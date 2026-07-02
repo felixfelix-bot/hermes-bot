@@ -12,13 +12,13 @@ BOARD_ID="net4sats-human-gate"
 RELAYS="wss://relay.damus.io wss://nos.lol"
 STATE_FILE=~/.hermes/state/nostr-kanban-sync.json
 
-# Read pending human-gate items from the local Hermes board
+# Read ALL non-done human-gate items from the local Hermes board
 PENDING=$(python3 -c "
 import sqlite3, json, sys
 try:
     conn = sqlite3.connect('/home/c03rad0r/.hermes/kanban/boards/human-gate/kanban.db')
     c = conn.cursor()
-    c.execute('SELECT id, title, status FROM tasks WHERE status IN (\"ready\", \"running\") ORDER BY created_at')
+    c.execute('SELECT id, title, status FROM tasks WHERE status NOT IN (\"done\", \"archived\") ORDER BY created_at')
     items = [{'id': r[0], 'title': r[1], 'status': r[2]} for r in c.fetchall()]
     conn.close()
     print(json.dumps(items))

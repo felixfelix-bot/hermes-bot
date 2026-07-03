@@ -1,0 +1,8 @@
+---
+# Apply all Hermes post-install patches to a fresh instance.
+# Usage: ansible-playbook playbook-hermes-patches.yml -e "hermes_kanban_py_path=/path/to/hermes_cli/kanban.py"
+- hosts: localhost
+  vars:
+    hermes_kanban_py_path: "{{ lookup('env', 'HOME') }}/.hermes/hermes-agent/hermes_cli/kanban.py"
+  roles:
+    - hermes_kanban_patch

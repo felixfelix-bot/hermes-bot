@@ -16,11 +16,17 @@ try:
     # Find done/archived tasks that haven't been resolved yet
     c.execute('SELECT id, title, body FROM tasks WHERE status = \"done\"')
     for tid, title, body in c.fetchall():
-        # Check if body contains source_board and source_task
-        if body and 'source_task' in body:
+        # Check body for source board/task info (either format)
+        body_lower = (body or '').lower()
+        has_source = 'source_board' in body_lower or 'source board' in body_lower
+        if body and has_source:
             import re
-            board_match = re.search(r'source_board[\":\s]+([\w-]+)', body)
-            task_match = re.search(r'source_task[\":\s]+(t_\w+)', body)
+            # Match both formats:
+            #   \"Source board: fips\"  (human, space, Title case)
+            #   \"source_board: fips\"  (JSON, underscore)
+            #   \"source_board\":\"fips\" (escaped JSON)
+            board_match = re.search(r'[Ss]ource[_\s][Bb]oard[\":\s]+([\w-]+)', body)
+            task_match = re.search(r'[Ss]ource[_\s][Tt]ask[\":\s]+([\w-]+)', body)
             if board_match and task_match:
                 src_board = board_match.group(1)
                 src_task = task_match.group(1)

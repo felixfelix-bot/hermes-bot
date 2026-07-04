@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""rate_limit_gate.py — Dispatch-level rate-limit gate.
+
+Checks three conditions before dispatching workers:
+1. Is current UTC hour a known rate-limit hour? (rate_limit_samples GROUP BY hour)
+2. Any 429 in last 5 minutes? (rate_limit_samples ORDER BY ts DESC)
+3. Kalman prediction: will quota exhaust during next task duration?
+
+Output JSON to ~/.hermes/state/rate_limit_gate.json:
+  {paused: bool, resume_at: iso_ts|null, reason: str, checked_at: iso_ts, checks: {...}}
+
+Exit codes: 0 = clear (dispatch OK), 1 = paused (skip dispatch)
+Run every 5 min via cron. Dispatch cron checks gate before spawning workers.
+If paused: skip dispatch, schedule one-shot resume cron at predicted_resume time.
+If clear: dispatch normally.
+
+DB: ~/.hermes/bot/zai_usage.db
+"""
+
+import sqlite3
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ── Configuration ──
+DB_PATH = Path.home() / ".hermes" / "bot" / "zai_usage.db"
+STATE_PATH = Path.home() / ".hermes" / "state" / "rate_limit_gate.json"
+RECENT_429_WINDOW_SEC = 300        # 5 minutes
+DEFAULT_TASK_DURATION_SEC = 300    # 5 min assumed task duration
+MIN_SAMPLES_FOR_HOUR_STATS = 10    # need at least this many for hour stats
+
+# Peak rate-limit hours (UTC) from historical analysis:
+# median burst gap 5s, burst duration 1-40min, peak hours 02-05 + 10-11 UTC
+KNOWN_PEAK_HOURS = {2, 3, 4, 5, 10, 11}
+
+ZAI_STATE_PATH = Path.home() / ".hermes" / "bot" / "zai_state.json"
+# If the live main-account session_pct is below this AND no recent 429s,
+# force the gate CLEAR. The inter-arrival-gap heuristic false-positives on
+# any active traffic; real quota % is ground truth.
+QUOTA_CLEAR_THRESHOLD = 60
+
+
+def read_live_quota():
+    """Read live quota state from zai_state.json.
+
+    Returns (session_pct: float|None, quota_pause: bool|None).
+    The main account's session_pct is the authoritative exhaustion indicator.
+    """
+    try:
+        data = json.loads(ZAI_STATE_PATH.read_text())
+        return data.get("session_pct"), data.get("quota_pause")
+    except Exception:
+        return None, None
+
+
+def parse_ts(val):
+    """Parse a timestamp (Unix epoch int/float, ISO string, or datetime)."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return datetime.fromtimestamp(val, tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromtimestamp(float(val), tz=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _ts_is_epoch(conn, table):
+    """Detect whether ts column stores Unix epoch (int/real) or ISO text."""
+    try:
+        row = conn.execute(
+            f"SELECT ts FROM {table} WHERE ts IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if row and isinstance(row[0], (int, float)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def check_rate_limit_hour(conn, now_utc):
+    """Check 1: Is current UTC hour a known rate-limit hour?
+
+    Queries historical rate_limit_samples grouped by hour to determine
+    if the current hour has historically seen rate limits.
+    Returns (is_risky: bool, info: dict).
+    """
+    current_hour = now_utc.hour
+    hour_stats = {}
+
+    epoch = _ts_is_epoch(conn, 'rate_limit_samples')
+    try:
+        if epoch:
+            cur = conn.execute("""
+                SELECT CAST(strftime('%H', datetime(ts, 'unixepoch')) AS INTEGER) AS hr,
+                       COUNT(*) AS cnt
+                FROM rate_limit_samples
+                WHERE ts IS NOT NULL
+                GROUP BY hr ORDER BY cnt DESC
+            """)
+        else:
+            cur = conn.execute("""
+                SELECT CAST(strftime('%H', ts) AS INTEGER) AS hr,
+                       COUNT(*) AS cnt
+                FROM rate_limit_samples
+                WHERE ts IS NOT NULL
+                GROUP BY hr ORDER BY cnt DESC
+            """)
+        hour_stats = {row[0]: row[1] for row in cur.fetchall()}
+    except sqlite3.OperationalError:
+        pass
+
+    total = sum(hour_stats.values())
+    if total < MIN_SAMPLES_FOR_HOUR_STATS:
+        is_risky = current_hour in KNOWN_PEAK_HOURS
+        return is_risky, {
+            "current_hour": current_hour,
+            "is_peak": is_risky,
+            "method": "static_peak_hours (insufficient data)",
+            "total_samples": total,
+            "hour_stats": hour_stats,
+        }
+
+    current_count = hour_stats.get(current_hour, 0)
+    current_pct = current_count / total if total > 0 else 0.0
+
+    # Hour is risky if it accounts for >8% of all rate-limit samples
+    # (uniform distribution across 24h would be ~4.2%)
+    is_risky = current_pct > 0.08 or current_hour in KNOWN_PEAK_HOURS
+
+    top_hours = dict(sorted(hour_stats.items(), key=lambda x: -x[1])[:6])
+    return is_risky, {
+        "current_hour": current_hour,
+        "current_hour_count": current_count,
+        "current_hour_pct": round(current_pct, 4),
+        "is_peak": is_risky,
+        "method": "historical_hour_stats",
+        "total_samples": total,
+        "top_hours": top_hours,
+    }
+
+
+def check_recent_429(conn, now_utc):
+    """Check 2: Any 429 (rate-limit) in the last 5 minutes?
+
+    Queries rate_limit_samples for entries within RECENT_429_WINDOW_SEC.
+    Returns (has_recent: bool, info: dict).
+    """
+    cutoff_dt = now_utc - timedelta(seconds=RECENT_429_WINDOW_SEC)
+    count = 0
+    latest = None
+
+    epoch = _ts_is_epoch(conn, 'rate_limit_samples')
+    try:
+        if epoch:
+            cutoff_val = cutoff_dt.timestamp()
+            cur = conn.execute("""
+                SELECT COUNT(*) AS cnt, MAX(ts) AS latest_ts
+                FROM rate_limit_samples
+                WHERE ts >= ? AND retry_after_estimate > 0
+            """, (cutoff_val,))
+        else:
+            cutoff_val = cutoff_dt.isoformat()
+            cur = conn.execute("""
+                SELECT COUNT(*) AS cnt, MAX(ts) AS latest_ts
+                FROM rate_limit_samples
+                WHERE ts >= ? AND retry_after_estimate > 0
+            """, (cutoff_val,))
+        row = cur.fetchone()
+        count = row[0] if row else 0
+        latest = row[1] if row else None
+    except sqlite3.OperationalError:
+        pass
+
+    return count > 0, {
+        "recent_429_count": count,
+        "latest_429_ts": str(latest) if latest else None,
+        "window_sec": RECENT_429_WINDOW_SEC,
+    }
+
+
+def check_kalman_prediction(conn, now_utc):
+    """Check 3: Kalman prediction — will quota exhaust during next task duration?
+
+    Uses the latest Kalman filter state from kalman_samples plus inter-arrival
+    gap analysis from rate_limit_samples to predict whether a rate limit is
+    likely within the next DEFAULT_TASK_DURATION_SEC seconds.
+    Returns (will_exhaust: bool, info: dict).
+    """
+    # Get latest kalman row
+    try:
+        cols_info = conn.execute("PRAGMA table_info(kalman_samples)").fetchall()
+        col_names = [c[1] for c in cols_info]
+        row = conn.execute(
+            "SELECT * FROM kalman_samples ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        kalman_data = dict(zip(col_names, row)) if row else {}
+    except Exception:
+        kalman_data = {}
+
+    # Extract Kalman estimate (try common column names)
+    estimate = None
+    for k in ('estimate', 'state', 'x_hat', 'predicted_interval',
+              'value', 'rate', 'interval'):
+        if k in kalman_data and kalman_data[k] is not None:
+            try:
+                estimate = float(kalman_data[k])
+            except (ValueError, TypeError):
+                pass
+            if estimate is not None:
+                break
+
+    uncertainty = None
+    for k in ('uncertainty', 'p', 'variance', 'covariance', 'p_hat', 'std'):
+        if k in kalman_data and kalman_data[k] is not None:
+            try:
+                uncertainty = float(kalman_data[k])
+            except (ValueError, TypeError):
+                pass
+            if uncertainty is not None:
+                break
+
+    # Compute inter-arrival gaps from recent rate_limit_samples
+    try:
+        # Only measure inter-arrival gaps between ACTUAL 429 events
+        # (retry_after_estimate > 0), not between every API call sample.
+        # Counting all samples makes the median gap trivially small during
+        # any active traffic, producing a permanent false "exhaustion" signal.
+        recent = conn.execute(
+            "SELECT ts FROM rate_limit_samples "
+            "WHERE retry_after_estimate > 0 ORDER BY ts DESC LIMIT 50"
+        ).fetchall()
+    except Exception:
+        recent = []
+
+    timestamps = []
+    for r in recent:
+        ts = parse_ts(r[0])
+        if ts:
+            timestamps.append(ts)
+    timestamps.sort()
+
+    if len(timestamps) >= 2:
+        gaps = [(timestamps[i + 1] - timestamps[i]).total_seconds()
+                for i in range(len(timestamps) - 1)]
+        gaps = [g for g in gaps if 0 < g < 3600]  # filter outliers
+        if gaps:
+            median_gap = sorted(gaps)[len(gaps) // 2]
+            # If median inter-429 gap < task duration, rate limit likely
+            will_exhaust = median_gap < DEFAULT_TASK_DURATION_SEC
+            return will_exhaust, {
+                "method": "inter_arrival_gap",
+                "median_gap_sec": round(median_gap, 1),
+                "mean_gap_sec": round(sum(gaps) / len(gaps), 1),
+                "task_duration_sec": DEFAULT_TASK_DURATION_SEC,
+                "sample_count": len(gaps),
+                "will_exhaust": will_exhaust,
+                "kalman_estimate": estimate,
+                "kalman_uncertainty": uncertainty,
+            }
+
+    # Fallback: use Kalman estimate directly
+    if estimate is not None:
+        will_exhaust = estimate < DEFAULT_TASK_DURATION_SEC
+        return will_exhaust, {
+            "method": "kalman_estimate_direct",
+            "estimate": estimate,
+            "uncertainty": uncertainty,
+            "task_duration_sec": DEFAULT_TASK_DURATION_SEC,
+            "will_exhaust": will_exhaust,
+        }
+
+    return False, {
+        "method": "insufficient_data",
+        "reason": "Could not extract Kalman state or inter-arrival stats",
+        "kalman_estimate": estimate,
+    }
+
+
+def predict_resume_time(now_utc, kalman_info, recent_429_info):
+    """Predict when it is safe to resume dispatch.
+
+    Uses the Kalman estimate or historical burst duration to predict
+    when the current rate-limit burst will end.
+    Burst duration: 1-40 min historically; median burst gap 5s.
+    """
+    median_gap = kalman_info.get("median_gap_sec")
+    if median_gap and median_gap > 0:
+        # Wait 3x median gap, clamped to [60s, 1800s]
+        resume_delta = max(median_gap * 3, 60)
+        resume_delta = min(resume_delta, 1800)
+        return now_utc + timedelta(seconds=resume_delta)
+
+    # If we have a Kalman estimate, wait that long + 20% margin
+    estimate = kalman_info.get("kalman_estimate") or kalman_info.get("estimate")
+    if estimate and estimate > 0:
+        resume_delta = min(estimate * 1.2, 1800)
+        resume_delta = max(resume_delta, 60)
+        return now_utc + timedelta(seconds=resume_delta)
+
+    # Default: wait 5 minutes (one cron cycle)
+    return now_utc + timedelta(seconds=300)
+
+
+def main():
+    now_utc = datetime.now(timezone.utc)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # DB missing — can't check, assume clear
+    if not DB_PATH.exists():
+        result = {
+            "paused": False,
+            "resume_at": None,
+            "reason": "DB not found — assuming clear",
+            "checked_at": now_utc.isoformat(),
+            "checks": {},
+        }
+        STATE_PATH.write_text(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2))
+        sys.exit(0)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        hour_risky, hour_info = check_rate_limit_hour(conn, now_utc)
+        has_recent_429, recent_info = check_recent_429(conn, now_utc)
+        will_exhaust, kalman_info = check_kalman_prediction(conn, now_utc)
+    finally:
+        conn.close()
+
+    # Decision: PAUSE if recent 429 (strong) OR Kalman predicts exhaustion.
+    # Peak hour alone is advisory, not a hard pause.
+    #
+    # Quota override: the Kalman inter-arrival heuristic false-positives on
+    # active API traffic (it measures gaps between ALL samples, not just 429s).
+    # If the live main-account session_pct is low with zero recent 429s, there
+    # is manifestly no exhaustion risk — override the false positive to CLEAR.
+    live_session_pct, live_quota_pause = read_live_quota()
+    if (
+        not has_recent_429
+        and live_session_pct is not None
+        and live_session_pct < QUOTA_CLEAR_THRESHOLD
+        and not live_quota_pause
+        and will_exhaust
+    ):
+        will_exhaust = False
+        kalman_info["will_exhaust"] = False
+        kalman_info["overridden_by_quota"] = (
+            f"session_pct={live_session_pct}% < {QUOTA_CLEAR_THRESHOLD}% "
+            f"with 0 recent 429s — inter-arrival false positive suppressed"
+        )
+    paused = has_recent_429 or will_exhaust
+
+    reasons = []
+    if has_recent_429:
+        reasons.append(
+            f"{recent_info['recent_429_count']} 429(s) in last "
+            f"{RECENT_429_WINDOW_SEC}s")
+    if will_exhaust:
+        gap = kalman_info.get("median_gap_sec",
+                              kalman_info.get("estimate", "?"))
+        reasons.append(
+            f"Kalman predicts exhaustion "
+            f"(gap={gap}s < {DEFAULT_TASK_DURATION_SEC}s)")
+    if hour_risky and not paused:
+        reasons.append(
+            f"Peak rate-limit hour {now_utc.hour}UTC (advisory only)")
+    if not reasons:
+        reasons.append("All clear")
+
+    resume_at = predict_resume_time(
+        now_utc, kalman_info, recent_info) if paused else None
+
+    result = {
+        "paused": paused,
+        "resume_at": resume_at.isoformat() if resume_at else None,
+        "reason": "; ".join(reasons),
+        "checked_at": now_utc.isoformat(),
+        "checks": {
+            "rate_limit_hour": hour_info,
+            "recent_429": recent_info,
+            "kalman_prediction": kalman_info,
+        },
+    }
+
+    STATE_PATH.write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))
+    sys.exit(1 if paused else 0)
+
+
+if __name__ == "__main__":
+    main()

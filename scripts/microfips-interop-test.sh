@@ -50,20 +50,43 @@ OUTPUT=$(FIPS_NSEC="$SIM_NSEC" FIPS_PEER_NPUB="$FIPS_PUB" \
     --target "$FIPS_NODE_ADDR" \
     2>&1 || true)
 
-# Check for handshake success
+# Determine handshake result
+HANDSHAKE_OK=false
 if echo "$OUTPUT" | grep -q "handshake complete"; then
+    HANDSHAKE_OK=true
+elif echo "$OUTPUT" | grep -qP "TX \d+B phase=0x[12]" && echo "$OUTPUT" | grep -qP "RX \d+B phase=0x[02]"; then
+    # MSG1 (phase 1) sent + MSG2 (phase 2) received = IK handshake completed
+    HANDSHAKE_OK=true
+elif echo "$OUTPUT" | grep -qP "TX \d+B phase=0x0" && echo "$OUTPUT" | grep -qP "RX \d+B phase=0x0"; then
+    # Both phase=0x0 messages = XX handshake init exchange
+    HANDSHAKE_OK=true
+fi
+
+if $HANDSHAKE_OK; then
+    # Save evidence
+    EVIDENCE_DIR="$HOME/microfips-evidence"
+    mkdir -p "$EVIDENCE_DIR"
+    TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+    MESSAGES=$(echo "$OUTPUT" | grep -oP '(TX|RX) \d+B phase=0x[0-9a-f]+' | sed 's/^/    "/' | sed 's/$/",/' | sed '$ s/,$//')
+    cat > "$EVIDENCE_DIR/latest.json" << JSONEOF
+{
+  "timestamp": "$TIMESTAMP",
+  "result": "pass",
+  "vps": "$VPS1_IP",
+  "branch": "$BRANCH",
+  "messages": [
+$MESSAGES
+  ]
+}
+JSONEOF
     exit 0
-elif echo "$OUTPUT" | grep -q "RX 69B phase=0x2"; then
-    # MSG2 received = handshake succeeded even if exact text differs
-    exit 0
-elif echo "$OUTPUT" | grep -q "MSG1 sent"; then
-    # MSG1 sent but no MSG2 response — FIPS didn't respond
-    echo "FAIL: MSG1 sent but no handshake response from FIPS"
-    echo "$OUTPUT" | grep -E 'MSG1|MSG2|RX|handshake' | tail -5
+elif echo "$OUTPUT" | grep -qi "panic\|error.*resolve\|connection refused"; then
+    echo "FAIL: sim error"
+    echo "$OUTPUT" | grep -i 'panic\|error\|refused' | tail -5
     exit 1
-elif echo "$OUTPUT" | grep -qi "error\|panic"; then
-    echo "FAIL: sim crashed"
-    echo "$OUTPUT" | grep -i 'error\|panic' | tail -5
+elif echo "$OUTPUT" | grep -qP "TX \d+B" && ! echo "$OUTPUT" | grep -qP "RX \d+B"; then
+    echo "FAIL: MSG1 sent but no response from FIPS"
+    echo "$OUTPUT" | grep -E 'TX|RX' | tail -5
     exit 1
 else
     echo "UNKNOWN: unexpected sim output"

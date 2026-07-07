@@ -1,0 +1,4 @@
+repos:
+  esp32-balloon-integration: { priority: 2 }
+  market: { priority: 2 }
+profiles: {}

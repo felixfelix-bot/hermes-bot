@@ -1,0 +1,30 @@
+{
+  "ts": 1783412020,
+  "ok": true,
+  "session_pct": 0,
+  "token_pct": 100,
+  "throttle": true,
+  "critical": true,
+  "quota_pause": false,
+  "ours_available": false,
+  "friend_token_pct": 73,
+  "friend_pause": false,
+  "friend_available": true,
+  "session_reset_ms": 1784467162994,
+  "token_reset_ms": 1783689562993,
+  "friend_reset_ms": 1783415452457,
+  "predictions": {
+    "ours": {
+      "will_exhaust": true,
+      "projected_pct": 184.8,
+      "hours_until_reset": 77.1,
+      "burn_rate_pct_per_hour": 1.1
+    },
+    "friend": {
+      "will_exhaust": false,
+      "projected_pct": 90.2,
+      "hours_until_reset": 0.95,
+      "burn_rate_pct_per_hour": 18.0
+    }
+  }
+}

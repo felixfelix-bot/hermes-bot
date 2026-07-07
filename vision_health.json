@@ -1,0 +1,7 @@
+{
+  "ts": 1783411449,
+  "ok": false,
+  "issues": [
+    "VISION SMOKE TEST FAILED: TimeoutError: timed out. Model=glm-4.6v, endpoint=http://127.0.0.1:9099/chat/completions"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "peak_start_utc": 6,
+  "peak_end_utc": 10,
+  "peak_local": "14:00-18:00 UTC+8",
+  "peak_multiplier": 3,
+  "offpeak_multiplier": 2,
+  "offpeak_note": "1x through September (limited-time promo); normally 2x",
+  "source": "https://docs.z.ai/devpack/overview",
+  "last_checked": 1783308611
+}

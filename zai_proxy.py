@@ -52,6 +52,16 @@ CACHE_TTL  = 300                                # 5 min
 PORT       = 9099
 STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
 
+# Model tier map: tier name → z.ai model name (cheapest first).
+# The X-Model-Tier request header selects one of these tiers to rewrite the
+# model field in the proxied request body.  Absent header = no rewrite.
+MODEL_TIER_MAP: dict[str, str] = {
+    "flash": "glm-4.5-flash",
+    "air":   "glm-4.5-air",
+    "mid":   "glm-4.5",
+    "heavy": "glm-5.2",
+}
+
 # ── usage logging DB (separate from response_cache.db) ──────────────────────
 USAGE_DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
 _usage_db_conn: sqlite3.Connection | None = None
@@ -68,6 +78,14 @@ _predict_exhaustion = None
 try:
     sys.path.insert(0, os.path.dirname(__file__))
     from burn_predictor import predict_exhaustion as _predict_exhaustion
+except Exception:
+    pass
+
+# ── Quota-aware model tier router (auto-downgrade based on Kalman + peak hours) ──
+_select_model_tier = None
+try:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from model_tier_router import compute_tier as _select_model_tier
 except Exception:
     pass
 
@@ -184,6 +202,21 @@ def _usage_db() -> sqlite3.Connection:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_calls_key_model ON api_calls(key_name, model)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_key_decisions_ts ON key_decisions(ts)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS model_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            key_name TEXT,
+            model TEXT,
+            original_model TEXT,
+            tier TEXT,
+            base_tier TEXT,
+            hint TEXT,
+            reason TEXT,
+            peak INTEGER,
+            hours_left REAL,
+            active_key TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_model_decisions_ts ON model_decisions(ts)")
         _usage_db_conn = conn
     return _usage_db_conn
 
@@ -279,6 +312,21 @@ def _log_rate_limit(*, key_used=None, attempt=0, duration_ms=None):
         _usage_db().execute(
             "INSERT INTO rate_limit_samples (ts, key_name, attempt_num, duration_ms) VALUES (?,?,?,?)",
             (time.time(), key_used, attempt, duration_ms))
+    except Exception:
+        pass
+
+
+def _log_model_decision(*, key_name=None, model=None, original_model=None,
+                        tier=None, base_tier=None, hint=None, reason=None,
+                        peak=0, hours_left=None, active_key=None):
+    """Log one model-tier decision. Swallows all errors."""
+    try:
+        _usage_db().execute(
+            "INSERT INTO model_decisions (ts, key_name, model, original_model, "
+            "tier, base_tier, hint, reason, peak, hours_left, active_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), key_name, model, original_model,
+             tier, base_tier, hint, reason, peak, hours_left, active_key))
     except Exception:
         pass
 
@@ -458,70 +506,137 @@ def _best_unlocked():
 
 
 def best_key() -> str:
-    """Pick a key for this request and log the decision.  Decides under the quota
-    lock; logs the decision outside the lock (DB write never blocks quota reads).
+    """Pick a key for this request using PROACTIVE prediction first.
 
-    Phase 3 — proactive burn-rate prediction: after the normal lock-based
-    selection, check whether the chosen key is *predicted* to exhaust before its
-    window resets.  If so, and the other key is unlocked with headroom, switch
-    proactively — before a 429 ever happens.  A 30-minute cooldown prevents
-    oscillation.  The entire proactive block runs OUTSIDE the quota lock (the
-    predictor does a self-HTTP GET to /quota which needs ``lock``) and is wrapped
-    so a predictor failure can never break a proxied request.
+    Proactive (primary): use Kalman burn-rate predictions to select the key
+    least likely to exhaust before its window resets.  Predictions are fetched
+    OUTSIDE the quota lock (the predictor does a safe self-HTTP GET to /quota).
+
+    Reactive (fallback): when predictions are unavailable (cold start, no data),
+    fall back to per-window lock thresholds in _best_unlocked().
+
+    Safety: a predictor failure never breaks key selection — every path is
+    wrapped so the proxy always returns a valid key.
     """
-    with lock:
-        chosen, reason, op, fp, oa, fa = _best_unlocked()
-
-    # PROACTIVE burn prediction (outside the quota lock — never deadlocks) -------
-    if _can_proactive_switch():
-        try:
-            exhaust_pred = _will_exhaust(_get_predictions(chosen))
-            if exhaust_pred is not None:
-                other_key = "friend" if chosen == "ours" else "ours"
-                if other_key in KEYS:                     # only one key? skip
-                    # Don't proactively switch to a key the lock logic already
-                    # rejected as locked — stale read of quota_cache is fine here.
-                    other_windows = quota_cache.get(other_key, ([], 0.0))[0]
-                    other_locked, *_ = is_key_locked(other_key, other_windows)
-                    if not other_locked:
-                        # Only switch if the other key is NOT also predicted to
-                        # exhaust (insufficient-data entries are treated as safe).
-                        if _will_exhaust(_get_predictions(other_key)) is None:
-                            chosen = other_key
-                            reason = (f"proactive_switch_predicted_exhaustion_"
-                                      f"{exhaust_pred.get('window', '?')}")
-                            _proactive_switch_state["key"] = chosen
-                            _proactive_switch_state["until"] = (time.time()
-                                + _PROACTIVE_COOLDOWN_SECONDS)
-        except Exception:
-            pass      # predictor must NEVER break key selection
-
-    # PROACTIVE RECOVER check — if the locked key has recovered below threshold
-    # (window reset), prefer it without waiting for next 5-min refresh.
-    # This runs outside the proactive cooldown so a recovered key is picked up
-    # immediately when its window rolls over.
+    # Phase 1 — PROACTIVE: use Kalman predictions as the primary signal -------
+    chosen = None
+    reason = ""
     try:
-        # Determine which key was locked (not chosen)
+        our_preds = _get_predictions("ours")
+        friend_preds = _get_predictions("friend")
+        our_exhaust = _will_exhaust(our_preds)
+        friend_exhaust = _will_exhaust(friend_preds)
+
+        if our_exhaust is not None and friend_exhaust is None:
+            # Our key predicted to exhaust, friend is safe
+            chosen = "friend"
+            reason = (f"proactive_ours_exhausts_{our_exhaust.get('window','?')}"
+                      f"_friend_safe")
+        elif friend_exhaust is not None and our_exhaust is None:
+            # Friend predicted to exhaust, our key is safe
+            chosen = "ours"
+            reason = (f"proactive_friend_exhausts_{friend_exhaust.get('window','?')}"
+                      f"_ours_safe")
+        elif our_exhaust is not None and friend_exhaust is not None:
+            # Both exhausting — pick the one that lasts longer
+            our_hours = our_exhaust.get("exhausts_in_hours") or 0
+            friend_hours = friend_exhaust.get("exhausts_in_hours") or 0
+            if friend_hours > our_hours:
+                chosen = "friend"
+                reason = ("proactive_both_exhausting_prefer_friend_longer_"
+                          f"{friend_hours:.1f}h_ours_{our_hours:.1f}h")
+            else:
+                chosen = "ours"
+                reason = ("proactive_both_exhausting_prefer_ours_longer_"
+                          f"{our_hours:.1f}h_friend_{friend_hours:.1f}h")
+    except Exception:
+        pass  # predictor failure → fall through to reactive
+
+    # Also record quota percentages for the log (read outside lock if possible)
+    op = fp = 0
+    try:
+        with lock:
+            op = _max_pct(quota_cache.get("ours", ([], 0.0))[0])
+            fp = _max_pct(quota_cache.get("friend", ([], 0.0))[0])
+    except Exception:
+        pass
+
+    # Phase 2 — REACTIVE fallback (when predictions not available) ------------
+    if chosen is None:
+        with lock:
+            chosen, reason, op, fp, oa, fa = _best_unlocked()
+    else:
+        # Proactive gave us a choice — still determine availability flags
+        # from reactive thresholds for the log
+        with lock:
+            ours_w = quota_cache.get("ours", ([], 0.0))[0]
+            friend_w = quota_cache.get("friend", ([], 0.0))[0]
+            o_locked, *_ = is_key_locked("ours", ours_w)
+            f_locked, *_ = is_key_locked("friend", friend_w)
+            oa = 0 if o_locked else 1
+            fa = 0 if f_locked else 1
+
+    # Phase 3 — RECOVER: if the non-chosen (previously locked) key has recovered
+    # below threshold, prefer it without waiting for next 5-min refresh.  This
+    # runs regardless of whether we used proactive or reactive selection.
+    try:
         locked_key = "friend" if chosen == "ours" else "ours"
         locked_windows = quota_cache.get(locked_key, ([], 0.0))[0]
         locked_now, *_ = is_key_locked(locked_key, locked_windows)
         if not locked_now:
-            # Key that was locked has recovered — re-evaluate
+            # Locked key has recovered — re-evaluate (but only from reactive,
+            # to avoid oscillation from stale predictions)
             with lock:
-                chosen2, reason2, op2, fp2, oa2, fa2 = _best_unlocked()
-            if chosen2 != chosen:
-                chosen = chosen2
+                reactive_choice, reactive_reason, _, _, _, _ = _best_unlocked()
+            if reactive_choice != chosen:
+                chosen = reactive_choice
                 reason = f"proactive_recover_{locked_key}_unlocked"
-                # Reset cooldown so the next proactive prediction can fire
-                _proactive_switch_state["key"] = None
-                _proactive_switch_state["until"] = 0.0
     except Exception:
-        pass      # NEVER break key selection
+        pass  # NEVER break key selection
 
     _log_key_decision(chosen_key=chosen, reason=reason, ours_pct=op,
                       friend_pct=fp, ours_available=oa, friend_available=fa)
     return chosen
 
+
+# Constants for retry logic
+TRANSIENT_ERRORS = {404, 429, 500, 502, 503, 504}
+RETRYABLE_EXCEPTIONS = (
+    "Broken pipe",
+    "Connection reset",
+    "Connection timed out",
+    "Remote end closed connection without response",
+)
+
+def _is_retryable_error(error):
+    """Check if an error should trigger a retry."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in TRANSIENT_ERRORS
+    error_str = str(error)
+    return any(err in error_str for err in RETRYABLE_EXCEPTIONS)
+
+def _attempt_retry(e, attempt, name, t0, key_order):
+    """Common retry logic for both HTTPError and Exception."""
+    if attempt == len(order) - 1:
+        # All keys tried, handle retry
+        _log_rate_limit(key_used=name, attempt=attempt, duration_ms=int((time.time() - t0) * 1000))
+        retry_num = attempt - len(order) + 1
+        if retry_num >= 50:
+            return False  # Safety cap exhausted
+        elif _rate_limit_predictor is not None:
+            _rate_limit_predictor.record_429()
+            wait = _rate_limit_predictor.predict_retry_at()
+            time.sleep(wait)
+            return True
+        else:
+            # Predictor unavailable — old exponential backoff
+            import random
+            wait = min(2 ** (retry_num + 1), 30) * (0.75 + random.random() * 0.5)
+            time.sleep(wait)
+            return True
+    else:
+        # Try the other key
+        return True
 
 # ── proxy handler ───────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
@@ -538,9 +653,59 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
+
+        # ── Quota-aware model tier routing (auto-downgrade) ────────────────
+        # Step 1: Extract original model + client tier hint
+        original_model = _extract_model(body)
+        tier_hint = self.headers.get("X-Model-Tier", "")
+
+        # Step 2: Choose key (logs the key decision)
+        chosen = best_key()
+
+        # Step 3: Compute tier for chosen key from Kalman + peak hours + client hint
+        model_tier_info = None
+        if _select_model_tier is not None and body:
+            try:
+                model_tier_info = _select_model_tier(chosen, tier_hint if tier_hint else None)
+                new_model = model_tier_info.get("model")
+                if original_model and new_model and new_model != original_model:
+                    body_json = json.loads(body)
+                    body_json["model"] = new_model
+                    body = json.dumps(body_json).encode()
+                    self.headers["Content-Length"] = str(len(body))
+            except Exception:
+                pass
+
+        # Step 4: Extract final model (may have been rewritten)
         model = _extract_model(body)
 
-        chosen = best_key()                        # logs the key decision
+        # Step 5: Log the model decision
+        if model_tier_info:
+            _log_model_decision(
+                key_name=chosen,
+                model=model,
+                original_model=original_model,
+                tier=model_tier_info.get("tier"),
+                base_tier=model_tier_info.get("base_tier"),
+                hint=tier_hint if tier_hint else None,
+                reason=model_tier_info.get("reason"),
+                peak=1 if model_tier_info.get("peak") else 0,
+                hours_left=model_tier_info.get("hours_left"),
+                active_key=chosen,
+            )
+        elif original_model != model:
+            _log_model_decision(
+                key_name=chosen,
+                model=model,
+                original_model=original_model,
+                tier="client",
+                base_tier="client",
+                hint=tier_hint if tier_hint else None,
+                reason=f"client X-Model-Tier={tier_hint}",
+                peak=0,
+                active_key=chosen,
+            )
+
         order = [chosen] + [n for n in KEYS if n != chosen]
 
         response_buffer = bytearray()
@@ -557,6 +722,16 @@ class Handler(BaseHTTPRequestHandler):
                     # the z.ai v4 base URL already contains the API version).
                     if path.startswith("/v1/"):
                         path = path[3:]
+                    # Only proxy /chat/completions to z.ai.  Non-chat paths
+                    # (model listings, Ollama API probes, version checks) get
+                    # a fast local 404 — sending them to z.ai wastes quota
+                    # and triggers Hermes fallback retries that burn PPQ.
+                    if not path.endswith("/chat/completions"):
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"only /chat/completions is proxied"}')
+                        return
                     url = UPSTREAM + path
                     hdrs = {k: v for k, v in self.headers.items()
                             if k.lower() not in ("host", "authorization", "connection", "content-length")}
@@ -583,28 +758,10 @@ class Handler(BaseHTTPRequestHandler):
                             _rate_limit_predictor.record_success()
                         return
                 except urllib.error.HTTPError as e:
-                    if e.code == 429:
-                        # Tried all keys; enter unlimited retry gated by the
-                        # Kalman-predicted recovery time.  Falls back to capped
-                        # exponential backoff when the filter has too few samples.
-                        if attempt == len(order) - 1:
-                            _log_rate_limit(key_used=name, attempt=attempt, duration_ms=int((time.time() - t0) * 1000))
-                            retry_num = attempt - len(order) + 1  # 0-indexed per full cycle
-                            if retry_num >= 50:
-                                pass          # safety cap exhausted — fall through to return 429
-                            elif _rate_limit_predictor is not None:
-                                _rate_limit_predictor.record_429()
-                                wait = _rate_limit_predictor.predict_retry_at()
-                                time.sleep(wait)
-                                continue      # loop back through all keys
-                            else:
-                                # Predictor unavailable — old exponential backoff.
-                                import random
-                                wait = min(2 ** (retry_num + 1), 30) * (0.75 + random.random() * 0.5)
-                                time.sleep(wait)
-                                continue
-                        else:
-                            continue   # try the other key
+                    if _is_retryable_error(e):
+                        if _attempt_retry(e, attempt, name, t0):
+                            continue
+                    # Non-retryable error
                     status_code = e.code
                     error_text = f"HTTPError {e.code}"
                     body_err = e.read()
@@ -614,11 +771,15 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(body_err)
                     return
                 except Exception as e:
+                    if _is_retryable_error(e):
+                        if _attempt_retry(e, attempt, name, t0):
+                            continue
+                    # Non-retryable error
                     status_code = 502
                     error_text = f"proxy error: {e}"
                     msg = f"proxy error: {e}".encode()
                     response_buffer.extend(msg)
-                    self.send_response(502)
+                    self.send_response(status_code)
                     self.end_headers()
                     self.wfile.write(msg)
                     return
@@ -680,6 +841,31 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(b"ok")
+        elif self.path == "/tier":
+            # Current recommended model tier (for dispatch gate queries)
+            # Supports ?urgency=urgent|standard|background query parameter
+            self.close_connection = True
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                urgency = qs.get("urgency", ["standard"])[0]
+                chosen = best_key()
+                if _select_model_tier is not None:
+                    info = _select_model_tier(chosen, None, urgency)
+                else:
+                    info = {"tier": "unknown", "model": "glm-5.2",
+                            "reason": "model_tier_router unavailable"}
+                info["active_key"] = chosen
+                info["quota_pct"] = {n: _max_pct(v[0]) for n, v in quota_cache.items()}
+            except Exception as e:
+                info = {"tier": "error", "reason": str(e)}
+            payload = json.dumps(info, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
         elif self.path.startswith("/route"):
             # Full routing decision endpoint (Kalman + costs + difficulty)
             self.close_connection = True
@@ -700,9 +886,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path == "/v1/models" or self.path == "/models":
+            # Model listing — return stub so Hermes doesn't 404 → fall back to PPQ
+            self.close_connection = True
+            now = int(time.time())
+            models_data = {
+                "object": "list",
+                "data": [
+                    {"id": "glm-5.2", "object": "model", "created": now, "owned_by": "zai"},
+                    {"id": "glm-4.5-flash", "object": "model", "created": now, "owned_by": "zai"},
+                    {"id": "glm-4.5-air", "object": "model", "created": now, "owned_by": "zai"},
+                ]
+            }
+            payload = json.dumps(models_data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(b"ok")
+            self.wfile.write(payload)
         else:
             self._proxy()
 

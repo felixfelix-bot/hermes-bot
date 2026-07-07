@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""zai_proxy — local reverse proxy for z.ai that auto-rotates API keys.
+
+ContextVM-pattern: a local service that fetches + caches external data (key quotas)
+and serves routing decisions transparently. Hermes points base_url here; the proxy
+picks the best key per request + retries on 429.
+
+Endpoints:
+  POST /* → forwarded to z.ai (with the healthiest key; retries on 429)
+  GET  /quota → both keys' cached quotas + which is active
+  GET  /health → simple liveness check
+"""
+from __future__ import annotations
+import json, threading, time, urllib.request, urllib.error
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+# ── config ──────────────────────────────────────────────────────────────────
+def _load_keys():
+    """Load keys from the manager .env (gitignored, never in repo)."""
+    keys = {}
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env"]:
+        if ep.exists():
+            for line in ep.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("ZAI_API_KEY=") and "ZAI_OUR_KEY" not in line and "friend" not in keys:
+                    keys["friend"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ZAI_OUR_KEY=") and "ours" not in keys:
+                    keys["ours"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+    return keys
+
+KEYS = _load_keys()
+THRESHOLDS = {"ours": 80, "friend": 40}       # swap away when above
+UPSTREAM   = "https://api.z.ai/api/coding/paas/v4"
+QUOTA_URL  = "https://api.z.ai/api/monitor/usage/quota/limit"
+CACHE_TTL  = 300                                # 5 min
+PORT       = 9099
+STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
+
+quota_cache: dict[str, tuple[int, float]] = {}   # name → (pct, ts)
+lock = threading.Lock()
+
+
+# ── quota polling (background thread) ───────────────────────────────────────
+def _fetch_quota(key: str) -> int:
+    try:
+        req = urllib.request.Request(QUOTA_URL, headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        pcts = [L.get("percentage", 0) for L in data["data"]["limits"] if L.get("type") == "TOKENS_LIMIT"]
+        return max(pcts) if pcts else 0
+    except Exception:
+        return 999
+
+
+def _refresh_loop():
+    while True:
+        with lock:
+            for name, key in KEYS.items():
+                quota_cache[name] = (_fetch_quota(key), time.time())
+            STATE_FILE.write_text(json.dumps(
+                {n: {"pct": v[0], "age_s": int(time.time() - v[1])} for n, v in quota_cache.items()}
+                | {"active": _best_unlocked()}, indent=2))
+        time.sleep(CACHE_TTL)
+
+
+def _best_unlocked() -> str:
+    if not quota_cache:
+        return "ours"
+    return min(quota_cache, key=lambda n: quota_cache[n][0])
+
+
+def best_key() -> str:
+    with lock:
+        return _best_unlocked()
+
+
+# ── proxy handler ───────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _proxy(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+
+        order = [best_key(), next(n for n in KEYS if n != best_key())]
+        for attempt, name in enumerate(order):
+            key = KEYS[name]
+            try:
+                url = UPSTREAM + self.path
+                hdrs = {k: v for k, v in self.headers.items()
+                        if k.lower() not in ("host", "authorization", "connection", "content-length")}
+                hdrs["Authorization"] = f"Bearer {key}"
+                hdrs["Content-Type"] = "application/json"
+                req = urllib.request.Request(url, data=body, method=self.command, headers=hdrs)
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    self.send_response(resp.status)
+                    for h, v in resp.headers.items():
+                        if h.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(h, v)
+                    self.end_headers()
+                    # streaming passthrough (SSE-safe)
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    return
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt == 0:
+                    continue   # try the other key
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(e.read())
+                return
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(f"proxy error: {e}".encode())
+                return
+
+    def do_POST(self): self._proxy()
+    def do_PUT(self):  self._proxy()
+    def do_GET(self):
+        if self.path == "/quota":
+            with lock:
+                data = {n: {"pct": v[0], "age_s": int(time.time() - v[1])}
+                        for n, v in quota_cache.items()} | {"active": _best_unlocked()}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, indent=2).encode())
+        elif self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self._proxy()
+
+    def log_message(self, *a):
+        pass
+
+
+if __name__ == "__main__":
+    t = threading.Thread(target=_refresh_loop, daemon=True)
+    t.start()
+    time.sleep(3)  # let first quota fetch complete
+    print(f"zai_proxy on :{PORT}  quotas={ {n: v[0] for n, v in quota_cache.items()} }")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

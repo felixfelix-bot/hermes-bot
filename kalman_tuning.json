@@ -1,0 +1,12 @@
+{
+  "mape_at_tune": {
+    "friend": 8034882.68
+  },
+  "measurement_noise": {
+    "friend": 27312460737108.938
+  },
+  "process_noise": {
+    "friend": 1.0
+  },
+  "retuned_at": "2026-07-07T07:20:37Z"
+}

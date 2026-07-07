@@ -16,7 +16,7 @@
     },
     "/home/c03rad0r/boom": {
       "name": "boom",
-      "summary": "Android PID1 experiments without the Android framework. The repo hosts our custom init binaries, the `drm_rect`/`compositor-rs` DRM demos, and the `cfctl` tooling that boots Cuttlefish on Hetzner.",
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
       "themes": []
     },
     "/home/c03rad0r/configurationwizzard": {
@@ -36,10 +36,9 @@
     },
     "/home/c03rad0r/dnn-node": {
       "name": "dnn-node",
-      "summary": "A Go implementation of a DNN (Decentralized Naming Network) node that serves as both a Nostr relay and a Bitcoin-anchored naming system resolver.",
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
       "themes": [
         "nostr",
-        "nip",
         "bitcoin"
       ]
     },
@@ -145,44 +144,28 @@
     },
     "/home/c03rad0r/soveng-website": {
       "name": "soveng-website",
-      "summary": "[Sovereign Engineering](https://sovereignengineering.io) organizes cohorts for open-source developers, focusing on how to best leverage freedom tech and emerging AI technologies to create systems that",
-      "themes": [
-        "nostr",
-        "soveng",
-        "sec"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     },
     "/home/c03rad0r/soveng.github.io": {
       "name": "soveng.github.io",
-      "summary": "soveng.github.io",
-      "themes": [
-        "soveng"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     },
     "/home/c03rad0r/soveng-heartbeat": {
       "name": "soveng-heartbeat",
-      "summary": "Static activity dashboard for projects explored at Sovereign Engineering cohorts.",
-      "themes": [
-        "soveng"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     },
     "/home/c03rad0r/soveng-nsite": {
       "name": "soveng-nsite",
-      "summary": "This repo is setup to be a small starter for deploying a static site as a Nsite using the Nsite-CLI.",
-      "themes": [
-        "soveng",
-        "sec"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     },
     "/home/c03rad0r/soveng-tshirt-contest": {
       "name": "soveng-tshirt-contest",
-      "summary": "A small web app for judging the [SEC-08 #SovEng t-shirt design contest](https://sovereignengineering.io/contest).",
-      "themes": [
-        "nostr",
-        "nip",
-        "soveng",
-        "sec"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     },
     "/home/c03rad0r/sx1280-testing": {
       "name": "sx1280-testing",
@@ -263,12 +246,8 @@
     },
     "/home/c03rad0r/wingmen": {
       "name": "wingmen",
-      "summary": "Wingman is the orchestration and control-plane layer for the Wingman suite.",
-      "themes": [
-        "nostr",
-        "nip",
-        "sec"
-      ]
+      "summary": "Project orientation for LLMs (see https://llmstxt.org/). Cross-link: AGENTS.md (workflow rules), HANDOVER.md (session state).",
+      "themes": []
     }
   },
   "theme_clusters": {
@@ -295,19 +274,8 @@
       "gitworkshop",
       "nostr-glasses",
       "rana",
-      "soveng-website",
-      "soveng-tshirt-contest",
       "tollgate-nostr-signing-device",
-      "tollgate-release-explorer-site",
-      "wingmen"
-    ],
-    "nip": [
-      "dnn-node",
-      "gitworkshop",
-      "nostr-glasses",
-      "soveng-tshirt-contest",
-      "tollgate-release-explorer-site",
-      "wingmen"
+      "tollgate-release-explorer-site"
     ],
     "bitcoin": [
       "dnn-node",
@@ -327,6 +295,11 @@
     "miner": [
       "esp-miner"
     ],
+    "nip": [
+      "gitworkshop",
+      "nostr-glasses",
+      "tollgate-release-explorer-site"
+    ],
     "market": [
       "market"
     ],
@@ -335,19 +308,6 @@
       "openrouter-automation",
       "tollgate-bash-client",
       "tollgate-module-basic-go"
-    ],
-    "soveng": [
-      "soveng-website",
-      "soveng.github.io",
-      "soveng-heartbeat",
-      "soveng-nsite",
-      "soveng-tshirt-contest"
-    ],
-    "sec": [
-      "soveng-website",
-      "soveng-nsite",
-      "soveng-tshirt-contest",
-      "wingmen"
     ],
     "radio": [
       "sx1280-testing"
@@ -361,46 +321,6 @@
   },
   "overlap_candidates": [
     {
-      "a": "dnn-node",
-      "b": "gitworkshop",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "dnn-node",
-      "b": "nostr-glasses",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "dnn-node",
-      "b": "soveng-tshirt-contest",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "dnn-node",
-      "b": "tollgate-release-explorer-site",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "dnn-node",
-      "b": "wingmen",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
       "a": "gitworkshop",
       "b": "nostr-glasses",
       "shared": [
@@ -410,31 +330,7 @@
     },
     {
       "a": "gitworkshop",
-      "b": "soveng-tshirt-contest",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "gitworkshop",
       "b": "tollgate-release-explorer-site",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "gitworkshop",
-      "b": "wingmen",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "nostr-glasses",
-      "b": "soveng-tshirt-contest",
       "shared": [
         "nip",
         "nostr"
@@ -446,64 +342,6 @@
       "shared": [
         "nip",
         "nostr"
-      ]
-    },
-    {
-      "a": "nostr-glasses",
-      "b": "wingmen",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "soveng-website",
-      "b": "soveng-nsite",
-      "shared": [
-        "sec",
-        "soveng"
-      ]
-    },
-    {
-      "a": "soveng-website",
-      "b": "soveng-tshirt-contest",
-      "shared": [
-        "nostr",
-        "sec",
-        "soveng"
-      ]
-    },
-    {
-      "a": "soveng-website",
-      "b": "wingmen",
-      "shared": [
-        "nostr",
-        "sec"
-      ]
-    },
-    {
-      "a": "soveng-nsite",
-      "b": "soveng-tshirt-contest",
-      "shared": [
-        "sec",
-        "soveng"
-      ]
-    },
-    {
-      "a": "soveng-tshirt-contest",
-      "b": "tollgate-release-explorer-site",
-      "shared": [
-        "nip",
-        "nostr"
-      ]
-    },
-    {
-      "a": "soveng-tshirt-contest",
-      "b": "wingmen",
-      "shared": [
-        "nip",
-        "nostr",
-        "sec"
       ]
     },
     {
@@ -520,14 +358,6 @@
       "shared": [
         "nostr",
         "tollgate"
-      ]
-    },
-    {
-      "a": "tollgate-release-explorer-site",
-      "b": "wingmen",
-      "shared": [
-        "nip",
-        "nostr"
       ]
     }
   ]

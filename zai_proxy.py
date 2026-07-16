@@ -52,6 +52,156 @@ CACHE_TTL  = 300                                # 5 min
 PORT       = 9099
 STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
 
+# ── external failover providers ─────────────────────────────────────────────
+def _load_external_keys():
+    """Load PPQ, OpenRouter, and Ollama Cloud keys from .env."""
+    keys = {}
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env"]:
+        if ep.exists():
+            for line in ep.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("PPQ_API_KEY=") and "ppq" not in keys:
+                    keys["ppq"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OPENROUTER_API_KEY=") and "openrouter" not in keys:
+                    keys["openrouter"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY=") and "ollama_cloud" not in keys:
+                    keys["ollama_cloud"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+    return keys
+
+_EXTERNAL_KEYS = _load_external_keys()
+
+# Ollama Cloud — primary provider (same tier as z.ai, not just failover)
+OLLAMA_CLOUD_KEY = _EXTERNAL_KEYS.get("ollama_cloud", "")
+OLLAMA_CLOUD_BASE = "https://ollama.com/v1"
+
+EXTERNAL_PROVIDERS = {
+    "ppq": {
+        "base_url": "https://api.ppq.ai/v1",
+        "key": _EXTERNAL_KEYS.get("ppq", ""),
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "key": _EXTERNAL_KEYS.get("openrouter", ""),
+    },
+}
+
+# Fallback models — chosen based on the requesting profile's quality tier.
+# Manager (glm-5.2): quality floor at deepseek-v4-pro (55.4% SWE-bench).
+#   NEVER falls back to flash — returns error instead of low-quality output.
+# Workers (glm-4.5-flash): cheapest available is fine (output gets vetted).
+MANAGER_FALLBACK_MODEL = "deepseek/deepseek-v4-pro"
+WORKER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+
+# z.ai peak hours: Beijing 14:00-18:00 = UTC 6-10. During peak, z.ai burns 3x quota.
+# Ollama Cloud has no peak pricing — prefer it during these hours.
+_PEAK_HOURS_UTC = {6, 7, 8, 9, 10}
+
+def _is_peak_hour() -> bool:
+    """Check if current UTC hour is a z.ai peak hour."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).hour in _PEAK_HOURS_UTC
+
+# ── provider funding tracker ────────────────────────────────────────────────
+# Tracks which providers have credits remaining. A 402 response marks a
+# provider unfunded for 1 hour (credits may be replenished). The failover
+# logic only tries funded providers, sorted by cost.
+_UNFUNDED_RETRY_SECONDS = 3600  # retry unfunded provider after 1 hour
+
+_provider_health: dict[str, dict] = {}
+
+
+def _is_provider_funded(name: str) -> bool:
+    """Check if a provider has credits. Unfunded providers are retried
+    after _UNFUNDED_RETRY_SECONDS."""
+    h = _provider_health.get(name)
+    if not h or h.get("funded", True):
+        return True
+    return time.time() >= h.get("retry_after", 0)
+
+
+def _mark_unfunded(name: str) -> None:
+    """Mark a provider as out of credits (after receiving 402)."""
+    _provider_health[name] = {
+        "funded": False,
+        "last_402": time.time(),
+        "retry_after": time.time() + _UNFUNDED_RETRY_SECONDS,
+    }
+
+
+def _mark_funded(name: str) -> None:
+    """Mark a provider as funded again (successful response)."""
+    _provider_health[name] = {"funded": True}
+
+
+# ── z.ai key health tracker ─────────────────────────────────────────────────
+# Same pattern as _provider_health, but for z.ai keys. When a key returns
+# an empty response or 429, it's marked exhausted for 5 minutes.
+# best_key() skips exhausted keys. When both are exhausted, the proxy
+# fails over to external providers (PPQ/OpenRouter).
+_EXHAUSTED_RETRY_SECONDS = 120  # retry exhausted key after 2 min
+
+_zai_key_health: dict[str, dict] = {}
+
+
+def _is_key_healthy(name: str) -> bool:
+    """Check if a z.ai key has quota remaining."""
+    h = _zai_key_health.get(name)
+    if not h or h.get("healthy", True):
+        return True
+    return time.time() >= h.get("retry_after", 0)
+
+
+def _mark_key_exhausted(name: str) -> None:
+    """Mark a z.ai key as out of quota (empty response or 429)."""
+    _zai_key_health[name] = {
+        "healthy": False,
+        "last_empty": time.time(),
+        "retry_after": time.time() + _EXHAUSTED_RETRY_SECONDS,
+    }
+
+
+def _mark_key_healthy(name: str) -> None:
+    """Mark a z.ai key as healthy (successful response with content)."""
+    _zai_key_health[name] = {"healthy": True}
+
+
+def _mark_unfunded(name: str) -> None:
+    """Mark a provider as out of credits (after receiving 402)."""
+    _provider_health[name] = {
+        "funded": False,
+        "last_402": time.time(),
+        "retry_after": time.time() + _UNFUNDED_RETRY_SECONDS,
+    }
+
+
+def _mark_funded(name: str) -> None:
+    """Mark a provider as funded again (successful response)."""
+    _provider_health[name] = {"funded": True}
+
+
+def _get_provider_cost(name: str, model_id: str) -> float:
+    """Look up the combined cost per 1M tokens for a model on a provider.
+    Reads from model_matrix.json if available; falls back to PPQ_PRICING dict.
+    Returns 999.0 if unknown."""
+    # Try model_matrix.json first (live pricing)
+    try:
+        matrix_path = BOT / "model_matrix.json"
+        if matrix_path.exists():
+            import json as _json
+            matrix = _json.loads(matrix_path.read_text())
+            key = f"{name}/{model_id}"
+            entry = matrix.get("models", {}).get(key, {})
+            if entry:
+                keys = entry.get("keys", {})
+                for k in keys.values():
+                    return k.get("cost_per_1m_offpeak", k.get("cost_per_1m_combined", 999.0))
+    except Exception:
+        pass
+    # Fallback to known pricing
+    from model_matrix import PPQ_PRICING
+    pricing = PPQ_PRICING.get(model_id, PPQ_PRICING.get(model_id.lower(), (0.14, 0.28)))
+    return pricing[0] + pricing[1]
+
 # Model tier map: tier name → z.ai model name (cheapest first).
 # The X-Model-Tier request header selects one of these tiers to rewrite the
 # model field in the proxied request body.  Absent header = no rewrite.
@@ -75,19 +225,20 @@ lock = threading.Lock()
 # the proxy — if the import fails, proactive switching is silently disabled and
 # the proxy falls back to reactive (lock-based) key selection.
 _predict_exhaustion = None
+_route_request = None
 try:
     sys.path.insert(0, os.path.dirname(__file__))
     from burn_predictor import predict_exhaustion as _predict_exhaustion
+    from burn_predictor import route_request as _route_request
 except Exception:
     pass
 
-# ── Quota-aware model tier router (auto-downgrade based on Kalman + peak hours) ──
+# ── Model tier router DISABLED — model selection is now profile-level ──
+# Each profile (manager, workers) sets its own model in config.yaml.
+# Manager: always GLM-5.2 (user-facing, high quality)
+# Workers: glm-4.5-flash (background, bounded tasks)
+# The proxy passes through whatever model the profile requests.
 _select_model_tier = None
-try:
-    sys.path.insert(0, os.path.dirname(__file__))
-    from model_tier_router import compute_tier as _select_model_tier
-except Exception:
-    pass
 
 # ── Kalman-backed rate-limit predictor (unlimited retries) ───────────────────
 # Models 429 inter-arrival times to predict recovery.  Falls back to capped
@@ -329,6 +480,109 @@ def _log_model_decision(*, key_name=None, model=None, original_model=None,
              tier, base_tier, hint, reason, peak, hours_left, active_key))
     except Exception:
         pass
+
+
+# ── global spend cap (runaway-loop circuit breaker) ─────────────────────────
+# Tracks cumulative daily spend across ALL providers (z.ai, PPQ, OpenRouter).
+# When the daily cap for a tier is exceeded, the proxy returns 503 — preventing
+# runaway agent loops from burning unlimited tokens.
+#
+# z.ai models are $0/1M (subscription). External failover models have real
+# per-token cost. The cap protects against the expensive external path.
+from datetime import date as _date
+
+_SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "10.0"))
+_SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "3.0"))
+
+# Cost per 1M tokens (combined input+output estimate). z.ai = $0 (subscription).
+_MODEL_COST_PER_1M: dict[str, float] = {
+    "glm-5.2":                 0.0,
+    "glm-4.5-flash":           0.0,
+    "glm-4.5":                 0.88,
+    "glm-4.5-air":             0.65,
+    "glm-4.5-airx":            2.80,
+    "glm-4.5-x":               5.55,
+    "deepseek/deepseek-v4-pro":   1.30,
+    "deepseek/deepseek-v4-flash": 0.09,
+    # Ollama Cloud models — $0/token (subscription, flat rate)
+    "gpt-oss:120b":            0.0,
+    "gemma4:31b":              0.0,
+    "qwen3.5:397b":            0.0,
+    "kimi-k2.7-code":          0.0,
+}
+
+
+def _spend_tier(model: str | None) -> str:
+    """Classify a request as 'manager' or 'worker' based on model.
+    Manager models: glm-5.2 (primary) + deepseek-v4-pro (fallback).
+    Worker models: everything else (glm-4.5-flash, deepseek-v4-flash, etc.)."""
+    if model in ("glm-5.2", MANAGER_FALLBACK_MODEL):
+        return "manager"
+    return "worker"
+
+
+def _estimate_cost_usd(model: str | None, total_tokens: int) -> float:
+    """Estimate USD cost for a request. Returns 0.0 for unknown/free models."""
+    if not model or total_tokens <= 0:
+        return 0.0
+    cost_per_1m = _MODEL_COST_PER_1M.get(model)
+    if cost_per_1m is None:
+        cost_per_1m = _MODEL_COST_PER_1M.get(model.lower(), 0.0)
+    return (total_tokens / 1_000_000) * cost_per_1m
+
+
+def _record_spend(model: str | None, total_tokens: int) -> None:
+    """Record spend for today. Called from the finally block of every request."""
+    try:
+        tier = _spend_tier(model)
+        cost = _estimate_cost_usd(model, total_tokens)
+        today = _date.today().isoformat()
+        _usage_db().execute(
+            "INSERT INTO daily_spend (date, tier, spend_usd, call_count, token_count) "
+            "VALUES (?,?,?,1,?) ON CONFLICT(date, tier) "
+            "DO UPDATE SET spend_usd = spend_usd + excluded.spend_usd, "
+            "call_count = call_count + 1, "
+            "token_count = token_count + excluded.token_count",
+            (today, tier, cost, total_tokens))
+    except Exception:
+        pass
+
+
+def _check_spend_cap(model: str | None) -> tuple[bool, float, float]:
+    """Check if the daily spend cap allows this request.
+
+    Returns (allowed, current_spend, cap).
+    Fails OPEN — if the DB is unreachable, always allows the request.
+    """
+    try:
+        tier = _spend_tier(model)
+        cap = _SPEND_CAP_MANAGER if tier == "manager" else _SPEND_CAP_WORKER
+        today = _date.today().isoformat()
+        row = _usage_db().execute(
+            "SELECT spend_usd FROM daily_spend WHERE date=? AND tier=?",
+            (today, tier)).fetchone()
+        current = row[0] if row else 0.0
+        return (current < cap, current, cap)
+    except Exception:
+        return (True, 0.0, 0.0)
+
+
+def _init_spend_table() -> None:
+    """Create the daily_spend table if it doesn't exist."""
+    try:
+        _usage_db().execute(
+            "CREATE TABLE IF NOT EXISTS daily_spend ("
+            "date TEXT NOT NULL, "
+            "tier TEXT NOT NULL, "
+            "spend_usd REAL DEFAULT 0, "
+            "call_count INTEGER DEFAULT 0, "
+            "token_count INTEGER DEFAULT 0, "
+            "PRIMARY KEY (date, tier))")
+    except Exception:
+        pass
+
+
+_init_spend_table()
 
 
 # ── quota polling (background thread) ───────────────────────────────────────
@@ -594,6 +848,16 @@ def best_key() -> str:
     except Exception:
         pass  # NEVER break key selection
 
+    # Phase 4 — HEALTH CHECK: skip exhausted keys (empty response / 429)
+    if chosen and not _is_key_healthy(chosen):
+        other = "friend" if chosen == "ours" else "ours"
+        if _is_key_healthy(other):
+            chosen = other
+            reason = f"health_switch_{other}_other_exhausted"
+        else:
+            chosen = None
+            reason = "both_keys_exhausted"
+
     _log_key_decision(chosen_key=chosen, reason=reason, ours_pct=op,
                       friend_pct=fp, ours_available=oa, friend_available=fa)
     return chosen
@@ -616,11 +880,17 @@ def _is_retryable_error(error):
     return any(err in error_str for err in RETRYABLE_EXCEPTIONS)
 
 def _attempt_retry(e, attempt, name, t0, key_order):
-    """Common retry logic for both HTTPError and Exception."""
-    if attempt == len(order) - 1:
-        # All keys tried, handle retry
+    """Retry with binary exponential backoff.
+
+    Between key switches: short jittered delay (prevents hammering endpoint).
+    Full cycle (all keys tried): exponential backoff with Kalman override.
+    """
+    import random
+
+    if attempt >= len(key_order) - 1:
+        # All keys exhausted — full backoff cycle
         _log_rate_limit(key_used=name, attempt=attempt, duration_ms=int((time.time() - t0) * 1000))
-        retry_num = attempt - len(order) + 1
+        retry_num = attempt - len(key_order) + 1
         if retry_num >= 50:
             return False  # Safety cap exhausted
         elif _rate_limit_predictor is not None:
@@ -629,18 +899,192 @@ def _attempt_retry(e, attempt, name, t0, key_order):
             time.sleep(wait)
             return True
         else:
-            # Predictor unavailable — old exponential backoff
-            import random
-            wait = min(2 ** (retry_num + 1), 30) * (0.75 + random.random() * 0.5)
+            # Binary exponential: 2s, 4s, 8s, 16s, 32s, 60s cap
+            wait = min(2 ** (retry_num + 1), 60)
+            wait *= (0.75 + random.random() * 0.5)
             time.sleep(wait)
             return True
     else:
-        # Try the other key
+        # Between key switches — brief delay to let endpoint recover
+        time.sleep(1 + random.random())  # 1-2s jitter
         return True
 
 # ── proxy handler ───────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def _try_ollama_cloud(self, body: bytes, model: str | None,
+                           response_buffer: bytearray, t0: float) -> bool:
+        """Forward request to Ollama Cloud API (primary provider, not failover).
+
+        Ollama Cloud is a $20/mo flat-rate subscription with no per-token cost.
+        During z.ai peak hours (UTC 6-10), z.ai burns 3x quota — Ollama has no
+        peak pricing, making it the preferred provider during peak.
+
+        Returns True on success (response already sent),
+        False on failure (caller should try next provider).
+        """
+        if not OLLAMA_CLOUD_KEY:
+            return False
+        if not _is_key_healthy("ollama_cloud"):
+            return False
+
+        # Map model names: z.ai names work directly on Ollama Cloud API
+        # (glm-5.2 → glm-5.2, no :cloud suffix needed for direct API)
+        ollama_model = model or "glm-5.2"
+
+        try:
+            body_json = json.loads(body) if body else {}
+            body_json["model"] = ollama_model
+            fwd_body = json.dumps(body_json).encode()
+
+            url = OLLAMA_CLOUD_BASE + "/chat/completions"
+            hdrs = {
+                "Authorization": f"Bearer {OLLAMA_CLOUD_KEY}",
+                "Content-Type": "application/json",
+            }
+
+            req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                self.send_response(resp.status)
+                for h, v in resp.headers.items():
+                    if h.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(h, v)
+                self.send_header("X-Provider", "ollama_cloud")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    response_buffer.extend(chunk)
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+                # Parse usage for spend tracking
+                ollama_usage = _parse_usage(bytes(response_buffer))
+                ollama_tokens = int(ollama_usage.get("total_tokens") or 0)
+                _record_spend(ollama_model, ollama_tokens)
+                self._spend_recorded = True
+                _mark_key_healthy("ollama_cloud")
+                _log_api_call(
+                    key_name="ollama_cloud", key_suffix=OLLAMA_CLOUD_KEY[-4:],
+                    model=ollama_model,
+                    prompt_tokens=int(ollama_usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(ollama_usage.get("completion_tokens") or 0),
+                    total_tokens=ollama_tokens,
+                    tier="ollama_cloud", status_code=resp.status, error=None,
+                    duration_ms=int((time.time() - t0) * 1000),
+                )
+                # Log key decision so dashboard shows the switch to ollama_cloud
+                _log_key_decision(
+                    chosen_key="ollama_cloud",
+                    reason="peak_hour_ollama_primary" if _is_peak_hour() else "zai_both_keys_exhausted_ollama_fallback",
+                )
+                return True
+
+        except urllib.error.HTTPError as he:
+            if he.code == 429:
+                _mark_key_exhausted("ollama_cloud")
+            return False
+        except Exception:
+            return False
+
+    def _try_external_failover(self, body: bytes, model: str | None,
+                                response_buffer: bytearray, t0: float) -> bool:
+        """Try forwarding to the cheapest funded external provider when z.ai fails.
+
+        Dynamically selects the provider with the lowest cost that still has
+        credits remaining. On 402 (out of credits), marks that provider
+        unfunded for 1 hour and tries the next cheapest.
+
+        Returns True on success (response already sent),
+        False on failure (caller should send error response).
+        """
+        # Choose failover model based on requesting profile's quality tier.
+        # Manager (glm-5.2): quality floor at deepseek-v4-pro (55.4% SWE-bench).
+        # Workers (glm-4.5-flash): cheapest available (output gets vetted).
+        if model == "glm-5.2":
+            ext_model = MANAGER_FALLBACK_MODEL
+        else:
+            ext_model = WORKER_FALLBACK_MODEL
+
+        # Collect funded providers with their cost
+        candidates = []
+        for name, prov in EXTERNAL_PROVIDERS.items():
+            if not prov.get("key"):
+                continue
+            if not _is_provider_funded(name):
+                continue
+            cost = _get_provider_cost(name, ext_model)
+            candidates.append((cost, name, prov))
+
+        # Sort cheapest first — no hardcoded order
+        candidates.sort(key=lambda c: c[0])
+
+        if not candidates:
+            return False
+
+        for cost, provider_name, prov in candidates:
+            try:
+                body_json = json.loads(body) if body else {}
+                body_json["model"] = ext_model
+                fwd_body = json.dumps(body_json).encode()
+
+                url = prov["base_url"] + "/chat/completions"
+                hdrs = {
+                    "Authorization": f"Bearer {prov['key']}",
+                    "Content-Type": "application/json",
+                }
+                if provider_name == "openrouter":
+                    hdrs["HTTP-Referer"] = "https://hermes.local"
+                    hdrs["X-Title"] = "Hermes Agent"
+
+                req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+                try:
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        self.send_response(resp.status)
+                        for h, v in resp.headers.items():
+                            if h.lower() not in ("transfer-encoding", "connection"):
+                                self.send_header(h, v)
+                        self.send_header("X-Failover-Provider", provider_name)
+                        self.end_headers()
+                        while True:
+                            chunk = resp.read(4096)
+                            if not chunk:
+                                break
+                            response_buffer.extend(chunk)
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        _mark_funded(provider_name)
+                        # Parse usage from the streamed response for spend tracking
+                        ext_usage = _parse_usage(bytes(response_buffer))
+                        ext_tokens = int(ext_usage.get("total_tokens") or 0)
+                        _record_spend(ext_model, ext_tokens)
+                        self._spend_recorded = True
+                        _log_api_call(
+                            key_name=provider_name, key_suffix=prov["key"][-4:],
+                            model=ext_model,
+                            prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                            completion_tokens=int(ext_usage.get("completion_tokens") or 0),
+                            total_tokens=ext_tokens,
+                            tier=provider_name, status_code=resp.status, error=None,
+                            duration_ms=int((time.time() - t0) * 1000),
+                        )
+                        # Log key decision so dashboard shows the failover switch
+                        _log_key_decision(
+                            chosen_key=provider_name,
+                            reason=f"zai_exhausted_{provider_name}_failover",
+                        )
+                        return True
+                except urllib.error.HTTPError as he:
+                    if he.code == 402:
+                        _mark_unfunded(provider_name)
+                        continue
+                    raise
+            except Exception:
+                continue
+
+        return False
 
     def _proxy(self):
         # We strip Transfer-Encoding from upstream responses (below) yet pass no
@@ -653,14 +1097,53 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
+        self._spend_recorded = False  # set True by _try_external_failover on success
 
         # ── Quota-aware model tier routing (auto-downgrade) ────────────────
         # Step 1: Extract original model + client tier hint
         original_model = _extract_model(body)
         tier_hint = self.headers.get("X-Model-Tier", "")
 
+        # Step 1b: Global spend cap — circuit breaker for runaway loops
+        allowed, current_spend, cap = _check_spend_cap(original_model)
+        if not allowed:
+            tier = _spend_tier(original_model)
+            err = json.dumps({
+                "error": f"daily spend cap exceeded for {tier}",
+                "spend_usd": round(current_spend, 4),
+                "cap_usd": cap,
+                "reset_at": "midnight local"
+            }).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
+
+        # Step 1c: Peak-hour routing — during z.ai peak (UTC 6-10), prefer
+        # Ollama Cloud FIRST (z.ai burns 3x quota during peak, Ollama has no peak)
+        peak = _is_peak_hour()
+        if peak and OLLAMA_CLOUD_KEY:
+            response_buffer = bytearray()
+            if self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                return
+
         # Step 2: Choose key (logs the key decision)
         chosen = best_key()
+
+        # If both z.ai keys exhausted, try Ollama Cloud then PPQ
+        if chosen is None:
+            response_buffer = bytearray()
+            if OLLAMA_CLOUD_KEY and self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                return
+            if self._try_external_failover(body, original_model, response_buffer, t0):
+                return
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"all providers exhausted, retry later"}')
+            return
 
         # Step 3: Compute tier for chosen key from Kalman + peak hours + client hint
         model_tier_info = None
@@ -740,27 +1223,88 @@ class Handler(BaseHTTPRequestHandler):
                     req = urllib.request.Request(url, data=body, method=self.command, headers=hdrs)
                     with urllib.request.urlopen(req, timeout=180) as resp:
                         status_code = resp.status
+                        # Buffer full response before sending — allows
+                        # empty-response detection for key health tracking.
+                        full_body = resp.read()
+
+                        # Check for empty or error response
+                        resp_text = full_body.decode('utf-8', errors='ignore').strip()
+                        is_empty = (
+                            not resp_text
+                            or resp_text == "data: [DONE]"
+                        )
+
+                        # Parse JSON to check content field
+                        is_error_response = False
+                        is_truncated = False  # finish_reason=length (ran out of tokens)
+                        if not is_empty:
+                            try:
+                                resp_json = json.loads(resp_text)
+                                # Check for error response (quota exhausted, etc.)
+                                if "error" in resp_json and "choices" not in resp_json:
+                                    is_error_response = True
+                                else:
+                                    choices = resp_json.get("choices", [])
+                                    if choices:
+                                        msg_obj = choices[0].get("message", {})
+                                        content = msg_obj.get("content", "")
+                                        finish_reason = choices[0].get("finish_reason", "")
+                                        if finish_reason == "length":
+                                            is_truncated = True
+                                        if not content or not content.strip():
+                                            # Content is empty — check if reasoning
+                                            # has value we can use instead
+                                            reasoning = msg_obj.get("reasoning_content", "")
+                                            if reasoning and reasoning.strip():
+                                                # Inject reasoning as content so
+                                                # the tokens aren't wasted
+                                                msg_obj["content"] = reasoning
+                                                full_body = json.dumps(resp_json).encode()
+                                                is_empty = False
+                                            else:
+                                                is_empty = True
+                            except Exception:
+                                pass
+
+                        if is_error_response:
+                            # Error responses are transient (model overload,
+                            # internal errors) — NOT quota issues. Only 429
+                            # should block a key. Failover this request only.
+                            continue
+
+                        if is_empty:
+                            # Content AND reasoning both empty — key produced nothing.
+                            # Try external failover for THIS request only.
+                            # Do NOT mark key as exhausted (it might work next time).
+                            if self._try_external_failover(body, model, response_buffer, t0):
+                                return
+                            continue  # try next key
+
+                        # Non-empty response — send to client
+                        _mark_key_healthy(name)
                         self.send_response(resp.status)
                         for h, v in resp.headers.items():
                             if h.lower() not in ("transfer-encoding", "connection"):
                                 self.send_header(h, v)
+                        if is_truncated:
+                            self.send_header("X-Response-Truncated", "true")
                         self.end_headers()
-                        # streaming passthrough (SSE-safe) + buffer for usage parsing
-                        while True:
-                            chunk = resp.read(4096)
-                            if not chunk:
-                                break
-                            response_buffer.extend(chunk)
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
+                        response_buffer.extend(full_body)
+                        self.wfile.write(full_body)
+                        self.wfile.flush()
                         # Success — reset the Kalman consecutive-429 streak.
                         if _rate_limit_predictor is not None:
                             _rate_limit_predictor.record_success()
                         return
                 except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        _mark_key_exhausted(name)
                     if _is_retryable_error(e):
-                        if _attempt_retry(e, attempt, name, t0):
+                        if _attempt_retry(e, attempt, name, t0, order):
                             continue
+                    # z.ai auth failure — try external failover before giving up
+                    if e.code in (401, 403) and self._try_external_failover(body, model, response_buffer, t0):
+                        return
                     # Non-retryable error
                     status_code = e.code
                     error_text = f"HTTPError {e.code}"
@@ -772,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 except Exception as e:
                     if _is_retryable_error(e):
-                        if _attempt_retry(e, attempt, name, t0):
+                        if _attempt_retry(e, attempt, name, t0, order):
                             continue
                     # Non-retryable error
                     status_code = 502
@@ -783,6 +1327,22 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(msg)
                     return
+
+            # All z.ai keys exhausted — try Ollama Cloud (primary, not failover)
+            if not peak and OLLAMA_CLOUD_KEY:
+                if self._try_ollama_cloud(body, model, response_buffer, t0):
+                    return
+
+            # All primary providers exhausted — try paid failover (PPQ/OpenRouter)
+            if self._try_external_failover(body, model, response_buffer, t0):
+                return
+
+            # All providers failed
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"all providers exhausted, retry later"}')
+            return
         finally:
             usage = _parse_usage(bytes(response_buffer))
             suffix = None
@@ -796,6 +1356,8 @@ class Handler(BaseHTTPRequestHandler):
                 tier="zai", status_code=status_code, error=error_text,
                 duration_ms=int((time.time() - t0) * 1000),
             )
+            if not getattr(self, '_spend_recorded', False):
+                _record_spend(model, int(usage.get("total_tokens") or 0))
 
     def do_POST(self): self._proxy()
     def do_PUT(self):  self._proxy()
@@ -899,6 +1461,37 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             }
             payload = json.dumps(models_data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/spend":
+            # Daily spend tracker — shows current spend vs caps
+            self.close_connection = True
+            try:
+                today = _date.today().isoformat()
+                rows = _usage_db().execute(
+                    "SELECT tier, spend_usd, call_count, token_count "
+                    "FROM daily_spend WHERE date=?", (today,)).fetchall()
+                data = {
+                    "date": today,
+                    "caps": {"manager": _SPEND_CAP_MANAGER, "worker": _SPEND_CAP_WORKER},
+                    "tiers": {},
+                }
+                for tier, spend, calls, tokens in rows:
+                    cap = _SPEND_CAP_MANAGER if tier == "manager" else _SPEND_CAP_WORKER
+                    data["tiers"][tier] = {
+                        "spend_usd": round(spend, 4),
+                        "cap_usd": cap,
+                        "pct_of_cap": round(spend / cap * 100, 1) if cap > 0 else 0,
+                        "call_count": calls,
+                        "token_count": tokens,
+                    }
+            except Exception as e:
+                data = {"error": str(e)}
+            payload = json.dumps(data, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

@@ -157,11 +157,56 @@ def _mark_funded(name: str) -> None:
 # force a key to be treated as unhealthy (e.g. a cancelled subscription).
 # Re-enable with: rm ~/.hermes/bot/.key_disabled_<name>
 
-_BACKOFF_BASE_SECONDS = 30        # 1st failure → 30s
-_BACKOFF_CAP_SECONDS    = 3600    # cap at 1 hour (reached at the 7th failure)
-_KEY_DEAD_THRESHOLD     = 7       # log KEY_DEAD anomaly after this many failures
+# Exponential backoff ramp for QUOTA-EXHAUSTION failures (429 / empty response).
+# Spec: 2s→4s→8s→16s→32s→60s (capped). A single 429 blocks a key for only 2s so
+# the other key / external failover covers traffic immediately; repeated 429s
+# escalate up to the 60s cap.
+_BACKOFF_SEQUENCE = (2, 4, 8, 16, 32, 60)
+
+# Dead key (401/403) — auth failure, likely revoked/cancelled. Flat 1h: a dead
+# key will not recover by retrying quickly, so park it for an hour.
+_DEAD_KEY_BACKOFF_SECONDS = 3600
+
+# Upstream server error (500/502/503/504) — transient, not the key's fault.
+# Medium flat backoff.
+_SERVER_ERROR_BACKOFF_SECONDS = 30
+
+# Legacy aliases — kept so any external script referencing them still resolves.
+_BACKOFF_BASE_SECONDS = 30
+_BACKOFF_CAP_SECONDS    = 3600
+
+# Log a KEY_DEAD anomaly after this many consecutive failures of any type —
+# surfaces persistently-failing keys (e.g. a cancelled subscription) to dashboards.
+_KEY_DEAD_THRESHOLD     = 7
 
 _zai_key_health: dict[str, dict] = {}
+
+
+def _disabled_flag_path(name: str) -> Path:
+    """Filesystem flag path used to manually disable key *name*."""
+    return Path.home() / ".hermes" / "bot" / f".key_disabled_{name}"
+
+
+def _is_manually_disabled(name: str) -> bool:
+    """True iff the operator has touched ~/.hermes/bot/.key_disabled_<name>.
+
+    Lightweight check (no logging) — safe to call inside loops (e.g. the retry
+    order filter). ``_is_key_healthy`` does its own check + dashboard log, so
+    prefer this helper anywhere that would otherwise spam key_decisions.
+    Fails OPEN: a filesystem error is treated as 'not disabled'."""
+    try:
+        return _disabled_flag_path(name).exists()
+    except Exception:
+        return False
+
+
+def _backoff_for_failure(failure_count: int) -> float:
+    """Exponential backoff (seconds) for the Nth consecutive *exhaustion* failure
+    (1-indexed): returns 2,4,8,16,32 then 60 for all subsequent failures."""
+    if failure_count <= 0:
+        return 0.0
+    idx = min(failure_count - 1, len(_BACKOFF_SEQUENCE) - 1)
+    return float(_BACKOFF_SEQUENCE[idx])
 
 
 def _ensure_anomaly_table() -> None:
@@ -231,45 +276,113 @@ def _is_key_healthy(name: str) -> bool:
     return time.time() >= h.get("retry_after", 0)
 
 
-def _mark_key_exhausted(name: str) -> None:
-    """Mark a z.ai key as out of quota (empty response or 429).
+def _mark_key_failure(name: str, error_type: str = "exhausted") -> None:
+    """Record one failure for *name* and arm the appropriate backoff window.
 
-    Uses binary exponential backoff: the retry-after delay doubles with each
-    consecutive failure, starting at _BACKOFF_BASE_SECONDS (30s) and capped at
-    _BACKOFF_CAP_SECONDS (3600s = 1h). When failures reach _KEY_DEAD_THRESHOLD
-    (7, i.e. when the cap is first hit), a 'KEY_DEAD' anomaly is logged for
-    dashboard visibility (e.g. a cancelled subscription where every retry
-    fails).
-    """
-    prev = _zai_key_health.get(name, {})
-    failures = prev.get("consecutive_failures", 0) + 1
-    backoff = min(_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)),
-                  _BACKOFF_CAP_SECONDS)
-    _zai_key_health[name] = {
-        "healthy": False,
-        "last_empty": time.time(),
-        "retry_after": time.time() + backoff,
-        "consecutive_failures": failures,
-        "backoff_seconds": backoff,
-    }
-    # Log every backoff level for dashboard visibility.
-    _log_anomaly("key_backoff", name,
-                 f"failure_{failures}_backoff_{backoff}s")
-    # When the cap is first reached, surface a KEY_DEAD anomaly so dashboards
-    # can alert (e.g. a cancelled subscription with persistent failures).
-    if failures == _KEY_DEAD_THRESHOLD:
-        _log_anomaly("KEY_DEAD", name,
-                     f"key reached {failures} consecutive failures "
-                     f"(backoff capped at {_BACKOFF_CAP_SECONDS}s) — likely dead")
+    error_type selects the backoff strategy (req 2 — dead-key detection):
+      "exhausted" (429 / empty) → exponential ramp 2→60s (req 1)
+      "dead"     (401/403)      → flat 1h (key likely revoked)
+      "server"   (500/502/503/504) → flat 30s (transient upstream issue)
+
+    Bumps the consecutive-failure counter (reset on success), mirrors the new
+    state to the ``key_health`` table (req 4), and logs backoff/KEY_DEAD
+    anomalies for dashboards. Never raises — a logging failure must never break
+    a proxied request."""
+    try:
+        now = time.time()
+        prev = _zai_key_health.get(name, {})
+        failures = int(prev.get("consecutive_failures", 0)) + 1
+        if error_type == "dead":
+            backoff = _DEAD_KEY_BACKOFF_SECONDS
+        elif error_type == "server":
+            backoff = _SERVER_ERROR_BACKOFF_SECONDS
+        else:  # "exhausted" — 429 / empty response
+            backoff = _backoff_for_failure(failures)
+        retry_after = now + backoff
+        disabled = _is_manually_disabled(name)
+        _zai_key_health[name] = {
+            "healthy": False,
+            "last_empty": now,
+            "retry_after": retry_after,
+            "consecutive_failures": failures,
+            "backoff_seconds": backoff,
+            "last_error_type": error_type,
+            "last_failure_ts": now,
+            "backoff_until": retry_after,
+            "disabled_manually": disabled,
+        }
+        # Mirror per-key state to the key_health table (req 4 — circuit breaker
+        # state: failure_count, last_failure_ts, last_error_type, backoff_until,
+        # disabled_manually). _log_key_health is defined near the other _log_*
+        # helpers below; forward reference is resolved at call time.
+        _log_key_health(name, _zai_key_health[name])
+        # Anomaly logging (dashboard visibility). _log_anomaly signature is
+        # (severity, category, title, detail, key_name=None) — the logger
+        # JSON-encodes detail+key_name into the shared anomaly_events table.
+        _log_anomaly("WARN", "key_backoff",
+                     f"{name} {error_type} failure #{failures}",
+                     f"backoff {backoff}s; error_type={error_type}",
+                     key_name=name)
+        # A definitive auth failure means the key is dead right now — surface it
+        # immediately rather than waiting for the N-failure threshold.
+        if error_type == "dead":
+            _log_anomaly("CRITICAL", "KEY_DEAD",
+                         f"{name} marked dead (auth failure 401/403)",
+                         f"backoff {_DEAD_KEY_BACKOFF_SECONDS}s; error_type=dead",
+                         key_name=name)
+        elif failures == _KEY_DEAD_THRESHOLD:
+            _log_anomaly("CRITICAL", "KEY_DEAD",
+                         f"{name} reached {failures} consecutive failures",
+                         f"backoff {backoff}s; likely dead",
+                         key_name=name)
+    except Exception:
+        pass
+
+
+def _mark_key_exhausted(name: str) -> None:
+    """Backward-compat shim — record a quota-exhaustion failure (429 / empty).
+
+    Preserved so existing call sites (and the ollama_cloud 429 path) keep
+    working; routes into the circuit breaker with error_type='exhausted'."""
+    _mark_key_failure(name, error_type="exhausted")
+
+
+def _mark_key_dead(name: str) -> None:
+    """Record an auth failure (401/403) — long flat backoff, key may be revoked."""
+    _mark_key_failure(name, error_type="dead")
+
+
+def _mark_key_server_error(name: str) -> None:
+    """Record a 5xx upstream error — medium flat backoff (not the key's fault)."""
+    _mark_key_failure(name, error_type="server")
 
 
 def _mark_key_healthy(name: str) -> None:
-    """Mark a z.ai key as healthy (successful response with content).
+    """Mark a key healthy (successful response) and reset its failure counter.
 
-    Resets the consecutive-failure counter so the next exhaustion starts
-    fresh from the minimum backoff.
-    """
-    _zai_key_health[name] = {"healthy": True, "consecutive_failures": 0}
+    Resets consecutive_failures to 0 so the next exhaustion starts fresh from
+    the minimum backoff. A manually-disabled key is kept disabled even on a
+    success — the flag file is the operator's explicit override and is not
+    auto-cleared here (remove the file to re-enable). Mirrors the reset to the
+    key_health table. Never raises."""
+    try:
+        disabled = _is_manually_disabled(name)
+        prev = _zai_key_health.get(name, {})
+        _zai_key_health[name] = {
+            "healthy": not disabled,
+            "consecutive_failures": 0,
+            "last_error_type": None,
+            "last_failure_ts": prev.get("last_failure_ts", 0),
+            "backoff_until": 0 if not disabled else prev.get("backoff_until", 0),
+            "backoff_seconds": 0,
+            "disabled_manually": disabled,
+            # legacy fields
+            "last_empty": prev.get("last_empty", 0),
+            "retry_after": 0 if not disabled else prev.get("retry_after", 0),
+        }
+        _log_key_health(name, _zai_key_health[name])
+    except Exception:
+        pass
 
 
 def _mark_unfunded(name: str) -> None:
@@ -475,6 +588,21 @@ def _usage_db() -> sqlite3.Connection:
             active_key TEXT
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_model_decisions_ts ON model_decisions(ts)")
+        # ── circuit-breaker state (one row per key, upserted) ───────────────
+        # Tracks failure_count, last_failure_ts, last_error_type, backoff_until,
+        # disabled_manually for each key. Written by _log_key_health on every
+        # state change. PK=key_name so it always reflects the LATEST state.
+        conn.execute("""CREATE TABLE IF NOT EXISTS key_health (
+            key_name           TEXT PRIMARY KEY,
+            healthy            INTEGER NOT NULL,
+            failure_count      INTEGER NOT NULL DEFAULT 0,
+            last_failure_ts    REAL,
+            last_error_type    TEXT,
+            backoff_until      REAL,
+            disabled_manually  INTEGER NOT NULL DEFAULT 0,
+            backoff_seconds    INTEGER DEFAULT 0,
+            updated_ts         REAL NOT NULL
+        )""")
         _usage_db_conn = conn
     return _usage_db_conn
 
@@ -585,6 +713,39 @@ def _log_model_decision(*, key_name=None, model=None, original_model=None,
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), key_name, model, original_model,
              tier, base_tier, hint, reason, peak, hours_left, active_key))
+    except Exception:
+        pass
+
+
+def _log_key_health(name: str, state: dict) -> None:
+    """Upsert the current per-key circuit-breaker state into ``key_health``.
+
+    One row per key (PRIMARY KEY = key_name) — queryable for dashboards and
+    post-mortems. Called from _mark_key_failure / _mark_key_healthy on every
+    state transition. Swallows all errors — never breaks a request."""
+    try:
+        _usage_db().execute(
+            "INSERT INTO key_health (key_name, healthy, failure_count, "
+            "last_failure_ts, last_error_type, backoff_until, "
+            "disabled_manually, backoff_seconds, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(key_name) DO UPDATE SET "
+            "healthy=excluded.healthy, failure_count=excluded.failure_count, "
+            "last_failure_ts=excluded.last_failure_ts, "
+            "last_error_type=excluded.last_error_type, "
+            "backoff_until=excluded.backoff_until, "
+            "disabled_manually=excluded.disabled_manually, "
+            "backoff_seconds=excluded.backoff_seconds, "
+            "updated_ts=excluded.updated_ts",
+            (name,
+             1 if state.get("healthy") else 0,
+             int(state.get("consecutive_failures", 0)),
+             state.get("last_failure_ts"),
+             state.get("last_error_type"),
+             state.get("backoff_until", 0),
+             1 if state.get("disabled_manually") else 0,
+             int(state.get("backoff_seconds", 0)),
+             time.time()))
     except Exception:
         pass
 
@@ -1323,6 +1484,13 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         order = [chosen] + [n for n in KEYS if n != chosen]
+        # Never try manually-disabled keys (operator touched
+        # ~/.hermes/bot/.key_disabled_<name>). best_key() Phase 4 already steers
+        # the *initial* choice away from them via _is_key_healthy; this filter
+        # also drops them from the retry fallback list so the loop skips them
+        # entirely. If every key is disabled, `order` empties and the request
+        # falls through to Ollama Cloud / external failover (correct behaviour).
+        order = [n for n in order if not _is_manually_disabled(n)]
 
         response_buffer = bytearray()
         key_used: str | None = None
@@ -1430,8 +1598,17 @@ class Handler(BaseHTTPRequestHandler):
                             _rate_limit_predictor.record_success()
                         return
                 except urllib.error.HTTPError as e:
+                    # Classify the failure by HTTP status to arm the correct
+                    # circuit-breaker backoff (req 2 — dead-key detection):
+                    #   429              → exhausted (exponential 2→60s)
+                    #   401/403          → dead key  (flat 1h)
+                    #   500/502/503/504  → server err (flat 30s)
                     if e.code == 429:
                         _mark_key_exhausted(name)
+                    elif e.code in (401, 403):
+                        _mark_key_dead(name)
+                    elif e.code in (500, 502, 503, 504):
+                        _mark_key_server_error(name)
                     if _is_retryable_error(e):
                         if _attempt_retry(e, attempt, name, t0, order):
                             continue

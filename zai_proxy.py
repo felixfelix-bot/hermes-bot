@@ -453,6 +453,78 @@ try:
 except Exception:
     pass
 
+# ── shadow-mode decision tap (Phase 2.1, ADR-014) ────────────────────────────
+# READ-ONLY tap: logs what the price-first RoutingOptimizer WOULD have chosen
+# alongside the live best_key() pick, so the two strategies can be compared
+# after a soak period. NEVER affects routing — every failure is swallowed and
+# `_shadow_logger`/`_shadow_optimizer` stay None on any import error, leaving
+# production routing 100% unchanged.
+#
+# NOTE on deviation from the task body template: the body called
+# `RoutingOptimizer(config_path=...)` and `log_decision(live_key=...,
+# shadow_decision=...)`, but those signatures DO NOT EXIST. RoutingOptimizer
+# has no config loader (providers are registered via add_provider, each backed
+# by a PriceKalman + ConsumptionKalman), and ShadowLogger.log_decision takes
+# positional fields (ts, live_provider, live_model, shadow_provider,
+# shadow_model, shadow_cost, tokens, reason, live_cost). Pasting the body
+# verbatim would raise TypeError on import and silently disable the tap forever
+# (the TEST row-count check would never increase). The construction below
+# mirrors tests/test_integration.py::_three_provider_optimizer and the topology
+# in config/providers.yaml; the tap below maps route()'s return dict to
+# log_decision()'s real signature. Static seeded Kalman rates are used because
+# no config->optimizer loader exists yet (out of scope for a read-only tap).
+_shadow_logger = None
+_shadow_optimizer = None
+try:
+    _SHADOW_REPO = '/home/c03rad0r/merchant-routing-engine'
+    if _SHADOW_REPO not in sys.path:
+        sys.path.insert(0, _SHADOW_REPO)
+    from src.shadow_logger import ShadowLogger as _ShadowLogger
+    from src.routing_optimizer import RoutingOptimizer as _RoutingOptimizer
+    from src.price_kalman import PriceKalman as _ShadowPriceKalman
+    from src.consumption_kalman import ConsumptionKalman as _ShadowConsumptionKalman
+
+    def _shadow_pk(rate):
+        kf = _ShadowPriceKalman(initial_rate=rate, process_noise=1e-6,
+                                measurement_noise=1e-4)
+        kf.update(rate)
+        return kf
+
+    _shadow_optimizer = _RoutingOptimizer(peak_hours_utc=(6, 10), peak_mult=3.0)
+    # zai_ours — flat-rate subscription, high tier, cheapest off-peak, peak window
+    _shadow_optimizer.add_provider(
+        "zai_ours", _shadow_pk(0.068), _ShadowConsumptionKalman(),
+        quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,
+        peak_hours_utc=(6, 10), peak_mult=3.0,
+    )
+    # zai_friend — derived +21% premium over ours (ADR-005), high tier
+    _shadow_optimizer.add_provider(
+        "zai_friend", _shadow_pk(0.068 * 1.21), _ShadowConsumptionKalman(),
+        quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,
+        peak_hours_utc=(6, 10), peak_mult=3.0,
+    )
+    # ollama_cloud — flat-rate $100/mo, standard tier, NO peak window
+    _shadow_optimizer.add_provider(
+        "ollama_cloud", _shadow_pk(0.40), _ShadowConsumptionKalman(),
+        quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
+    )
+    # ppq_external — per-token, low tier, most expensive, last resort
+    _shadow_optimizer.add_provider(
+        "ppq_external", _shadow_pk(0.80), _ShadowConsumptionKalman(),
+        quota_remaining=10_000_000, model_tier="low", quota_total=20_000_000,
+    )
+    # Defaults to ~/.hermes/bot/zai_usage.db (config/providers.yaml :: shadow_mode.db_path)
+    _shadow_logger = _ShadowLogger()
+except Exception:
+    _shadow_logger = None
+    _shadow_optimizer = None
+
+def _shadow_live_label(chosen_key):
+    """Map the proxy's key name ('ours'/'friend') into the optimizer's
+    provider namespace ('zai_ours'/'zai_friend') so the agreement comparison
+    in ShadowLogger.log_decision is meaningful."""
+    return {"ours": "zai_ours", "friend": "zai_friend"}.get(chosen_key, "zai")
+
 # ── Model tier router DISABLED — model selection is now profile-level ──
 # Each profile (manager, workers) sets its own model in config.yaml.
 # Manager: always GLM-5.2 (user-facing, high quality)
@@ -1444,6 +1516,32 @@ class Handler(BaseHTTPRequestHandler):
 
         # Step 2: Choose key (logs the key decision)
         chosen = best_key()
+
+        # Shadow mode (Phase 2.1, ADR-014): record what the price-first
+        # optimizer WOULD have chosen, alongside the live best_key() pick.
+        # READ-ONLY — never changes `chosen` or any routing state. Runs
+        # synchronously (<1ms: persistent conn + prepared INSERT per the
+        # ShadowLogger contract); any failure is swallowed so production is
+        # unaffected. Only logged when a real z.ai key was chosen (skips the
+        # both-exhausted fall-through to Ollama/PPQ, where there is no live
+        # best_key decision to compare against).
+        if _shadow_logger and _shadow_optimizer and chosen:
+            try:
+                _sd = _shadow_optimizer.route(difficulty="medium", estimated_tokens=0)
+                if _sd:
+                    _shadow_logger.log_decision(
+                        ts=time.time(),
+                        live_provider=_shadow_live_label(chosen),
+                        live_model=original_model,
+                        shadow_provider=_sd.get("chosen_provider"),
+                        shadow_model=_sd.get("chosen_model"),
+                        shadow_cost=_sd.get("effective_cost_per_1m"),
+                        tokens=0,
+                        reason=(_sd.get("reason") or "")[:200],
+                        live_cost=None,
+                    )
+            except Exception:
+                pass  # Shadow mode never blocks production
 
         # If both z.ai keys exhausted, try Ollama Cloud then PPQ
         if chosen is None:

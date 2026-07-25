@@ -46,6 +46,19 @@ LOCK_THRESHOLDS = {
     "weekly":  {"ours": 60, "friend": 80},   # proactive: switch off ours at 60% (40% buffer)
     "monthly": {"ours": 95, "friend": 95},   # tools limit (high — rarely hit)
 }
+
+# Cost-aware routing tie-breaker. Cheapest key wins when both are unlocked
+# AND healthy. NOTE: cost is a TIE-BREAKER only — Kalman exhaustion prediction
+# and per-window lock thresholds remain the primary signals in best_key().
+#
+#   ours          1.0   — base rate (z.ai subscription); CHEAPEST when healthy.
+#                         Subscription may be cancelled → mark dead with:
+#                         touch ~/.hermes/bot/.key_disabled_ours
+#   friend        1.21  — z.ai courtesy key (21% premium over base rate).
+#   ollama_cloud  1.0   — flat-rate cloud ($100/mo, ~$0.024/M tokens). Preferred
+#                         during z.ai peak hours (UTC 6-10) or when z.ai is dead.
+#   ppq           — pay-per-token; most expensive, last-resort failover only.
+_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0}
 UPSTREAM   = "https://api.z.ai/api/coding/paas/v4"
 QUOTA_URL  = "https://api.z.ai/api/monitor/usage/quota/limit"
 CACHE_TTL  = 300                                # 5 min
@@ -135,16 +148,83 @@ def _mark_funded(name: str) -> None:
 
 # ── z.ai key health tracker ─────────────────────────────────────────────────
 # Same pattern as _provider_health, but for z.ai keys. When a key returns
-# an empty response or 429, it's marked exhausted for 5 minutes.
-# best_key() skips exhausted keys. When both are exhausted, the proxy
-# fails over to external providers (PPQ/OpenRouter).
-_EXHAUSTED_RETRY_SECONDS = 120  # retry exhausted key after 2 min
+# an empty response or 429, it's marked exhausted with BINARY EXPONENTIAL
+# BACKOFF: each consecutive failure doubles the retry-after delay (capped
+# at 1 hour). best_key() skips exhausted keys. When both are exhausted,
+# the proxy fails over to external providers (PPQ/OpenRouter).
+#
+# Manual override: drop a flag file ~/.hermes/bot/.key_disabled_<name> to
+# force a key to be treated as unhealthy (e.g. a cancelled subscription).
+# Re-enable with: rm ~/.hermes/bot/.key_disabled_<name>
+
+_BACKOFF_BASE_SECONDS = 30        # 1st failure → 30s
+_BACKOFF_CAP_SECONDS    = 3600    # cap at 1 hour (reached at the 7th failure)
+_KEY_DEAD_THRESHOLD     = 7       # log KEY_DEAD anomaly after this many failures
 
 _zai_key_health: dict[str, dict] = {}
 
 
+def _ensure_anomaly_table() -> None:
+    """Ensure the anomaly_events table exists. Swallows all errors.
+
+    Uses the SHARED monitoring schema (severity/category/title/detail) that the
+    bot's anomaly detector also writes to. On systems where the table already
+    exists this is a defensive no-op (CREATE IF NOT EXISTS)."""
+    try:
+        _usage_db().execute(
+            "CREATE TABLE IF NOT EXISTS anomaly_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "ts REAL NOT NULL,"
+            "severity TEXT NOT NULL,"
+            "category TEXT NOT NULL,"
+            "title TEXT,"
+            "detail TEXT,"
+            "alerted INTEGER DEFAULT 0,"
+            "resolved INTEGER DEFAULT 0)")
+        _usage_db().execute(
+            "CREATE INDEX IF NOT EXISTS idx_anomaly_ts ON anomaly_events(ts)")
+    except Exception:
+        pass
+
+
+def _log_anomaly(severity: str, category: str, title: str,
+                 detail: str, key_name: str | None = None) -> None:
+    """Insert one row into the shared anomaly_events table.
+
+    Writes to the monitoring schema (severity/category/title/detail). ``detail``
+    is stored as a JSON object so dashboards can parse key_name + extras.
+    Swallows all errors.
+    """
+    try:
+        _ensure_anomaly_table()
+        payload: dict = {"detail": detail}
+        if key_name is not None:
+            payload["key_name"] = key_name
+        _usage_db().execute(
+            "INSERT INTO anomaly_events (ts, severity, category, title, detail) "
+            "VALUES (?,?,?,?,?)",
+            (time.time(), severity, category, title, json.dumps(payload)))
+    except Exception:
+        pass
+
+
 def _is_key_healthy(name: str) -> bool:
-    """Check if a z.ai key has quota remaining."""
+    """Check if a z.ai key has quota remaining.
+
+    Returns False immediately if a manual-disable flag file exists:
+        ~/.hermes/bot/.key_disabled_<name>
+    Re-enable by removing the file, e.g.:
+        rm ~/.hermes/bot/.key_disabled_ours
+    """
+    # Manual disable via flag file — checked first, overrides everything.
+    try:
+        if (Path.home() / ".hermes" / "bot" / f".key_disabled_{name}").exists():
+            _log_key_decision(chosen_key=None,
+                              reason=f"manually_disabled_{name}")
+            return False
+    except Exception:
+        pass
+
     h = _zai_key_health.get(name)
     if not h or h.get("healthy", True):
         return True
@@ -152,17 +232,44 @@ def _is_key_healthy(name: str) -> bool:
 
 
 def _mark_key_exhausted(name: str) -> None:
-    """Mark a z.ai key as out of quota (empty response or 429)."""
+    """Mark a z.ai key as out of quota (empty response or 429).
+
+    Uses binary exponential backoff: the retry-after delay doubles with each
+    consecutive failure, starting at _BACKOFF_BASE_SECONDS (30s) and capped at
+    _BACKOFF_CAP_SECONDS (3600s = 1h). When failures reach _KEY_DEAD_THRESHOLD
+    (7, i.e. when the cap is first hit), a 'KEY_DEAD' anomaly is logged for
+    dashboard visibility (e.g. a cancelled subscription where every retry
+    fails).
+    """
+    prev = _zai_key_health.get(name, {})
+    failures = prev.get("consecutive_failures", 0) + 1
+    backoff = min(_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)),
+                  _BACKOFF_CAP_SECONDS)
     _zai_key_health[name] = {
         "healthy": False,
         "last_empty": time.time(),
-        "retry_after": time.time() + _EXHAUSTED_RETRY_SECONDS,
+        "retry_after": time.time() + backoff,
+        "consecutive_failures": failures,
+        "backoff_seconds": backoff,
     }
+    # Log every backoff level for dashboard visibility.
+    _log_anomaly("key_backoff", name,
+                 f"failure_{failures}_backoff_{backoff}s")
+    # When the cap is first reached, surface a KEY_DEAD anomaly so dashboards
+    # can alert (e.g. a cancelled subscription with persistent failures).
+    if failures == _KEY_DEAD_THRESHOLD:
+        _log_anomaly("KEY_DEAD", name,
+                     f"key reached {failures} consecutive failures "
+                     f"(backoff capped at {_BACKOFF_CAP_SECONDS}s) — likely dead")
 
 
 def _mark_key_healthy(name: str) -> None:
-    """Mark a z.ai key as healthy (successful response with content)."""
-    _zai_key_health[name] = {"healthy": True}
+    """Mark a z.ai key as healthy (successful response with content).
+
+    Resets the consecutive-failure counter so the next exhaustion starts
+    fresh from the minimum backoff.
+    """
+    _zai_key_health[name] = {"healthy": True, "consecutive_failures": 0}
 
 
 def _mark_unfunded(name: str) -> None:
@@ -754,9 +861,21 @@ def _best_unlocked():
         reason = f"only_available_friend_locked_{f_lwin}_{f_lpct}pct"
         return ("ours", reason, op, fp, 1, 0)
 
-    # neither locked → always prefer our key. We own it; friend's key is a
-    # courtesy fallback used only when our key is locked (weekly >= 80%).
-    return ("ours", f"prefer_ours_both_unlocked_ours_{op}_friend_{fp}", op, fp, 1, 1)
+    # neither locked → prefer the CHEAPER key (cost-aware tie-break).
+    # Per _KEY_COST_MULTIPLIER, ours (1.0) is cheaper than friend (1.21), so
+    # we default to ours. We own it; friend's key is a courtesy fallback.
+    # If ours has been manually disabled or is mid-backoff, _is_key_healthy
+    # catches that in Phase 4 of best_key() and switches to friend there.
+    ours_cost  = _KEY_COST_MULTIPLIER.get("ours",   1.0)
+    friend_cost = _KEY_COST_MULTIPLIER.get("friend", 1.0)
+    if friend_cost < ours_cost:
+        chosen, reason = "friend", (f"cost_aware_friend_{friend_cost}_cheaper_"
+                                    f"ours_{ours_cost}_o{op}pct_f{fp}pct")
+    else:
+        chosen, reason = "ours", (f"cost_aware_prefer_ours_both_unlocked_"
+                                  f"ours_{ours_cost}_friend_{friend_cost}_"
+                                  f"o{op}pct_f{fp}pct")
+    return (chosen, reason, op, fp, 1, 1)
 
 
 def best_key() -> str:
@@ -1121,7 +1240,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(err)
             return
 
-        # Step 1c: Peak-hour routing — during z.ai peak (UTC 6-10), prefer
+        # Step 1c: Ollama-only models — route directly to Ollama Cloud
+        # These models don't exist on z.ai, so skip z.ai entirely
+        _OLLAMA_ONLY_MODELS = {"kimi-k2.7-code", "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b"}
+        if original_model in _OLLAMA_ONLY_MODELS and OLLAMA_CLOUD_KEY:
+            response_buffer = bytearray()
+            if self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                return
+            # If ollama cloud fails for an ollama-only model, don't try z.ai
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(f'{{"error":"ollama cloud failed for ollama-only model {original_model}"}}'.encode())
+            return
+
+        # Step 1d: Peak-hour routing — during z.ai peak (UTC 6-10), prefer
         # Ollama Cloud FIRST (z.ai burns 3x quota during peak, Ollama has no peak)
         peak = _is_peak_hour()
         if peak and OLLAMA_CLOUD_KEY:

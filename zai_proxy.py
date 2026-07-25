@@ -762,8 +762,21 @@ from datetime import date as _date
 _SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "10.0"))
 _SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "3.0"))
 
-# Cost per 1M tokens (combined input+output estimate). z.ai = $0 (subscription).
+# Cost per 1M tokens with the new pricing model:
+# - ollama: $100/mo flat rate subscription (calculated as ~$0.024/M tokens typical usage)
+# - friend: 21% premium over base rate 
+# - ours: $0 (cancelled subscription)
 _MODEL_COST_PER_1M: dict[str, float] = {
+    # Ollama Cloud - flat rate ($100/mo ≈ $0.024/M tokens at typical usage)
+    "ollama_cloud": 0.024,
+    
+    # Friend key - 21% premium over ollama rate  
+    "friend": 0.029,  # 0.024 * 1.21 = 0.02904
+    
+    # Our key - cancelled subscription ($0)
+    "ours": 0.0,
+    
+    # Legacy model pricing (kept for compatibility but may not be used)
     "glm-5.2":                 0.0,
     "glm-4.5-flash":           0.0,
     "glm-4.5":                 0.88,
@@ -772,7 +785,7 @@ _MODEL_COST_PER_1M: dict[str, float] = {
     "glm-4.5-x":               5.55,
     "deepseek/deepseek-v4-pro":   1.30,
     "deepseek/deepseek-v4-flash": 0.09,
-    # Ollama Cloud models — $0/token (subscription, flat rate)
+    # Legacy ollama models (kept for compatibility)
     "gpt-oss:120b":            0.0,
     "gemma4:31b":              0.0,
     "qwen3.5:397b":            0.0,
@@ -780,30 +793,29 @@ _MODEL_COST_PER_1M: dict[str, float] = {
 }
 
 
-def _spend_tier(model: str | None) -> str:
-    """Classify a request as 'manager' or 'worker' based on model.
-    Manager models: glm-5.2 (primary) + deepseek-v4-pro (fallback).
-    Worker models: everything else (glm-4.5-flash, deepseek-v4-flash, etc.)."""
-    if model in ("glm-5.2", MANAGER_FALLBACK_MODEL):
-        return "manager"
-    return "worker"
+def _spend_tier(key_name: str | None) -> str:
+    """Classify a request by key type for cost tracking.
+    Key types: ours (z.ai subscription), friend (courtesy key), ollama_cloud (flat-rate)."""
+    if key_name in ("ours", "friend"):
+        return key_name
+    elif key_name == "ollama_cloud":
+        return "ollama_cloud"
+    return "unknown"
 
 
-def _estimate_cost_usd(model: str | None, total_tokens: int) -> float:
-    """Estimate USD cost for a request. Returns 0.0 for unknown/free models."""
-    if not model or total_tokens <= 0:
+def _estimate_cost_usd(key_name: str | None, total_tokens: int) -> float:
+    """Estimate USD cost for a request based on key type. Returns 0.0 for unknown/free keys."""
+    if not key_name or total_tokens <= 0:
         return 0.0
-    cost_per_1m = _MODEL_COST_PER_1M.get(model)
-    if cost_per_1m is None:
-        cost_per_1m = _MODEL_COST_PER_1M.get(model.lower(), 0.0)
+    cost_per_1m = _MODEL_COST_PER_1M.get(key_name, 0.0)
     return (total_tokens / 1_000_000) * cost_per_1m
 
 
-def _record_spend(model: str | None, total_tokens: int) -> None:
+def _record_spend(key_name: str | None, model: str | None, total_tokens: int) -> None:
     """Record spend for today. Called from the finally block of every request."""
     try:
-        tier = _spend_tier(model)
-        cost = _estimate_cost_usd(model, total_tokens)
+        tier = _spend_tier(key_name)
+        cost = _estimate_cost_usd(key_name, total_tokens)
         today = _date.today().isoformat()
         _usage_db().execute(
             "INSERT INTO daily_spend (date, tier, spend_usd, call_count, token_count) "
@@ -816,15 +828,22 @@ def _record_spend(model: str | None, total_tokens: int) -> None:
         pass
 
 
-def _check_spend_cap(model: str | None) -> tuple[bool, float, float]:
+def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     """Check if the daily spend cap allows this request.
 
     Returns (allowed, current_spend, cap).
     Fails OPEN — if the DB is unreachable, always allows the request.
     """
     try:
-        tier = _spend_tier(model)
-        cap = _SPEND_CAP_MANAGER if tier == "manager" else _SPEND_CAP_WORKER
+        tier = _spend_tier(key_name)
+        # Use different caps for different key types
+        if tier == "ollama_cloud":
+            cap = _SPEND_CAP_MANAGER  # Higher cap for ollama cloud
+        elif tier == "friend":
+            cap = _SPEND_CAP_WORKER   # Lower cap for friend key
+        else:  # ours or unknown
+            cap = _SPEND_CAP_WORKER    # Default worker cap
+        
         today = _date.today().isoformat()
         row = _usage_db().execute(
             "SELECT spend_usd FROM daily_spend WHERE date=? AND tier=?",
@@ -1243,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Parse usage for spend tracking
                 ollama_usage = _parse_usage(bytes(response_buffer))
                 ollama_tokens = int(ollama_usage.get("total_tokens") or 0)
-                _record_spend(ollama_model, ollama_tokens)
+                _record_spend("ollama_cloud", ollama_model, ollama_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy("ollama_cloud")
                 _log_api_call(
@@ -1339,7 +1358,7 @@ class Handler(BaseHTTPRequestHandler):
                         # Parse usage from the streamed response for spend tracking
                         ext_usage = _parse_usage(bytes(response_buffer))
                         ext_tokens = int(ext_usage.get("total_tokens") or 0)
-                        _record_spend(ext_model, ext_tokens)
+                        _record_spend(provider_name, ext_model, ext_tokens)
                         self._spend_recorded = True
                         _log_api_call(
                             key_name=provider_name, key_suffix=prov["key"][-4:],
@@ -1385,7 +1404,7 @@ class Handler(BaseHTTPRequestHandler):
         tier_hint = self.headers.get("X-Model-Tier", "")
 
         # Step 1b: Global spend cap — circuit breaker for runaway loops
-        allowed, current_spend, cap = _check_spend_cap(original_model)
+        allowed, current_spend, cap = _check_spend_cap("unknown")  # Pre-key selection check
         if not allowed:
             tier = _spend_tier(original_model)
             err = json.dumps({
@@ -1667,7 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
                 duration_ms=int((time.time() - t0) * 1000),
             )
             if not getattr(self, '_spend_recorded', False):
-                _record_spend(model, int(usage.get("total_tokens") or 0))
+                _record_spend(key_used, model, int(usage.get("total_tokens") or 0))
 
     def do_POST(self): self._proxy()
     def do_PUT(self):  self._proxy()

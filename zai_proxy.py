@@ -23,6 +23,21 @@ import json, os, sqlite3, sys, threading, time, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+# ── Shadow mode (Phase 2) — price-first optimizer running read-only ──────────
+# Import bridge: logs shadow routing decisions alongside live best_key() picks.
+# Wrapped so a missing repo or import error NEVER breaks production routing.
+_shadow_hook = None
+try:
+    _MRE_PATH = os.path.expanduser("~/merchant-routing-engine")
+    if _MRE_PATH not in sys.path:
+        sys.path.insert(0, _MRE_PATH)
+    from src.shadow_hook import ShadowHook
+    _shadow_hook = ShadowHook(db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"))
+    print(f"[shadow] ShadowHook initialized — logging to zai_usage.db", flush=True)
+except Exception as _e:
+    print(f"[shadow] DISABLED — {_e}", flush=True)
+    _shadow_hook = None
+
 # ── config ──────────────────────────────────────────────────────────────────
 def _load_keys():
     """Load keys from the manager .env (gitignored, never in repo)."""
@@ -67,7 +82,7 @@ STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
 
 # ── external failover providers ─────────────────────────────────────────────
 def _load_external_keys():
-    """Load PPQ, OpenRouter, and Ollama Cloud keys from .env."""
+    """Load PPQ, OpenRouter, Ollama Cloud, and DeepInfra keys from .env."""
     keys = {}
     for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env"]:
         if ep.exists():
@@ -79,6 +94,10 @@ def _load_external_keys():
                     keys["openrouter"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("OLLAMA_CLOUD_API_KEY=") and "ollama_cloud" not in keys:
                     keys["ollama_cloud"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPINFRA_API_KEY=") and "deepinfra" not in keys:
+                    keys["deepinfra"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPINFRA_STARTING_BALANCE=") and "deepinfra_balance" not in keys:
+                    keys["deepinfra_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
@@ -87,7 +106,20 @@ _EXTERNAL_KEYS = _load_external_keys()
 OLLAMA_CLOUD_KEY = _EXTERNAL_KEYS.get("ollama_cloud", "")
 OLLAMA_CLOUD_BASE = "https://ollama.com/v1"
 
+# DeepInfra — preferred external failover (prompt caching reduces effective cost)
+DEEPINFRA_KEY = _EXTERNAL_KEYS.get("deepinfra", "")
+DEEPINFRA_BASE = "https://api.deepinfra.com/v1/openai"
+DEEPINFRA_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("deepinfra_balance", "5.0") or "5.0")
+
+# Provider priority for failover sort (lower = tried first).
+# DeepInfra preferred over PPQ because of prompt-caching discounts.
+_PROVIDER_PRIORITY = {"deepinfra": 0, "ppq": 1, "openrouter": 2}
+
 EXTERNAL_PROVIDERS = {
+    "deepinfra": {
+        "base_url": DEEPINFRA_BASE,
+        "key": DEEPINFRA_KEY,
+    },
     "ppq": {
         "base_url": "https://api.ppq.ai/v1",
         "key": _EXTERNAL_KEYS.get("ppq", ""),
@@ -440,6 +472,42 @@ _usage_db_lock = threading.Lock()
 quota_cache: dict[str, tuple[list[dict], float]] = {}   # name → (windows, ts)
 lock = threading.Lock()
 
+# ── Shadow mode snapshot helpers ────────────────────────────────────────────
+def _snapshot_quota() -> dict:
+    """Snapshot current quota state for all providers. Thread-safe."""
+    snap = {}
+    try:
+        with lock:
+            for name in ("ours", "friend"):
+                wins = quota_cache.get(name, ([], 0.0))[0]
+                pct = _max_pct(wins)
+                snap[name] = {
+                    "used_pct": float(pct),
+                    "remaining": max(0.0, 2_000_000 * (1.0 - pct / 100.0)),
+                    "total": 2_000_000,
+                }
+        # Ollama Cloud — no quota API, approximate from health
+        snap["ollama_cloud"] = {"used_pct": 0.0, "remaining": 1_000_000, "total": 1_000_000}
+        # Per-token providers — effectively unlimited
+        snap["ppq"] = {"used_pct": 0.0, "remaining": float("inf")}
+        snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}
+    except Exception:
+        pass
+    return snap
+
+def _snapshot_health() -> dict:
+    """Snapshot health state for all providers. Thread-safe read."""
+    h = {}
+    try:
+        for name in ("ours", "friend"):
+            h[name] = _is_key_healthy(name)
+        h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
+        h["ppq"] = _is_key_healthy("ppq")
+        h["openrouter"] = True
+    except Exception:
+        pass
+    return h
+
 # ── proactive burn-rate prediction (Phase 3) ─────────────────────────────────
 # Import the burn predictor.  Wrapped so a broken burn_predictor.py never crashes
 # the proxy — if the import fails, proactive switching is silently disabled and
@@ -512,6 +580,20 @@ try:
     _shadow_optimizer.add_provider(
         "ppq_external", _shadow_pk(0.80), _ShadowConsumptionKalman(),
         quota_remaining=10_000_000, model_tier="low", quota_total=20_000_000,
+    )
+    # deepinfra — per-token, low tier (same models as PPQ), preferred external
+    # due to prompt-caching discounts. No peak window.
+    try:
+        import sys as _sys
+        _sys.path.insert(0, '/home/c03rad0r/.hermes/bot')
+        from zai_proxy import _get_deepinfra_balance as _gdb
+        _di_balance = _gdb() * 1_000_000  # USD → token-equiv at $1.30/M
+    except Exception:
+        _di_balance = 5.0 * 1_000_000
+    _shadow_optimizer.add_provider(
+        "deepinfra", _shadow_pk(1.30), _ShadowConsumptionKalman(),
+        quota_remaining=_di_balance, model_tier="low",
+        quota_total=DEEPINFRA_STARTING_BALANCE * 1_000_000,
     )
     # Defaults to ~/.hermes/bot/zai_usage.db (config/providers.yaml :: shadow_mode.db_path)
     _shadow_logger = _ShadowLogger()
@@ -857,6 +939,8 @@ _MODEL_COST_PER_1M: dict[str, float] = {
     "glm-4.5-x":               5.55,
     "deepseek/deepseek-v4-pro":   1.30,
     "deepseek/deepseek-v4-flash": 0.09,
+    # DeepInfra — same models as PPQ, fallback if estimated_cost is missing
+    "deepinfra":                  1.30,
     # Legacy ollama models (kept for compatibility)
     "gpt-oss:120b":            0.0,
     "gemma4:31b":              0.0,
@@ -867,11 +951,14 @@ _MODEL_COST_PER_1M: dict[str, float] = {
 
 def _spend_tier(key_name: str | None) -> str:
     """Classify a request by key type for cost tracking.
-    Key types: ours (z.ai subscription), friend (courtesy key), ollama_cloud (flat-rate)."""
+    Key types: ours (z.ai subscription), friend (courtesy key),
+    ollama_cloud (flat-rate), deepinfra (pay-per-use with prompt caching)."""
     if key_name in ("ours", "friend"):
         return key_name
     elif key_name == "ollama_cloud":
         return "ollama_cloud"
+    elif key_name == "deepinfra":
+        return "deepinfra"
     return "unknown"
 
 
@@ -883,11 +970,17 @@ def _estimate_cost_usd(key_name: str | None, total_tokens: int) -> float:
     return (total_tokens / 1_000_000) * cost_per_1m
 
 
-def _record_spend(key_name: str | None, model: str | None, total_tokens: int) -> None:
-    """Record spend for today. Called from the finally block of every request."""
+def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
+                  actual_cost: float | None = None) -> None:
+    """Record spend for today. Called from the finally block of every request.
+
+    When actual_cost is provided (e.g., from DeepInfra's estimated_cost field),
+    it is used directly instead of computing from _MODEL_COST_PER_1M. This
+    captures prompt-caching discounts and real-time pricing changes.
+    """
     try:
         tier = _spend_tier(key_name)
-        cost = _estimate_cost_usd(key_name, total_tokens)
+        cost = actual_cost if actual_cost is not None else _estimate_cost_usd(key_name, total_tokens)
         today = _date.today().isoformat()
         _usage_db().execute(
             "INSERT INTO daily_spend (date, tier, spend_usd, call_count, token_count) "
@@ -900,6 +993,69 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int) ->
         pass
 
 
+# ── DeepInfra local credit balance tracking (no billing API available) ───────
+def _init_deepinfra_balance():
+    """Initialize DeepInfra balance table with starting balance if not exists."""
+    try:
+        db = _usage_db()
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS deepinfra_balance ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "balance_usd REAL NOT NULL,"
+            "last_updated REAL NOT NULL,"
+            "total_deducted REAL DEFAULT 0.0,"
+            "total_requests INTEGER DEFAULT 0)")
+        row = db.execute("SELECT balance_usd FROM deepinfra_balance WHERE id=1").fetchone()
+        if not row:
+            db.execute(
+                "INSERT INTO deepinfra_balance (id, balance_usd, last_updated) VALUES (1, ?, ?)",
+                (DEEPINFRA_STARTING_BALANCE, time.time()))
+        db.commit()
+    except Exception:
+        pass
+
+
+def _deduct_deepinfra_balance(cost: float) -> float:
+    """Deduct actual cost from local DeepInfra balance. Returns remaining balance.
+
+    When balance drops below $1.0, marks DeepInfra as unfunded so the failover
+    system skips to the next provider (PPQ). Mirrors the existing 402 handler.
+    """
+    if cost <= 0:
+        return _get_deepinfra_balance()
+    try:
+        db = _usage_db()
+        db.execute(
+            "UPDATE deepinfra_balance SET "
+            "balance_usd = balance_usd - ?, "
+            "last_updated = ?, "
+            "total_deducted = total_deducted + ?, "
+            "total_requests = total_requests + 1 WHERE id=1",
+            (cost, time.time(), cost))
+        db.commit()
+        row = db.execute("SELECT balance_usd FROM deepinfra_balance WHERE id=1").fetchone()
+        remaining = row[0] if row else 0.0
+        if remaining < 1.0:
+            _mark_unfunded("deepinfra")
+        return remaining
+    except Exception:
+        return DEEPINFRA_STARTING_BALANCE
+
+
+def _get_deepinfra_balance() -> float:
+    """Get current DeepInfra balance. Returns starting balance on error."""
+    try:
+        row = _usage_db().execute("SELECT balance_usd FROM deepinfra_balance WHERE id=1").fetchone()
+        return row[0] if row else DEEPINFRA_STARTING_BALANCE
+    except Exception:
+        return DEEPINFRA_STARTING_BALANCE
+
+
+# Initialize balance on module load
+if DEEPINFRA_KEY:
+    _init_deepinfra_balance()
+
+
 def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     """Check if the daily spend cap allows this request.
 
@@ -908,11 +1064,10 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     """
     try:
         tier = _spend_tier(key_name)
-        # Use different caps for different key types
-        if tier == "ollama_cloud":
-            cap = _SPEND_CAP_MANAGER  # Higher cap for ollama cloud
-        elif tier == "friend":
-            cap = _SPEND_CAP_WORKER   # Lower cap for friend key
+        # Use manager cap for: ollama_cloud, friend (used for manager-tier work),
+        # deepinfra (preferred external failover). Default: worker cap.
+        if tier in ("ollama_cloud", "friend", "deepinfra"):
+            cap = _SPEND_CAP_MANAGER  # Manager-tier work, generous allowance
         else:  # ours or unknown
             cap = _SPEND_CAP_WORKER    # Default worker cap
         
@@ -1389,8 +1544,8 @@ class Handler(BaseHTTPRequestHandler):
             cost = _get_provider_cost(name, ext_model)
             candidates.append((cost, name, prov))
 
-        # Sort cheapest first — no hardcoded order
-        candidates.sort(key=lambda c: c[0])
+        # Sort cheapest first; ties broken by _PROVIDER_PRIORITY (lower = tried first)
+        candidates.sort(key=lambda c: (c[0], _PROVIDER_PRIORITY.get(c[1], 99)))
 
         if not candidates:
             return False
@@ -1430,7 +1585,18 @@ class Handler(BaseHTTPRequestHandler):
                         # Parse usage from the streamed response for spend tracking
                         ext_usage = _parse_usage(bytes(response_buffer))
                         ext_tokens = int(ext_usage.get("total_tokens") or 0)
-                        _record_spend(provider_name, ext_model, ext_tokens)
+                        # DeepInfra returns estimated_cost (actual charge incl. caching)
+                        # Use it directly for accurate spend tracking + balance deduction
+                        ext_estimated_cost = ext_usage.get("estimated_cost")
+                        if ext_estimated_cost is not None:
+                            ext_actual_cost = float(ext_estimated_cost)
+                        else:
+                            ext_actual_cost = None
+                        _record_spend(provider_name, ext_model, ext_tokens,
+                                      actual_cost=ext_actual_cost)
+                        # Deduct from DeepInfra local credit balance
+                        if provider_name == "deepinfra" and ext_actual_cost is not None:
+                            remaining = _deduct_deepinfra_balance(ext_actual_cost)
                         self._spend_recorded = True
                         _log_api_call(
                             key_name=provider_name, key_suffix=prov["key"][-4:],
@@ -1785,6 +1951,22 @@ class Handler(BaseHTTPRequestHandler):
             )
             if not getattr(self, '_spend_recorded', False):
                 _record_spend(key_used, model, int(usage.get("total_tokens") or 0))
+
+            # ── Shadow mode: log optimizer decision alongside live pick ────
+            # Read-only comparison. NEVER affects routing. Wrapped so any
+            # shadow failure cannot break the proxied request.
+            if _shadow_hook is not None:
+                try:
+                    _shadow_hook.compare(
+                        live_provider=key_used,
+                        live_model=model,
+                        tokens=int(usage.get("total_tokens") or 0),
+                        quota_state=_snapshot_quota(),
+                        health_state=_snapshot_health(),
+                        peak=peak if 'peak' in dir() else False,
+                    )
+                except Exception:
+                    pass
 
     def do_POST(self): self._proxy()
     def do_PUT(self):  self._proxy()

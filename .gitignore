@@ -1,0 +1,28 @@
+# Secrets - NEVER commit
+.env
+.env.*
+*.key
+*.pem
+secrets.yaml
+credentials.yaml
+
+# Databases (contain token data)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Allow secret patterns file (for pre-commit hooks)
+!.secret-patterns.txt

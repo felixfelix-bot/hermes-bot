@@ -123,6 +123,7 @@ _PROVIDER_MODEL_NAMES = {
     "deepinfra": {
         "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
         "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+        "glm-5.2":                    "zai-org/GLM-5.2",
     },
 }
 
@@ -145,7 +146,7 @@ EXTERNAL_PROVIDERS = {
 # Manager (glm-5.2): quality floor at deepseek-v4-pro (55.4% SWE-bench).
 #   NEVER falls back to flash — returns error instead of low-quality output.
 # Workers (glm-4.5-flash): cheapest available is fine (output gets vetted).
-MANAGER_FALLBACK_MODEL = "deepseek/deepseek-v4-pro"
+MANAGER_FALLBACK_MODEL = "glm-5.2"
 WORKER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 
 # z.ai peak hours: Beijing 14:00-18:00 = UTC 6-10. During peak, z.ai burns 3x quota.

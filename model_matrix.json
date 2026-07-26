@@ -90,6 +90,13 @@
               }
             ]
           }
+        },
+        "deepinfra/default": {
+          "base_url": "https://api.deepinfra.com/v1/openai",
+          "cost_per_1m_offpeak": 0.93,
+          "cost_per_1m_peak": 3.00,
+          "penalty_pct": 0,
+          "cached_cost_per_1m": 0.18
         }
       }
     },

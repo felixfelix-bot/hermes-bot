@@ -115,6 +115,17 @@ DEEPINFRA_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("deepinfra_balance", "5.0"
 # DeepInfra preferred over PPQ because of prompt-caching discounts.
 _PROVIDER_PRIORITY = {"deepinfra": 0, "ppq": 1, "openrouter": 2}
 
+# Per-provider model name translation.
+# PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
+# but DeepInfra expects case-sensitive dotted form (e.g., "deepseek-ai/DeepSeek-V4-Pro").
+# Any provider not in this dict uses ext_model verbatim.
+_PROVIDER_MODEL_NAMES = {
+    "deepinfra": {
+        "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
+        "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+    },
+}
+
 EXTERNAL_PROVIDERS = {
     "deepinfra": {
         "base_url": DEEPINFRA_BASE,
@@ -1553,7 +1564,11 @@ class Handler(BaseHTTPRequestHandler):
         for cost, provider_name, prov in candidates:
             try:
                 body_json = json.loads(body) if body else {}
-                body_json["model"] = ext_model
+                # Per-provider model name translation.
+                # PPQ/OpenRouter use "deepseek/deepseek-v4-pro" but DeepInfra expects
+                # "deepseek-ai/DeepSeek-V4-Pro" (case-sensitive, dotted form).
+                actual_model = _PROVIDER_MODEL_NAMES.get(provider_name, {}).get(ext_model, ext_model)
+                body_json["model"] = actual_model
                 fwd_body = json.dumps(body_json).encode()
 
                 url = prov["base_url"] + "/chat/completions"

@@ -2136,4 +2136,7 @@ if __name__ == "__main__":
     t.start()
     time.sleep(3)  # let first quota fetch complete
     print(f"zai_proxy on :{PORT}  quotas={ {n: _max_pct(v[0]) for n, v in quota_cache.items()} }")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    # Allow socket reuse to prevent "Address already in use" on restart
+    from socketserver import TCPServer
+    TCPServer.allow_reuse_address = True
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

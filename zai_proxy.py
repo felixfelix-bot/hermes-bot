@@ -1911,8 +1911,9 @@ class Handler(BaseHTTPRequestHandler):
                     if _is_retryable_error(e):
                         if _attempt_retry(e, attempt, name, t0, order):
                             continue
-                    # z.ai auth failure — try external failover before giving up
-                    if e.code in (401, 403) and self._try_external_failover(body, model, response_buffer, t0):
+                    # z.ai failure — try external failover before giving up
+                    # Include 429 (rate limit) since z.ai returns 429 when exhausted
+                    if e.code in (401, 403, 429) and self._try_external_failover(body, model, response_buffer, t0):
                         return
                     # Non-retryable error
                     status_code = e.code

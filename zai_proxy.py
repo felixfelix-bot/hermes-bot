@@ -20,6 +20,7 @@ logging failure can never break a proxied request.
 """
 from __future__ import annotations
 import json, os, sqlite3, sys, threading, time, urllib.request, urllib.error
+from datetime import datetime, timezone, date as _date
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -32,11 +33,78 @@ try:
     if _MRE_PATH not in sys.path:
         sys.path.insert(0, _MRE_PATH)
     from src.shadow_hook import ShadowHook
-    _shadow_hook = ShadowHook(db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"))
+    # ── Token audit (Phase 2.5.4) ──────────────────────────────────────
+    # Extracted into src/token_audit.py so the billed-vs-actual mismatch
+    # check is unit-testable.  Falls back to a local stub below if missing.
+    from src.token_audit import audit_token_count as _audit_token_count
+    # ── Converged rates (Phase 3.0) ────────────────────────────────────
+    # Load converged Kalman base rates from historical daily_spend data at
+    # startup instead of using static seed costs.  This gives the shadow
+    # optimizer an immediately-converged cost model.  Falls back to seeds
+    # (inside the ShadowHook constructor) on any failure.
+    _converged_rates: dict[str, float] | None = None
+    try:
+        from scripts.feed_historical_costs import load_historical_rates
+        _converged_rates = load_historical_rates()
+        if _converged_rates:
+            print(f"[shadow] Converged rates loaded:", flush=True)
+            for _p, _r in sorted(_converged_rates.items()):
+                print(f"[shadow]   {_p:15s}  ${_r:.6f}/M", flush=True)
+    except Exception as _ce:
+        print(f"[shadow] converged-rate load failed — using seed costs: {_ce}", flush=True)
+        _converged_rates = None
+    _shadow_hook = ShadowHook(
+        db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"),
+        converged_rates=_converged_rates,
+    )
     print(f"[shadow] ShadowHook initialized — logging to zai_usage.db", flush=True)
 except Exception as _e:
     print(f"[shadow] DISABLED — {_e}", flush=True)
     _shadow_hook = None
+    _converged_rates = None
+
+# ── Token-audit fallback (Phase 2.5.4) ──────────────────────────────────────
+# If the src import above failed, define a never-raising stub so the request
+# path's audit call is still safe.  Real logic lives in src/token_audit.py.
+if "_audit_token_count" not in globals():
+
+    def _audit_token_count(billed_tokens, response_buffer, threshold=0.20):
+        try:
+            _buf = response_buffer if response_buffer is not None else b""
+            _actual = len(_buf) // 4
+            _billed = int(billed_tokens or 0)
+            if _billed <= 0 or _actual <= 0:
+                return (_actual, False, 0.0)
+            _rate = abs(_billed - _actual) / max(_billed, 1)
+            return (_actual, _rate > threshold, _rate)
+        except Exception:
+            return (0, False, 0.0)
+
+# ── LiveRouter (Phase 1.2) — Kalman-driven failover selection ───────────────
+# LiveRouter wraps the RoutingOptimizer for LIVE failover routing.  It is
+# ONLY called when BOTH z.ai keys are exhausted (best_key() Phase 4 sets
+# chosen = None).  Normal ours/friend routing is completely unaffected.
+#
+# Kill switch: touch ~/.hermes/bot/.enable_live_routing to enable.
+#             rm    ~/.hermes/bot/.enable_live_routing to disable.
+# No restart needed — the flag is checked on every failover call.
+#
+# Safety: every LiveRouter call is wrapped in try/except.  If LiveRouter
+# fails (import error, exception, no provider found), best_key() returns
+# None and the existing hardcoded ollama → ppq → openrouter chain runs.
+_LIVE_ROUTER = None
+_LIVE_ROUTING_FLAG = os.path.expanduser("~/.hermes/bot/.enable_live_routing")
+try:
+    from src.live_router import LiveRouter as _LiveRouterCls
+    _LIVE_ROUTER = _LiveRouterCls(
+        db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"),
+        converged_rates=_converged_rates,
+    )
+    print(f"[live] LiveRouter initialized — failover selection ready "
+          f"(kill switch: {_LIVE_ROUTING_FLAG})", flush=True)
+except Exception as _le:
+    print(f"[live] LiveRouter DISABLED — {_le}", flush=True)
+    _LIVE_ROUTER = None
 
 # ── config ──────────────────────────────────────────────────────────────────
 def _load_keys():
@@ -482,6 +550,12 @@ _usage_db_conn: sqlite3.Connection | None = None
 _usage_db_lock = threading.Lock()
 
 quota_cache: dict[str, tuple[list[dict], float]] = {}   # name → (windows, ts)
+
+# ── Phase 2.4: Pace windows for LiveRouter ──────────────────────────────────
+# Computed in _refresh_loop() from quota_cache + LiveRouter's ConsumptionKalman
+# burn rates. Stored here so best_key() can pass them to select_failover() on
+# the next failover call. Thread-safe reads via `lock`.
+_pace_windows: dict[str, list[tuple[float, float, float, float, float]]] = {}
 lock = threading.Lock()
 
 # ── Shadow mode snapshot helpers ────────────────────────────────────────────
@@ -769,6 +843,9 @@ def _usage_db() -> sqlite3.Connection:
             backoff_seconds    INTEGER DEFAULT 0,
             updated_ts         REAL NOT NULL
         )""")
+        # ── provider telemetry (Phase 2.5.1) ───────────────────────────────
+        # One row per proxied request: success/fail, latency, token-mismatch.
+        _ensure_telemetry_table(conn)
         _usage_db_conn = conn
     return _usage_db_conn
 
@@ -916,6 +993,88 @@ def _log_key_health(name: str, state: dict) -> None:
         pass
 
 
+# ── provider telemetry (Phase 2.5.1) ────────────────────────────────────────
+# One row per proxied request: success/fail, latency, token-mismatch (fraud
+# signal).  This is the data foundation for CPVO (cost-per-valid-output) and
+# quality probes.  NEVER raises — telemetry failure is silent and must never
+# break request handling.
+
+_TELEMETRY_SCHEMA = """CREATE TABLE IF NOT EXISTS provider_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    response_received INTEGER,
+    response_valid INTEGER,
+    latency_ms INTEGER,
+    error_type TEXT,
+    billed_tokens INTEGER,
+    actual_tokens INTEGER,
+    token_mismatch INTEGER
+)"""
+
+
+def _ensure_telemetry_table(conn: sqlite3.Connection | None) -> None:
+    """Create the provider_telemetry table if it doesn't exist.
+
+    Idempotent — safe to call on every request or at startup.  Swallows all
+    errors so a schema migration failure never breaks request handling.
+    """
+    if conn is None:
+        return
+    try:
+        conn.execute(_TELEMETRY_SCHEMA)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telemetry_ts "
+            "ON provider_telemetry(ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telemetry_provider "
+            "ON provider_telemetry(provider)"
+        )
+    except Exception:
+        pass
+
+
+def _log_provider_telemetry(
+    *,
+    conn: sqlite3.Connection | None,
+    provider: str | None,
+    response_received: bool | None,
+    response_valid: bool | None,
+    latency_ms: int | None,
+    error_type: str | None,
+    billed_tokens: int | None,
+    actual_tokens: int | None,
+    token_mismatch: bool | None,
+) -> None:
+    """Insert one telemetry row.  NEVER raises — telemetry failure is silent.
+
+    Called from the _proxy() finally block after every request completes.
+    One INSERT per request using the existing shared DB connection.
+    """
+    if conn is None:
+        return
+    try:
+        _ensure_telemetry_table(conn)
+        conn.execute(
+            "INSERT INTO provider_telemetry "
+            "(ts, provider, response_received, response_valid, "
+            "latency_ms, error_type, billed_tokens, actual_tokens, "
+            "token_mismatch) VALUES (?,?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(),
+             provider or "unknown",
+             int(response_received) if response_received is not None else 0,
+             int(response_valid) if response_valid is not None else 0,
+             int(latency_ms) if latency_ms is not None else 0,
+             error_type or "none",
+             int(billed_tokens) if billed_tokens is not None else 0,
+             int(actual_tokens) if actual_tokens is not None else 0,
+             int(token_mismatch) if token_mismatch is not None else 0),
+        )
+    except Exception:
+        pass
+
+
 # ── global spend cap (runaway-loop circuit breaker) ─────────────────────────
 # Tracks cumulative daily spend across ALL providers (z.ai, PPQ, OpenRouter).
 # When the daily cap for a tier is exceeded, the proxy returns 503 — preventing
@@ -923,7 +1082,6 @@ def _log_key_health(name: str, state: dict) -> None:
 #
 # z.ai models are $0/1M (subscription). External failover models have real
 # per-token cost. The cap protects against the expensive external path.
-from datetime import date as _date
 
 _SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "10.0"))
 _SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "3.0"))
@@ -1220,6 +1378,21 @@ def _refresh_loop():
                 _get_predictions(name)
             except Exception:
                 pass
+        # ── Phase 2.4: Compute pace windows for LiveRouter ───────────────
+        # After quota refresh, compute pace_factor input tuples from
+        # quota_cache + LiveRouter's ConsumptionKalman burn rates. Stored
+        # in _pace_windows for best_key() to pass to select_failover().
+        # NEVER blocks quota refresh — wrapped in try/except.
+        try:
+            global _pace_windows
+            if _LIVE_ROUTER is not None:
+                with lock:
+                    pw = _LIVE_ROUTER.compute_pace_windows(dict(quota_cache))
+                if pw:
+                    with lock:
+                        _pace_windows = pw
+        except Exception:
+            pass  # pace window computation must never block refresh
         time.sleep(CACHE_TTL)
 
 
@@ -1395,6 +1568,37 @@ def best_key() -> str:
         else:
             chosen = None
             reason = "both_keys_exhausted"
+
+    # Phase 5 — LIVE ROUTER FAILOVER (Phase 1.2) ─────────────────────────
+    # ONLY fires when both z.ai keys are exhausted (chosen is None after
+    # Phase 4 health check).  Asks LiveRouter for the cheapest viable
+    # external provider via Kalman-converged pricing.  Kill switch:
+    # ~/.hermes/bot/.enable_live_routing must exist.  Every call wrapped
+    # in try/except — on any failure, falls through to None and the
+    # hardcoded ollama → ppq → openrouter chain in _proxy() runs.
+    if chosen is None and _LIVE_ROUTER is not None and \
+            os.path.exists(_LIVE_ROUTING_FLAG):
+        try:
+            # Pass pace windows computed by _refresh_loop() — used by
+            # the optimizer's pace_factor_multi for predictive pricing.
+            _pw = None
+            with lock:
+                _pw = dict(_pace_windows) if _pace_windows else None
+            _provider, _fallback = _LIVE_ROUTER.select_failover(
+                quota_state=_snapshot_quota(),
+                health_state=_snapshot_health(),
+                peak=_is_peak_hour(),
+                pace_windows=_pw,
+            )
+            if _provider:
+                chosen = _provider
+                reason = f"live_kalman_failover_{_provider}"
+                _log_key_decision(chosen_key=chosen, reason=reason,
+                                  ours_pct=op, friend_pct=fp,
+                                  ours_available=oa, friend_available=fa)
+                return chosen
+        except Exception:
+            pass  # fall through to hardcoded failover
 
     _log_key_decision(chosen_key=chosen, reason=reason, ours_pct=op,
                       friend_pct=fp, ours_available=oa, friend_available=fa)
@@ -1738,6 +1942,33 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"all providers exhausted, retry later"}')
             return
 
+        # Phase 1.2: LiveRouter returned an external provider (not a z.ai
+        # key).  Route to the appropriate external handler.  This ONLY
+        # happens when both z.ai keys are exhausted AND the kill switch
+        # (.enable_live_routing) is active.  If the external provider fails,
+        # fall through to the hardcoded failover chain below.
+        if chosen not in KEYS:
+            response_buffer = bytearray()
+            if chosen == "ollama_cloud" and OLLAMA_CLOUD_KEY:
+                if self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                    return
+            elif chosen in EXTERNAL_PROVIDERS or chosen == "deepinfra":
+                # Try the LiveRouter-chosen provider first, then the rest
+                if self._try_external_failover(body, original_model,
+                                               response_buffer, t0):
+                    return
+            # LiveRouter provider failed — fall through to hardcoded chain
+            response_buffer = bytearray()
+            if OLLAMA_CLOUD_KEY and self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                return
+            if self._try_external_failover(body, original_model, response_buffer, t0):
+                return
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"all providers exhausted, retry later"}')
+            return
+
         # Step 3: Compute tier for chosen key from Kalman + peak hours + client hint
         model_tier_info = None
         if _select_model_tier is not None and body:
@@ -1969,6 +2200,93 @@ class Handler(BaseHTTPRequestHandler):
             if not getattr(self, '_spend_recorded', False):
                 _record_spend(key_used, model, int(usage.get("total_tokens") or 0))
 
+            # ── Provider telemetry (Phase 2.5.1) ─────────────────────────────
+            # One row per request: success/fail, latency, token-mismatch.
+            # NEVER raises — telemetry failure is silent and must never break
+            # request handling.  Wrapped in its own try/except (the function
+            # itself also swallows errors, so this is belt-and-suspenders).
+            try:
+                _latency_ms = int((time.time() - t0) * 1000)
+                _billed = int(usage.get("total_tokens") or 0)
+                _resp_buf = bytes(response_buffer)
+                _resp_received = len(_resp_buf) > 0
+                _resp_valid = False
+                _err_type = error_text or "none"
+                if _resp_received:
+                    try:
+                        _rj = json.loads(_resp_buf)
+                        if isinstance(_rj, dict) and "choices" in _rj:
+                            _resp_valid = True
+                            _err_type = "none"
+                        elif isinstance(_rj, dict) and "error" in _rj:
+                            _err_type = "api_error"
+                    except Exception:
+                        # Not single-JSON — likely SSE streaming format.
+                        # Scan data: lines for choices/error (mirrors _parse_usage).
+                        try:
+                            _found_valid = False
+                            _found_error = False
+                            for _line in _resp_buf.decode(
+                                "utf-8", "ignore"
+                            ).splitlines():
+                                _line = _line.strip()
+                                if not _line.startswith("data:"):
+                                    continue
+                                _payload = _line[5:].strip()
+                                if _payload == "[DONE]" or not _payload:
+                                    continue
+                                try:
+                                    _cj = json.loads(_payload)
+                                except Exception:
+                                    continue
+                                if isinstance(_cj, dict) and "choices" in _cj:
+                                    _found_valid = True
+                                    break
+                                if isinstance(_cj, dict) and "error" in _cj:
+                                    _found_error = True
+                            if _found_valid:
+                                _resp_valid = True
+                                _err_type = "none"
+                            elif _found_error:
+                                _err_type = "api_error"
+                            else:
+                                _err_type = "parse_error"
+                        except Exception:
+                            _err_type = "parse_error"
+                elif not _resp_received:
+                    _err_type = error_text or "no_response"
+                # Estimate actual tokens + detect billing mismatch (Phase 2.5.4).
+                # Uses the unit-tested audit_token_count from src/token_audit.py
+                # (with a never-raising fallback stub if the import failed).
+                # Token audit NEVER blocks request handling — _audit_token_count
+                # swallows all errors internally.
+                _actual, _mismatch, _mm_rate = _audit_token_count(_billed, _resp_buf)
+                if _mismatch:
+                    # Quality signal: feed mismatch_rate into CPVO via the
+                    # token_mismatch telemetry column. Warn loudly — a large
+                    # billed-vs-actual gap is a billing-fraud / silent-downgrade
+                    # signal worth investigating.
+                    print(
+                        f"[telemetry] token billing mismatch: "
+                        f"provider={key_used or 'unknown'} "
+                        f"billed={_billed} actual~={_actual} "
+                        f"gap={_mm_rate:.0%}",
+                        flush=True,
+                    )
+                _log_provider_telemetry(
+                    conn=_usage_db(),
+                    provider=key_used or "unknown",
+                    response_received=_resp_received,
+                    response_valid=_resp_valid,
+                    latency_ms=_latency_ms,
+                    error_type=_err_type,
+                    billed_tokens=_billed,
+                    actual_tokens=_actual,
+                    token_mismatch=_mismatch,
+                )
+            except Exception:
+                pass
+
             # ── Shadow mode: log optimizer decision alongside live pick ────
             # Read-only comparison. NEVER affects routing. Wrapped so any
             # shadow failure cannot break the proxied request.
@@ -1984,6 +2302,21 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     pass
+
+            # ── Phase 2.3: Live consumption tracking ──────────────────────
+            # Feed completed request token count to LiveRouter's Kalman
+            # filters. Wrapped in try/except — NEVER breaks request handling.
+            # record_request updates the ConsumptionKalman for the provider
+            # that served this request, keeping burn-rate predictions fresh.
+            if _LIVE_ROUTER is not None:
+                try:
+                    total_tokens = int(usage.get("total_tokens") or 0)
+                    _LIVE_ROUTER.record_request(
+                        provider=key_used if key_used else "unknown",
+                        tokens=total_tokens,
+                    )
+                except Exception:
+                    pass  # recording must never break production
 
     def do_POST(self): self._proxy()
     def do_PUT(self):  self._proxy()

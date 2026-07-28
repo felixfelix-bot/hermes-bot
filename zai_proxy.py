@@ -892,6 +892,71 @@ def _parse_usage(response_buffer: bytes) -> dict:
     return {}
 
 
+def _classify_response(response_buffer: bytes, error_text: str | None) -> tuple:
+    """Classify an upstream response buffer for provider telemetry.
+
+    Returns (response_received, response_valid, error_type):
+      * response_received — buffer was non-empty
+      * response_valid    — buffer held a usable completion (JSON or SSE with
+                            a ``choices`` payload)
+      * error_type        — 'none' on success; the upstream ``error_text`` for
+                            known failures (HTTP/proxy/network errors); 'api_error'
+                            for provider error bodies; 'parse_error' ONLY for a
+                            genuinely unparseable 200 body.
+
+    Mirrors _parse_usage's SSE handling. Preserves the real ``error_text``
+    instead of clobbering it with 'parse_error' when the buffer is non-JSON —
+    e.g. a DNS/connection failure writes a plain-text ``'proxy error: ...'``
+    body that should be reported as the connection error it is, not as a
+    generic parse_error. Never raises.
+    """
+    resp_received = len(response_buffer) > 0
+    if not resp_received:
+        return (False, False, error_text or "no_response")
+    try:
+        rj = json.loads(response_buffer)
+    except Exception:
+        rj = None
+    if isinstance(rj, dict):
+        if "choices" in rj:
+            return (True, True, "none")
+        if "error" in rj:
+            return (True, False, "api_error")
+        # Valid JSON but no choices/error — keep the upstream error_text if any.
+        return (True, False, error_text or "none")
+    # Not single-JSON — likely SSE streaming format. Scan data: lines for a
+    # choices/error payload (mirrors _parse_usage).
+    try:
+        found_valid = False
+        found_error = False
+        for _line in response_buffer.decode("utf-8", "ignore").splitlines():
+            _line = _line.strip()
+            if not _line.startswith("data:"):
+                continue
+            _payload = _line[5:].strip()
+            if _payload == "[DONE]" or not _payload:
+                continue
+            try:
+                _cj = json.loads(_payload)
+            except Exception:
+                continue
+            if isinstance(_cj, dict) and "choices" in _cj:
+                found_valid = True
+                break
+            if isinstance(_cj, dict) and "error" in _cj:
+                found_error = True
+        if found_valid:
+            return (True, True, "none")
+        if found_error:
+            return (True, False, "api_error")
+        # Genuinely unparseable body (non-JSON, non-SSE). Preserve the real
+        # error_text when we have one (network/DNS/HTTP failures) so the
+        # 'parse_error' bucket is not contaminated by known connection errors.
+        return (True, False, error_text or "parse_error")
+    except Exception:
+        return (True, False, error_text or "parse_error")
+
+
 def _extract_model(body: bytes):
     """Best-effort extraction of the `model` field from a request body."""
     if not body:
@@ -2225,52 +2290,12 @@ class Handler(BaseHTTPRequestHandler):
                 # (Phase 2.5.4 false-positive fix.)
                 _billed = int(usage.get("completion_tokens") or 0)
                 _resp_buf = bytes(response_buffer)
-                _resp_received = len(_resp_buf) > 0
-                _resp_valid = False
-                _err_type = error_text or "none"
-                if _resp_received:
-                    try:
-                        _rj = json.loads(_resp_buf)
-                        if isinstance(_rj, dict) and "choices" in _rj:
-                            _resp_valid = True
-                            _err_type = "none"
-                        elif isinstance(_rj, dict) and "error" in _rj:
-                            _err_type = "api_error"
-                    except Exception:
-                        # Not single-JSON — likely SSE streaming format.
-                        # Scan data: lines for choices/error (mirrors _parse_usage).
-                        try:
-                            _found_valid = False
-                            _found_error = False
-                            for _line in _resp_buf.decode(
-                                "utf-8", "ignore"
-                            ).splitlines():
-                                _line = _line.strip()
-                                if not _line.startswith("data:"):
-                                    continue
-                                _payload = _line[5:].strip()
-                                if _payload == "[DONE]" or not _payload:
-                                    continue
-                                try:
-                                    _cj = json.loads(_payload)
-                                except Exception:
-                                    continue
-                                if isinstance(_cj, dict) and "choices" in _cj:
-                                    _found_valid = True
-                                    break
-                                if isinstance(_cj, dict) and "error" in _cj:
-                                    _found_error = True
-                            if _found_valid:
-                                _resp_valid = True
-                                _err_type = "none"
-                            elif _found_error:
-                                _err_type = "api_error"
-                            else:
-                                _err_type = "parse_error"
-                        except Exception:
-                            _err_type = "parse_error"
-                elif not _resp_received:
-                    _err_type = error_text or "no_response"
+                # Classify the upstream response for telemetry. Extracted to
+                # _classify_response() (testable; mirrors _parse_usage's SSE
+                # handling) so genuine HTTP/network errors are reported with
+                # their real error_text instead of a generic 'parse_error'.
+                _resp_received, _resp_valid, _err_type = _classify_response(
+                    _resp_buf, error_text)
                 # Estimate actual tokens + detect billing mismatch (Phase 2.5.4).
                 # Uses the unit-tested audit_token_count from src/token_audit.py
                 # (with a never-raising fallback stub if the import failed).

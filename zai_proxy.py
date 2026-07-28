@@ -66,6 +66,14 @@ except Exception as _e:
 # ── Token-audit fallback (Phase 2.5.4) ──────────────────────────────────────
 # If the src import above failed, define a never-raising stub so the request
 # path's audit call is still safe.  Real logic lives in src/token_audit.py.
+#
+# IMPORTANT (false-positive fix): `billed_tokens` MUST be the provider's
+# completion_tokens — NOT total_tokens.  The estimate is derived from
+# len(response_buffer)//4, and the response buffer contains ONLY the completion
+# text (the prompt is never echoed back).  Passing total_tokens (prompt +
+# completion) makes the billed count always much larger than the completion-only
+# estimate, which guarantees a spurious >20% mismatch on any request with a
+# non-trivial prompt.
 if "_audit_token_count" not in globals():
 
     def _audit_token_count(billed_tokens, response_buffer, threshold=0.20):
@@ -2207,7 +2215,15 @@ class Handler(BaseHTTPRequestHandler):
             # itself also swallows errors, so this is belt-and-suspenders).
             try:
                 _latency_ms = int((time.time() - t0) * 1000)
-                _billed = int(usage.get("total_tokens") or 0)
+                # Use completion_tokens — NOT total_tokens — for the audit.
+                # `actual_tokens` is estimated from len(response_buffer)//4,
+                # and the response buffer contains ONLY the completion content
+                # (the prompt is never echoed back).  Comparing total_tokens
+                # (prompt+completion) against a completion-only estimate always
+                # looks like a >20% over-billing gap whenever the prompt is
+                # non-trivial, producing false-positive billing-mismatch alerts.
+                # (Phase 2.5.4 false-positive fix.)
+                _billed = int(usage.get("completion_tokens") or 0)
                 _resp_buf = bytes(response_buffer)
                 _resp_received = len(_resp_buf) > 0
                 _resp_valid = False
@@ -2264,10 +2280,14 @@ class Handler(BaseHTTPRequestHandler):
                 if _mismatch:
                     # Quality signal: feed mismatch_rate into CPVO via the
                     # token_mismatch telemetry column. Warn loudly — a large
-                    # billed-vs-actual gap is a billing-fraud / silent-downgrade
-                    # signal worth investigating.
+                    # billed-vs-actual gap on the COMPLETION content is a
+                    # billing-fraud / silent-downgrade signal worth
+                    # investigating.  (Note: total_tokens is intentionally NOT
+                    # used here — see the comment at the _billed assignment
+                    # above — because the response buffer holds completion text
+                    # only, so completion_tokens is the correct comparison basis.)
                     print(
-                        f"[telemetry] token billing mismatch: "
+                        f"[telemetry] token billing mismatch (completion): "
                         f"provider={key_used or 'unknown'} "
                         f"billed={_billed} actual~={_actual} "
                         f"gap={_mm_rate:.0%}",

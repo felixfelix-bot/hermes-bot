@@ -62,7 +62,9 @@ class VectorStore:
     def table_exists(self) -> bool:
         """Check if table exists in the database."""
         try:
-            return self.table_name in [table.name for table in self.db.list_tables()]
+            # Try to open the table, if it exists it will work
+            self.db.open_table(self.table_name)
+            return True
         except Exception:
             return False
     
@@ -112,28 +114,29 @@ class VectorStore:
         table = self.db.open_table(self.table_name)
         
         # Build search query
-        query = table.vector_search(query_vector).limit(limit)
+        query = table.search(query_vector).limit(limit)
         
         # Apply session filter if specified
         if session_id is not None:
             query = query.where(f"session_id = '{session_id}'")
         
         # Execute search
-        results = query.to_pydict()
+        results = query.to_arrow()
         
         # Format results with distance scores
         output_results = []
-        for i in range(len(results.get("id", []))):
-            result = {
-                "id": results["id"][i],
-                "session_id": results["session_id"][i],
-                "role": results["role"][i],
-                "content": results["content"][i],
-                "vector": results["vector"][i],
-                "timestamp": results["timestamp"][i],
-                "distance": float(results.get("_distance", [float('inf')])[i])
-            }
-            output_results.append(result)
+        if len(results) > 0:
+            for i in range(len(results["id"])):
+                result = {
+                    "id": results["id"][i].as_py(),
+                    "session_id": results["session_id"][i].as_py(),
+                    "role": results["role"][i].as_py(),
+                    "content": results["content"][i].as_py(),
+                    "vector": [float(x) for x in results["vector"][i].as_py()],
+                    "timestamp": results["timestamp"][i].as_py(),
+                    "distance": float(results["distance"][i].as_py()) if "distance" in results.schema.names else float('inf')
+                }
+                output_results.append(result)
         
         return output_results
     
@@ -155,17 +158,21 @@ class VectorStore:
         Returns:
             Number of records deleted
         """
-        table = self.db.open_table(self.table_name)
-        
-        # Count records before deletion
-        count_before = table.count_rows()
-        
-        # Delete session records
-        table.delete(f"session_id = '{session_id}'")
-        
-        # Return number of deleted records
-        count_after = table.count_rows()
-        return count_before - count_after
+        try:
+            table = self.db.open_table(self.table_name)
+            
+            # Count records before deletion
+            count_before = table.count_rows()
+            
+            # Delete session records
+            table.delete(f"session_id = '{session_id}'")
+            
+            # Return number of deleted records
+            count_after = table.count_rows()
+            return count_before - count_after
+        except Exception:
+            # If deletion fails (table doesn't exist, session doesn't exist, etc.)
+            return 0
     
     def get_table_info(self) -> Dict[str, Any]:
         """

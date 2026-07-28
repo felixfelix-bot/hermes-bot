@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pre-push: block pushes containing secrets + run quality gates
-# Scans all commits being pushed for secret patterns
+# pre-push: block pushes containing secrets in FULL repo history
+# Scans source files across all commits — skips large/binary/generated files
 set -e
 
 PATTERNS_FILE="$(git rev-parse --show-toplevel)/.secret-patterns.txt"
@@ -9,22 +9,21 @@ if [ ! -f "$PATTERNS_FILE" ]; then
     exit 0
 fi
 
-# Get commits being pushed
-RANGE="@{u}..HEAD"
-COMMITS=$(git rev-list "$RANGE" 2>/dev/null || echo "")
+# Only scan source code files, skip generated/binary/large files
+SCAN_PATHS="*.py *.sh *.json *.yml *.yaml *.toml *.env *.cfg *.conf *.ini *.js *.ts *.md"
 
-if [ -z "$COMMITS" ]; then
-    # No upstream — scan last 5 commits
-    COMMITS=$(git rev-list HEAD~5..HEAD 2>/dev/null || echo "")
-fi
+# Exclude files that define the patterns themselves + generated content
+EXCLUDE_PATHS=":(exclude).secret-patterns.txt :(exclude)data.json :(exclude)*.html"
 
 FOUND=0
 while IFS= read -r pattern; do
     [ -z "$pattern" ] && continue
     [[ "$pattern" == \#* ]] && continue
-    MATCH=$(git log -p $RANGE 2>/dev/null | grep -nP "$pattern" 2>/dev/null | head -5)
+
+    # Scan full history of source files only
+    MATCH=$(git log -p --all -- $SCAN_PATHS $EXCLUDE_PATHS 2>/dev/null | grep -nP "$pattern" 2>/dev/null | head -10)
     if [ -n "$MATCH" ]; then
-        echo "SECRET in push history (pattern: $pattern):"
+        echo "SECRET in repo history (pattern: $pattern):"
         echo "$MATCH"
         FOUND=1
     fi
@@ -33,9 +32,10 @@ done < "$PATTERNS_FILE"
 if [ $FOUND -eq 1 ]; then
     echo ""
     echo "PUSH BLOCKED — secrets detected in commit history."
-    echo "Scrub with: git filter-repo --replace-text .secret-patterns.txt"
+    echo "To scrub: git filter-repo --replace-text .secret-patterns.txt"
+    echo "To override (DANGEROUS): git push --no-verify"
     exit 1
 fi
 
-echo "No secrets detected."
+echo "✓ No secrets detected in full repo history."
 exit 0

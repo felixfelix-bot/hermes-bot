@@ -61,6 +61,19 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_snap_ts       ON balance_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_snap_provider ON balance_snapshots(provider, ts);
+
+CREATE TABLE IF NOT EXISTS ppq_queries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    model       TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    total_tokens INTEGER,
+    cost_usd    REAL,
+    query_type  TEXT,
+    api_key_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ppq_queries_ts ON ppq_queries(ts);
 """
 
 
@@ -122,9 +135,10 @@ def fetch_ppq():
             data = json.loads(resp.read().decode())
             balance = float(data.get("balance", 0))
 
-            # ── 2. GET /queries/history — recent spend breakdown ──
+            # ── 2. GET /queries/history — recent spend breakdown + per-query data ──
             spend_24h = 0.0
             query_count_24h = 0
+            query_records = []
             try:
                 hreq = urllib.request.Request(
                     f"{base}/queries/history?page=1&page_count=100",
@@ -134,7 +148,6 @@ def fetch_ppq():
                     hist = json.loads(hresp.read().decode())
                     now = time.time()
                     for q in hist.get("data", []):
-                        # Parse ISO timestamp
                         ts_str = q.get("timestamp", "")
                         try:
                             from datetime import datetime, timezone
@@ -144,6 +157,19 @@ def fetch_ppq():
                             if now - qts < 86400:  # last 24h
                                 spend_24h += float(q.get("price_in_usd", 0))
                                 query_count_24h += 1
+                            # Always save query for dashboard (last 100)
+                            inp = int(q.get("input_count", 0) or 0)
+                            out = int(q.get("output_count", 0) or 0)
+                            query_records.append({
+                                "ts": qts,
+                                "model": q.get("model", ""),
+                                "input_tokens": inp,
+                                "output_tokens": out,
+                                "total_tokens": inp + out,
+                                "cost_usd": float(q.get("price_in_usd", 0) or 0),
+                                "query_type": q.get("query_type", ""),
+                                "api_key_id": q.get("api_key_id", ""),
+                            })
                         except Exception:
                             pass
                     total_queries = hist.get("pagination", {}).get("total", 0)
@@ -153,11 +179,12 @@ def fetch_ppq():
             return {
                 "provider": "ppq",
                 "balance_usd": round(balance, 6),
-                "total_credits": None,  # PPQ uses pre-funded, not credit grants
+                "total_credits": None,
                 "total_usage": round(spend_24h, 6),
                 "spend_24h_usd": round(spend_24h, 6),
                 "queries_24h": query_count_24h,
                 "total_queries_all_time": total_queries,
+                "query_records": query_records,  # per-query data for dashboard
                 "raw": json.dumps(data)[:500],
             }
     except Exception as e:

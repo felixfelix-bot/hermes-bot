@@ -8,7 +8,7 @@ export PATH="$HOME/.deno/bin:$HOME/.local/bin:$PATH"
 REPORTS_DIR="$HOME/reports"
 NSITE_DIR="$HOME/nsites/worker-dashboard"
 DASHBOARD_NSEC=$(cat "$HOME/.hermes/state/worker-dashboard-nsec.key" 2>/dev/null || echo "")
-MAIN_NSEC="nsec1gszj7vzu56wjxk0kaja4tc3n8p4xachjev7maev4w82a8xd69ddsm7t63e"
+MAIN_NSEC="NSEC_REDACTED_USE_BUNKER"
 MAIN_NPUB="npub12m5exm2uk3xa674cc5r0hlyvccs5xxn7qv83ezuteefv5972nquq4j4szl"
 
 # Step 1: Regenerate the dashboard

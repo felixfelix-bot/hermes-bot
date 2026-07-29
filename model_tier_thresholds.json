@@ -1,0 +1,14 @@
+{
+  "economy_max_hours": 0.9,
+  "premium_min_hours": 227.5,
+  "peak_cap_tier": "air",
+  "updated_at": 1785015006.654285,
+  "source": "adaptive_percentile",
+  "samples_used": 1000,
+  "target_economy_pct": 10,
+  "target_standard_pct": 80,
+  "target_premium_pct": 10,
+  "p10_hours": 0.9,
+  "p90_hours": 227.5,
+  "median_hours": 10.7
+}

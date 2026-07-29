@@ -106,12 +106,21 @@ elif [ "$throttle" = "1" ] || [ "$qpause" = "1" ]; then
 fi
 
 # peak hours (config-driven via peak_hours.json, updated weekly by peak_hours_check.py)
+# REMOVED: hard exit during peak hours. Proxy auto-downgrades all models to economy
+# (glm-4.5-flash) during peak — no agent changes needed. We still dispatch, just cheaper.
 ph_s=$($PY -c "import json;d=json.load(open('$HOME/.hermes/bot/peak_hours.json'));print(d.get('peak_start_utc',6))" 2>/dev/null||echo 6)
 ph_e=$($PY -c "import json;d=json.load(open('$HOME/.hermes/bot/peak_hours.json'));print(d.get('peak_end_utc',10))" 2>/dev/null||echo 10)
 hour=$(date -u +%H)
 if [ "$hour" -ge "$ph_s" ] && [ "$hour" -lt "$ph_e" ]; then
-  echo "[$ts] PEAK HOURS (${ph_s}:00-${ph_e}:00 UTC, 3× burn) — pausing dispatch"
-  exit 0
+  # Peak hours: keep dispatching — proxy downgrades models to economy tier
+  tier_info=$($PY -c "
+import json, urllib.request
+try:
+  r = urllib.request.urlopen('http://localhost:9099/tier', timeout=5)
+  print(json.loads(r.read()).get('tier', 'unknown'))
+except Exception:
+  print('unknown')" 2>/dev/null || echo "unknown")
+  echo "[$ts] PEAK HOURS (${ph_s}:00-${ph_e}:00 UTC) — proxy handles downgrade (tier=$tier_info)"
 fi
 
 if [ "$active" -eq 0 ]; then

@@ -1,7 +1,7 @@
 {
-  "ts": 1783411449,
-  "ok": false,
+  "ts": 1785306630,
+  "ok": true,
   "issues": [
-    "VISION SMOKE TEST FAILED: TimeoutError: timed out. Model=glm-4.6v, endpoint=http://127.0.0.1:9099/chat/completions"
+    "vision temporarily disabled (no vision-capable model available)"
   ]
 }

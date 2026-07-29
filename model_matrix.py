@@ -33,8 +33,10 @@ BOT = HOME / ".hermes" / "bot"
 OUT = BOT / "model_matrix.json"
 QUOTA_URL = "http://localhost:9099/quota"
 USAGE_DB = BOT / "zai_usage.db"
-PPQ_API_KEY = os.environ.get("PPQ_API_KEY", "sk-K3L6r46DdSTsDXiWRE6AXw")
+PPQ_API_KEY = os.environ.get("PPQ_API_KEY", "")
 PPQ_BASE = "https://api.ppq.ai/v1"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 # ── z.ai cost model ─────────────────────────────────────────────────────────
 ZAI_MONTHLY_FEE_USD = 155          # €144 ≈ $155
@@ -152,6 +154,55 @@ def scrape_ppq_models() -> list[dict]:
         return data.get("data", [])
     except Exception as e:
         print(f"  WARN: PPQ scrape failed: {e}", file=sys.stderr)
+        return []
+
+
+def scrape_openrouter_models() -> list[dict]:
+    """Fetch OpenRouter models with live pricing.
+
+    OpenRouter's /v1/models endpoint returns pricing per-token in USD.
+    We convert to per-1M-tokens for consistency with the rest of the matrix.
+    """
+    if not OPENROUTER_API_KEY:
+        print("  WARN: OPENROUTER_API_KEY not set, skipping OpenRouter scrape", file=sys.stderr)
+        return []
+    try:
+        req = urllib.request.Request(
+            f"{OPENROUTER_BASE}/models",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+
+        parsed = []
+        for m in models:
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            pricing = m.get("pricing", {})
+            prompt_cost = float(pricing.get("prompt", "999"))
+            completion_cost = float(pricing.get("completion", "999"))
+
+            if prompt_cost < 0 or completion_cost < 0:
+                continue
+            if prompt_cost > 100:
+                continue
+
+            ctx = m.get("context_length", 32768)
+            parsed.append({
+                "id": mid,
+                "name": m.get("name", mid),
+                "provider": m.get("top_provider", {}).get("name", "unknown"),
+                "context_length": ctx,
+                "cost_per_1m_prompt": round(prompt_cost * 1e6, 4),
+                "cost_per_1m_completion": round(completion_cost * 1e6, 4),
+                "cost_per_1m_combined": round((prompt_cost + completion_cost) * 1e6, 4),
+            })
+        print(f"  OpenRouter: {len(parsed)} models with valid pricing")
+        return parsed
+    except Exception as e:
+        print(f"  WARN: OpenRouter scrape failed: {e}", file=sys.stderr)
         return []
 
 
@@ -360,6 +411,53 @@ def build_matrix() -> dict:
             },
         },
     }
+
+    # Add OpenRouter models (live pricing from API)
+    print("  Scraping OpenRouter models...")
+    or_models = scrape_openrouter_models()
+    or_added = 0
+    for m in or_models:
+        model_id = m["id"]
+
+        # Skip free models that are tiny/low-quality (unless we have benchmarks)
+        if m["cost_per_1m_combined"] == 0:
+            bench = _BENCHMARK_CACHE.get(model_id.lower(), {})
+            if not bench:
+                continue
+
+        # Get benchmark data — try exact match, then base model name
+        bench = (
+            _BENCHMARK_CACHE.get(model_id.lower())
+            or _BENCHMARK_CACHE.get(model_id)
+            or {}
+        )
+        if not bench:
+            # Try matching by base model (e.g., "z-ai/glm-5.2" matches "z-ai/glm-5.2")
+            for cache_key, cache_val in _BENCHMARK_CACHE.items():
+                if cache_key in model_id.lower() or model_id.lower() in cache_key:
+                    bench = cache_val
+                    break
+
+        combined_cost = m["cost_per_1m_combined"]
+
+        models[f"openrouter/{model_id}"] = {
+            "name": m.get("name", model_id),
+            "provider": m.get("provider", "openrouter"),
+            "context_length": m.get("context_length", 32768),
+            "benchmarks": bench,
+            "keys": {
+                "openrouter/default": {
+                    "base_url": OPENROUTER_BASE,
+                    "cost_per_1m_offpeak": combined_cost,
+                    "cost_per_1m_peak": combined_cost,
+                    "cost_per_1m_prompt": m["cost_per_1m_prompt"],
+                    "cost_per_1m_completion": m["cost_per_1m_completion"],
+                    "penalty_pct": 0,
+                },
+            },
+        }
+        or_added += 1
+    print(f"  OpenRouter: {or_added} models added to matrix")
 
     return {
         "timestamp": _utc_now(),

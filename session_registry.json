@@ -1,8 +1,8 @@
 {
-  "last_sync": "2026-07-06T20:30:09.309601+00:00",
-  "total_worktrees": 52,
-  "total_sessions": 657,
-  "needs_curation": 9,
+  "last_sync": "2026-07-28T20:30:52.989727+00:00",
+  "total_worktrees": 54,
+  "total_sessions": 662,
+  "needs_curation": 8,
   "sessions": {
     "/home/c03rad0r": {
       "description": "Hermes Agent disk space check",
@@ -12,6 +12,9 @@
       "is_git": true,
       "session_ids": [
         "ses_11e495071ffetfDchK19GpPI8Y",
+        "ses_0b988efa3ffe6c0gQC3sxHw62q",
+        "ses_0bce62818ffe4bdCrB7BKZClX4",
+        "ses_0bf169827ffe3ASVBsQRqPNxWh",
         "ses_0f2963f35ffedGT7iOcMgVi3jJ",
         "ses_0f29dbc82ffe5fii0H0uZBPUZD",
         "ses_0f2af28d6ffe10fALzZtPwN98F",
@@ -45,26 +48,86 @@
         "ses_2ad0c8142ffecPKRB0DEZXupKh",
         "ses_323676522ffeUmSAfMNSLJoqkJ"
       ],
-      "last_activity": "2026-06-29T09:57:03.156000+00:00",
-      "last_activity_epoch": 1782727023.156,
-      "total_sessions": 33,
-      "total_tokens_in": 29773038,
-      "total_tokens_out": 862905,
+      "last_activity": "2026-07-27T06:01:10.800000+00:00",
+      "last_activity_epoch": 1785132070.8,
+      "total_sessions": 36,
+      "total_tokens_in": 65067703,
+      "total_tokens_out": 1450995,
       "handover": {
         "path": "/home/c03rad0r/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.658547,
-        "mtime_iso": "2026-07-05T22:47:00.658000+00:00"
+        "mtime_epoch": 1785192500.7382505,
+        "mtime_iso": "2026-07-27T22:48:20.738000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/llms.txt",
         "exists": true,
-        "mtime_epoch": 1782766037.679983,
-        "mtime_iso": "2026-06-29T20:47:17.679000+00:00"
+        "mtime_epoch": 1785184242.2347734,
+        "mtime_iso": "2026-07-27T20:30:42.234000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
       "status": "active"
+    },
+    "/home/c03rad0r/proteomics-pipeline": {
+      "description": "Repo context review",
+      "worktree": "/home/c03rad0r/proteomics-pipeline",
+      "repo": "proteomics-pipeline",
+      "branch": "main",
+      "is_git": true,
+      "session_ids": [
+        "ses_0a045789fffe6hTN60i7WFLTzo"
+      ],
+      "last_activity": "2026-07-14T09:59:00.385000+00:00",
+      "last_activity_epoch": 1784023140.385,
+      "total_sessions": 1,
+      "total_tokens_in": 415472,
+      "total_tokens_out": 26350,
+      "handover": {
+        "path": "/home/c03rad0r/proteomics-pipeline/HANDOVER.md",
+        "exists": true,
+        "mtime_epoch": 1785192501.1366765,
+        "mtime_iso": "2026-07-27T22:48:21.136000+00:00"
+      },
+      "llms_txt": {
+        "path": "/home/c03rad0r/proteomics-pipeline/llms.txt",
+        "exists": true,
+        "mtime_epoch": 1784061022.5366755,
+        "mtime_iso": "2026-07-14T20:30:22.536000+00:00"
+      },
+      "needs_curation": false,
+      "curation_reasons": [],
+      "status": "stale"
+    },
+    "/home/c03rad0r/feed": {
+      "description": "OpenWrt feed for tollgate-module-basic-go",
+      "worktree": "/home/c03rad0r/feed",
+      "repo": "feed",
+      "branch": "fix/tar-extraction-stdin-bug",
+      "is_git": true,
+      "session_ids": [
+        "ses_0bf03b499ffeWLCw9R5CecDcm7"
+      ],
+      "last_activity": "2026-07-08T15:16:37.858000+00:00",
+      "last_activity_epoch": 1783523797.858,
+      "total_sessions": 1,
+      "total_tokens_in": 1625215,
+      "total_tokens_out": 45789,
+      "handover": {
+        "path": "/home/c03rad0r/feed/HANDOVER.md",
+        "exists": true,
+        "mtime_epoch": 1785192500.9383962,
+        "mtime_iso": "2026-07-27T22:48:20.938000+00:00"
+      },
+      "llms_txt": {
+        "path": "/home/c03rad0r/feed/llms.txt",
+        "exists": true,
+        "mtime_epoch": 1783542633.829916,
+        "mtime_iso": "2026-07-08T20:30:33.829000+00:00"
+      },
+      "needs_curation": false,
+      "curation_reasons": [],
+      "status": "stale"
     },
     "/home/c03rad0r/esp32-balloon-integration": {
       "description": "Freerouting DSN format fix",
@@ -179,13 +242,13 @@
       },
       "needs_curation": false,
       "curation_reasons": [],
-      "status": "active"
+      "status": "stale"
     },
     "/home/c03rad0r/market": {
       "description": "Shipping-selector PR with diagnostic commit",
       "worktree": "/home/c03rad0r/market",
       "repo": "market",
-      "branch": "fix-1104-franchovy-feedback",
+      "branch": "docs/adr-store-layer",
       "is_git": true,
       "session_ids": [
         "ses_106e733abffetTxxI5VI2nfE60",
@@ -266,24 +329,24 @@
       "handover": {
         "path": "/home/c03rad0r/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8584168,
-        "mtime_iso": "2026-07-05T22:47:00.858000+00:00"
+        "mtime_epoch": 1785192500.9860148,
+        "mtime_iso": "2026-07-27T22:48:20.986000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/market/llms.txt",
         "exists": true,
-        "mtime_epoch": 1783287955.1296313,
-        "mtime_iso": "2026-07-05T21:45:55.129000+00:00"
+        "mtime_epoch": 1785184242.469776,
+        "mtime_iso": "2026-07-27T20:30:42.469000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
-      "status": "active"
+      "status": "stale"
     },
     "/home/c03rad0r/rana": {
       "description": "Rana PR plan: entropy-based npub mining",
       "worktree": "/home/c03rad0r/rana",
       "repo": "rana",
-      "branch": "feat/entropy-mining",
+      "branch": "feat/mac-mapping",
       "is_git": true,
       "session_ids": [
         "ses_11067d511ffe0ykj8mqZhVz22M",
@@ -297,8 +360,8 @@
       "handover": {
         "path": "/home/c03rad0r/rana/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9476824,
-        "mtime_iso": "2026-07-05T22:47:00.947000+00:00"
+        "mtime_epoch": 1785192501.157641,
+        "mtime_iso": "2026-07-27T22:48:21.157000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/rana/llms.txt",
@@ -308,7 +371,7 @@
       },
       "needs_curation": false,
       "curation_reasons": [],
-      "status": "active"
+      "status": "stale"
     },
     "/home/c03rad0r/nostr-glasses": {
       "description": "Research India\u2194West arbitrage (@research subagent)",
@@ -328,8 +391,8 @@
       "handover": {
         "path": "/home/c03rad0r/nostr-glasses/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8963587,
-        "mtime_iso": "2026-07-05T22:47:00.896000+00:00"
+        "mtime_epoch": 1785192501.034243,
+        "mtime_iso": "2026-07-27T22:48:21.034000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/nostr-glasses/llms.txt",
@@ -339,13 +402,13 @@
       },
       "needs_curation": false,
       "curation_reasons": [],
-      "status": "active"
+      "status": "stale"
     },
     "/home/c03rad0r/tollgate-infrastructure-kit": {
       "description": "Strfry aggregation relay deployment plan",
       "worktree": "/home/c03rad0r/tollgate-infrastructure-kit",
       "repo": "tollgate-infrastructure-kit",
-      "branch": "feat/wot-sync-blossom-grasp",
+      "branch": "main",
       "is_git": true,
       "session_ids": [
         "ses_135b68defffeB20PQ7s2vsMmIC",
@@ -421,8 +484,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-infrastructure-kit/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9836304,
-        "mtime_iso": "2026-07-05T22:47:00.983000+00:00"
+        "mtime_epoch": 1785192501.210878,
+        "mtime_iso": "2026-07-27T22:48:21.210000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-infrastructure-kit/llms.txt",
@@ -432,7 +495,7 @@
       },
       "needs_curation": false,
       "curation_reasons": [],
-      "status": "active"
+      "status": "stale"
     },
     "/home/c03rad0r/vanity-npub-ghdl": {
       "description": "Repo context review",
@@ -464,8 +527,8 @@
       "handover": {
         "path": "/home/c03rad0r/vanity-npub-ghdl/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291621.0307877,
-        "mtime_iso": "2026-07-05T22:47:01.030000+00:00"
+        "mtime_epoch": 1785192501.2806664,
+        "mtime_iso": "2026-07-27T22:48:21.280000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/vanity-npub-ghdl/llms.txt",
@@ -494,8 +557,8 @@
       "handover": {
         "path": "/home/c03rad0r/openrouter-automation/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1781882315.5842192,
-        "mtime_iso": "2026-06-19T15:18:35.584000+00:00"
+        "mtime_epoch": 1783542445.5768564,
+        "mtime_iso": "2026-07-08T20:27:25.576000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/openrouter-automation/llms.txt",
@@ -503,17 +566,15 @@
         "mtime_epoch": 1782251671.9121325,
         "mtime_iso": "2026-06-23T21:54:31.912000+00:00"
       },
-      "needs_curation": true,
-      "curation_reasons": [
-        "handover stale"
-      ],
+      "needs_curation": false,
+      "curation_reasons": [],
       "status": "stale"
     },
     "/home/c03rad0r/tollgate-module-basic-go": {
       "description": "Check local main behind remote",
       "worktree": "/home/c03rad0r/tollgate-module-basic-go",
       "repo": "tollgate-module-basic-go",
-      "branch": "net4sats-mvp",
+      "branch": "fix/lightning-monitor-rate-limiting",
       "is_git": true,
       "session_ids": [
         "ses_1253f89f0ffei9WXdp2kc5R8YL",
@@ -590,14 +651,14 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-module-basic-go/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9904501,
-        "mtime_iso": "2026-07-05T22:47:00.990000+00:00"
+        "mtime_epoch": 1785192501.2192519,
+        "mtime_iso": "2026-07-27T22:48:21.219000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-module-basic-go/llms.txt",
         "exists": true,
-        "mtime_epoch": 1783369800.695181,
-        "mtime_iso": "2026-07-06T20:30:00.695000+00:00"
+        "mtime_epoch": 1784374402.704538,
+        "mtime_iso": "2026-07-18T11:33:22.704000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
@@ -709,8 +770,8 @@
       "handover": {
         "path": "/home/c03rad0r/esp32-tollgate/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.777416,
-        "mtime_iso": "2026-07-05T22:47:00.777000+00:00"
+        "mtime_epoch": 1785192500.8997264,
+        "mtime_iso": "2026-07-27T22:48:20.899000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/esp32-tollgate/llms.txt",
@@ -739,8 +800,8 @@
       "handover": {
         "path": "/home/c03rad0r/nutband/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9088986,
-        "mtime_iso": "2026-07-05T22:47:00.908000+00:00"
+        "mtime_epoch": 1785192501.0530157,
+        "mtime_iso": "2026-07-27T22:48:21.053000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/nutband/llms.txt",
@@ -756,7 +817,7 @@
       "description": "configurationwizard integration with tollgate-module-basic-go",
       "worktree": "/home/c03rad0r/configurationwizzard",
       "repo": "configurationwizzard",
-      "branch": "net4sats-mvp",
+      "branch": "fix/balance-redirect-port",
       "is_git": true,
       "session_ids": [
         "ses_17392ab15ffeoG1OuVkVkGQfDR",
@@ -781,14 +842,14 @@
       "handover": {
         "path": "/home/c03rad0r/configurationwizzard/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7104151,
-        "mtime_iso": "2026-07-05T22:47:00.710000+00:00"
+        "mtime_epoch": 1785192500.8128128,
+        "mtime_iso": "2026-07-27T22:48:20.812000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/configurationwizzard/llms.txt",
         "exists": true,
-        "mtime_epoch": 1783369800.3921776,
-        "mtime_iso": "2026-07-06T20:30:00.392000+00:00"
+        "mtime_epoch": 1784752224.8649812,
+        "mtime_iso": "2026-07-22T20:30:24.864000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
@@ -870,8 +931,8 @@
       "handover": {
         "path": "/home/c03rad0r/physical-router-test-automation/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9298878,
-        "mtime_iso": "2026-07-05T22:47:00.929000+00:00"
+        "mtime_epoch": 1785192501.0857716,
+        "mtime_iso": "2026-07-27T22:48:21.085000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/physical-router-test-automation/llms.txt",
@@ -904,8 +965,8 @@
       "handover": {
         "path": "/home/c03rad0r/gitworkshop/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.852549,
-        "mtime_iso": "2026-07-05T22:47:00.852000+00:00"
+        "mtime_epoch": 1785192500.978107,
+        "mtime_iso": "2026-07-27T22:48:20.978000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/gitworkshop/llms.txt",
@@ -934,8 +995,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-release-explorer-site/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291621.0128374,
-        "mtime_iso": "2026-07-05T22:47:01.012000+00:00"
+        "mtime_epoch": 1785192501.2536829,
+        "mtime_iso": "2026-07-27T22:48:21.253000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-release-explorer-site/llms.txt",
@@ -982,8 +1043,8 @@
       "handover": {
         "path": "/home/c03rad0r/plebeian-testing-15.05.2026/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9384177,
-        "mtime_iso": "2026-07-05T22:47:00.938000+00:00"
+        "mtime_epoch": 1785192501.1140163,
+        "mtime_iso": "2026-07-27T22:48:21.114000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/plebeian-testing-15.05.2026/market/llms.txt",
@@ -1018,8 +1079,8 @@
       "llms_txt": {
         "path": "/tmp/llms.txt",
         "exists": true,
-        "mtime_epoch": 1783283450.3242419,
-        "mtime_iso": "2026-07-05T20:30:50.324000+00:00"
+        "mtime_epoch": 1785184242.641778,
+        "mtime_iso": "2026-07-27T20:30:42.641000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
@@ -1042,8 +1103,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-community-calls/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.976542,
-        "mtime_iso": "2026-07-05T22:47:00.976000+00:00"
+        "mtime_epoch": 1785192501.203305,
+        "mtime_iso": "2026-07-27T22:48:21.203000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-community-calls/llms.txt",
@@ -1080,8 +1141,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-nostr-signing-device/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9979641,
-        "mtime_iso": "2026-07-05T22:47:00.997000+00:00"
+        "mtime_epoch": 1785192501.230747,
+        "mtime_iso": "2026-07-27T22:48:21.230000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-nostr-signing-device/llms.txt",
@@ -1116,8 +1177,8 @@
       "handover": {
         "path": "/home/c03rad0r/contextvm-anker-solix/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7194152,
-        "mtime_iso": "2026-07-05T22:47:00.719000+00:00"
+        "mtime_epoch": 1785192500.8233433,
+        "mtime_iso": "2026-07-27T22:48:20.823000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/contextvm-anker-solix/llms.txt",
@@ -1162,8 +1223,8 @@
       "handover": {
         "path": "/home/c03rad0r/esp-miner/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.737409,
-        "mtime_iso": "2026-07-05T22:47:00.737000+00:00"
+        "mtime_epoch": 1785192500.8448417,
+        "mtime_iso": "2026-07-27T22:48:20.844000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/esp-miner/llms.txt",
@@ -1226,8 +1287,8 @@
       "handover": {
         "path": "/home/c03rad0r/esp32-mesh/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7524157,
-        "mtime_iso": "2026-07-05T22:47:00.752000+00:00"
+        "mtime_epoch": 1785192500.863039,
+        "mtime_iso": "2026-07-27T22:48:20.863000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/esp32-mesh/llms.txt",
@@ -1256,8 +1317,8 @@
       "handover": {
         "path": "/home/c03rad0r/setup-android-screen-sharing/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.953418,
-        "mtime_iso": "2026-07-05T22:47:00.953000+00:00"
+        "mtime_epoch": 1785192501.1739848,
+        "mtime_iso": "2026-07-27T22:48:21.173000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/setup-android-screen-sharing/llms.txt",
@@ -1286,8 +1347,8 @@
       "handover": {
         "path": "/home/c03rad0r/awesome-community-networks/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.694857,
-        "mtime_iso": "2026-07-05T22:47:00.694000+00:00"
+        "mtime_epoch": 1785192500.793607,
+        "mtime_iso": "2026-07-27T22:48:20.793000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/awesome-community-networks/llms.txt",
@@ -1340,8 +1401,8 @@
       "handover": {
         "path": "/home/c03rad0r/94-temporarily-remove-unreachable-mints-from-list-of-supported-mints/tollgate-module-basic-go/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.6764147,
-        "mtime_iso": "2026-07-05T22:47:00.676000+00:00"
+        "mtime_epoch": 1785192500.7607882,
+        "mtime_iso": "2026-07-27T22:48:20.760000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/94-temporarily-remove-unreachable-mints-from-list-of-supported-mints/tollgate-module-basic-go/llms.txt",
@@ -1357,7 +1418,7 @@
       "description": "TollGate Rust docs vs TIPs comparison",
       "worktree": "/home/c03rad0r/tollgate-rs",
       "repo": "tollgate-rs",
-      "branch": "ci-and-workflow-rules",
+      "branch": "feature/android-native",
       "is_git": true,
       "session_ids": [
         "ses_1f97a7289ffe3Hiz3iG4Qd006b",
@@ -1373,14 +1434,14 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-rs/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291621.0192149,
-        "mtime_iso": "2026-07-05T22:47:01.019000+00:00"
+        "mtime_epoch": 1785192501.2622864,
+        "mtime_iso": "2026-07-27T22:48:21.262000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-rs/llms.txt",
         "exists": true,
-        "mtime_epoch": 1783369800.788182,
-        "mtime_iso": "2026-07-06T20:30:00.788000+00:00"
+        "mtime_epoch": 1783645533.8998878,
+        "mtime_iso": "2026-07-10T01:05:33.899000+00:00"
       },
       "needs_curation": false,
       "curation_reasons": [],
@@ -1405,8 +1466,8 @@
       "handover": {
         "path": "/home/c03rad0r/market-08-05-2026/trusted-mint-state-ownership/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8878293,
-        "mtime_iso": "2026-07-05T22:47:00.887000+00:00"
+        "mtime_epoch": 1785192501.0223677,
+        "mtime_iso": "2026-07-27T22:48:21.022000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/market-08-05-2026/trusted-mint-state-ownership/llms.txt",
@@ -1435,8 +1496,8 @@
       "handover": {
         "path": "/home/c03rad0r/market-08-05-2026/fix-bidding-with-any-mint/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8813195,
-        "mtime_iso": "2026-07-05T22:47:00.881000+00:00"
+        "mtime_epoch": 1785192501.0124807,
+        "mtime_iso": "2026-07-27T22:48:21.012000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/market-08-05-2026/fix-bidding-with-any-mint/llms.txt",
@@ -1465,8 +1526,8 @@
       "handover": {
         "path": "/home/c03rad0r/market-08-05-2026/auction-shipping-ref-dedupe/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8732264,
-        "mtime_iso": "2026-07-05T22:47:00.873000+00:00"
+        "mtime_epoch": 1785192501.0017421,
+        "mtime_iso": "2026-07-27T22:48:21.001000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/market-08-05-2026/auction-shipping-ref-dedupe/llms.txt",
@@ -1495,8 +1556,8 @@
       "handover": {
         "path": "/home/c03rad0r/market-08-05-2026/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.868417,
-        "mtime_iso": "2026-07-05T22:47:00.868000+00:00"
+        "mtime_epoch": 1785192500.995015,
+        "mtime_iso": "2026-07-27T22:48:20.995000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/market-08-05-2026/llms.txt",
@@ -1525,8 +1586,8 @@
       "handover": {
         "path": "/home/c03rad0r/feat-auction-custom-mint-support/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7873359,
-        "mtime_iso": "2026-07-05T22:47:00.787000+00:00"
+        "mtime_epoch": 1785192500.916366,
+        "mtime_iso": "2026-07-27T22:48:20.916000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/feat-auction-custom-mint-support/market/llms.txt",
@@ -1555,8 +1616,8 @@
       "handover": {
         "path": "/home/c03rad0r/fix-auction-trusted-mint-state-ownership/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8346703,
-        "mtime_iso": "2026-07-05T22:47:00.834000+00:00"
+        "mtime_epoch": 1785192500.9613361,
+        "mtime_iso": "2026-07-27T22:48:20.961000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/fix-auction-trusted-mint-state-ownership/market/llms.txt",
@@ -1585,8 +1646,8 @@
       "handover": {
         "path": "/home/c03rad0r/fix-auction-shipping-ref-dedupe/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.824124,
-        "mtime_iso": "2026-07-05T22:47:00.824000+00:00"
+        "mtime_epoch": 1785192500.953877,
+        "mtime_iso": "2026-07-27T22:48:20.953000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/fix-auction-shipping-ref-dedupe/market/llms.txt",
@@ -1617,8 +1678,8 @@
       "handover": {
         "path": "/home/c03rad0r/fix-bidding-with-any-mint/market/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8428924,
-        "mtime_iso": "2026-07-05T22:47:00.842000+00:00"
+        "mtime_epoch": 1785192500.9674718,
+        "mtime_iso": "2026-07-27T22:48:20.967000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/fix-bidding-with-any-mint/market/llms.txt",
@@ -1651,8 +1712,8 @@
       "handover": {
         "path": "/home/c03rad0r/feature-upstream-wifi-manager/tollgate-module-basic-go/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8066397,
-        "mtime_iso": "2026-07-05T22:47:00.806000+00:00"
+        "mtime_epoch": 1785192500.93159,
+        "mtime_iso": "2026-07-27T22:48:20.931000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/feature-upstream-wifi-manager/tollgate-module-basic-go/llms.txt",
@@ -1815,8 +1876,8 @@
       "handover": {
         "path": "/home/c03rad0r/feature-luci-admin-ui/tollgate-module-basic-go/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7967017,
-        "mtime_iso": "2026-07-05T22:47:00.796000+00:00"
+        "mtime_epoch": 1785192500.9242113,
+        "mtime_iso": "2026-07-27T22:48:20.924000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/feature-luci-admin-ui/tollgate-module-basic-go/llms.txt",
@@ -1846,8 +1907,8 @@
       "handover": {
         "path": "/home/c03rad0r/Desktop/soveng-compliance-slides/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.6847506,
-        "mtime_iso": "2026-07-05T22:47:00.684000+00:00"
+        "mtime_epoch": 1785192500.7760124,
+        "mtime_iso": "2026-07-27T22:48:20.776000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/Desktop/soveng-compliance-slides/llms.txt",
@@ -1890,8 +1951,8 @@
       "handover": {
         "path": "/home/c03rad0r/fips/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.8149076,
-        "mtime_iso": "2026-07-05T22:47:00.814000+00:00"
+        "mtime_epoch": 1785192500.9463167,
+        "mtime_iso": "2026-07-27T22:48:20.946000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/fips/llms.txt",
@@ -1923,8 +1984,8 @@
       "handover": {
         "path": "/home/c03rad0r/direwolf-setup/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7269497,
-        "mtime_iso": "2026-07-05T22:47:00.726000+00:00"
+        "mtime_epoch": 1785192500.8326564,
+        "mtime_iso": "2026-07-27T22:48:20.832000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/direwolf-setup/llms.txt",
@@ -1954,8 +2015,8 @@
       "handover": {
         "path": "/home/c03rad0r/sx1280-testing/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.962418,
-        "mtime_iso": "2026-07-05T22:47:00.962000+00:00"
+        "mtime_epoch": 1785192501.1892376,
+        "mtime_iso": "2026-07-27T22:48:21.189000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/sx1280-testing/llms.txt",
@@ -1984,8 +2045,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-bash-client/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.9699116,
-        "mtime_iso": "2026-07-05T22:47:00.969000+00:00"
+        "mtime_epoch": 1785192501.1964617,
+        "mtime_iso": "2026-07-27T22:48:21.196000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-bash-client/llms.txt",
@@ -2014,8 +2075,8 @@
       "handover": {
         "path": "/home/c03rad0r/awesome-tollgate/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.7027724,
-        "mtime_iso": "2026-07-05T22:47:00.702000+00:00"
+        "mtime_epoch": 1785192500.8012116,
+        "mtime_iso": "2026-07-27T22:48:20.801000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/awesome-tollgate/llms.txt",
@@ -2048,8 +2109,8 @@
       "handover": {
         "path": "/home/c03rad0r/tollgate-quaterly-reports/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291621.0056732,
-        "mtime_iso": "2026-07-05T22:47:01.005000+00:00"
+        "mtime_epoch": 1785192501.2437096,
+        "mtime_iso": "2026-07-27T22:48:21.243000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/tollgate-quaterly-reports/llms.txt",
@@ -2142,8 +2203,8 @@
       "handover": {
         "path": "/home/c03rad0r/opencode-setup/HANDOVER.md",
         "exists": true,
-        "mtime_epoch": 1783291620.917776,
-        "mtime_iso": "2026-07-05T22:47:00.917000+00:00"
+        "mtime_epoch": 1785192501.0640821,
+        "mtime_iso": "2026-07-27T22:48:21.064000+00:00"
       },
       "llms_txt": {
         "path": "/home/c03rad0r/opencode-setup/llms.txt",

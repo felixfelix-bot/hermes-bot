@@ -63,11 +63,25 @@ try:
         LOOKBACK_HOURS,
         MIN_DATA_POINTS,
     )
+    # Import multi-resource functions if available
+    try:
+        from burn_predictor import (
+            predict_resource_exhaustion,
+            get_system_resource_summary,
+            _HAS_MULTI_RESOURCE
+        )
+    except ImportError:
+        predict_resource_exhaustion = None  # type: ignore
+        get_system_resource_summary = None  # type: ignore
+        _HAS_MULTI_RESOURCE = False
 except Exception as _e:  # pragma: no cover
     KalmanPredictor = None  # type: ignore
     predict_exhaustion = None  # type: ignore
     predict_all = None  # type: ignore
     _get_burn_history = None  # type: ignore
+    predict_resource_exhaustion = None  # type: ignore
+    get_system_resource_summary = None  # type: ignore
+    _HAS_MULTI_RESOURCE = False
     _IMPORT_ERR = repr(_e)
 else:
     _IMPORT_ERR = None
@@ -296,6 +310,99 @@ def _verdict(mape: float, vel_acc: float, cov1: float, trend: str) -> str:
     return "healthy"
 
 
+# ── Multi-Resource Health Check ─────────────────────────────────────────────────
+
+def check_multi_resource_health() -> dict:
+    """Check the health of the multi-resource Kalman predictor.
+    
+    Returns:
+        Dict with health status for the 4-state system resource predictor
+    """
+    if not _HAS_MULTI_RESOURCE or not predict_resource_exhaustion:
+        return {
+            "status": "unavailable",
+            "reason": "Multi-resource predictor not available",
+            "predictor_type": "4-state-kalman"
+        }
+    
+    try:
+        # Test basic functionality
+        summary = get_system_resource_summary()
+        predictions = predict_resource_exhaustion(minutes_ahead=30)
+        
+        health_status = {
+            "status": "healthy",
+            "predictor_type": "4-state-kalman",
+            "resources": ["tokens", "cpu_load", "memory_pct", "worker_count"],
+            "timestamp": time.time(),
+            "checks": {}
+        }
+        
+        # Check resource summary
+        if summary.get("status") == "ok":
+            health_status["checks"]["resource_summary"] = {
+                "status": "pass",
+                "data_points": summary.get("data_points", 0),
+                "timestamp": summary.get("timestamp")
+            }
+        else:
+            health_status["checks"]["resource_summary"] = {
+                "status": "fail",
+                "reason": summary.get("error", "Unknown error")
+            }
+            health_status["status"] = "degraded"
+        
+        # Check prediction functionality
+        if predictions.get("status") == "success":
+            pred_data = predictions
+            health_status["checks"]["prediction_engine"] = {
+                "status": "pass",
+                "predictor_initialized": pred_data.get("predictor_initialized", False),
+                "update_count": pred_data.get("update_count", 0),
+                "history_points": pred_data.get("history_points", 0),
+                "warnings_count": len(pred_data.get("resource_warnings", []))
+            }
+            
+            # Check health score
+            health_score = pred_data.get("health_score", {})
+            if isinstance(health_score, dict):
+                overall_health = health_score.get("overall", 0)
+                health_status["overall_health_score"] = overall_health
+                
+                # Health score thresholds
+                if overall_health >= 80:
+                    health_category = "good"
+                elif overall_health >= 60:
+                    health_category = "moderate"
+                elif overall_health >= 40:
+                    health_category = "poor"
+                else:
+                    health_category = "critical"
+                    health_status["status"] = "unhealthy"
+                
+                health_status["health_category"] = health_category
+                health_status["checks"]["health_score"] = {
+                    "status": "pass" if overall_health >= 40 else "fail",
+                    "score": overall_health,
+                    "category": health_category
+                }
+        else:
+            health_status["checks"]["prediction_engine"] = {
+                "status": "fail",
+                "reason": predictions.get("error", "Unknown error")
+            }
+            health_status["status"] = "unhealthy"
+        
+        return health_status
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Multi-resource health check failed: {str(e)}",
+            "predictor_type": "4-state-kalman"
+        }
+
+
 # ── live prediction snapshot (collect mode) ──────────────────────────────────
 
 def collect_samples() -> dict:
@@ -451,6 +558,24 @@ def build_report() -> dict:
         "keys": keys_out,
         "status_line": "",
     }
+    
+    # Add multi-resource health check if available
+    if _HAS_MULTI_RESOURCE:
+        multi_resource_health = check_multi_resource_health()
+        report["multi_resource_health"] = multi_resource_health
+        
+        # Update overall verdict to consider multi-resource health
+        if multi_resource_health.get("status") == "unhealthy":
+            if overall == "healthy":
+                overall = "degraded"
+            elif overall == "degraded":
+                overall = "unhealthy"
+        elif multi_resource_health.get("status") == "error":
+            if overall == "healthy":
+                overall = "degraded"
+                
+        report["overall_verdict"] = overall
+    
     report["status_line"] = format_status_line(report)
     return report
 
@@ -476,8 +601,18 @@ def format_status_line(report: dict) -> str:
             kbits.append(f"{kn} {km}")
     mape_s = f"{mape:.1f}%" if mape is not None else "n/a"
     vel_s = f"{vel:.0f}%" if vel is not None else "n/a"
+    
+    # Add multi-resource status if available
+    mr_status = ""
+    if "multi_resource_health" in report:
+        mr_health = report["multi_resource_health"]
+        mr_status_actual = mr_health.get("status", "?")
+        mr_mark = {"healthy": "✓", "degraded": "!", "unhealthy": "✗", 
+                  "error": "⚠", "unavailable": "⊘"}.get(mr_status_actual, "?")
+        mr_status = f" | Multi-Resource: {mr_mark} {mr_status_actual}"
+    
     return (f"Kalman Convergence: {mark} {v} | mean error: {mape_s} ({trend}) "
-            f"| keys: {' '.join(kbits)} | velocity accuracy: {vel_s}")
+            f"| keys: {' '.join(kbits)} | velocity accuracy: {vel_s}{mr_status}")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -502,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="dump stored prediction samples and exit")
     p.add_argument("--pool", action="store_true",
                    help="check pool Kalman convergence health instead of burn-rate")
+    p.add_argument("--multi-resource", action="store_true",
+                   help="check multi-resource Kalman health instead of burn-rate")
     args = p.parse_args(argv)
 
     if args.samples:
@@ -591,6 +728,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if verdict in ("healthy", "stable", "converging") else 1
 
         print(json.dumps(report, indent=2, default=str))
+        return 0
+
+    if args.multi_resource:
+        """Check multi-resource Kalman health."""
+        health_report = check_multi_resource_health()
+        
+        if args.short:
+            status = health_report.get("status", "?")
+            mark = {"healthy": "✓", "degraded": "!", "unhealthy": "✗", 
+                   "error": "⚠", "unavailable": "⊘"}.get(status, "?")
+            health_score = health_report.get("overall_health_score", 0)
+            print(f"Multi-Resource Kalman: {mark} {status} | health score: {health_score:.0f}/100")
+            return 0 if status in ("healthy", "degraded") else 1
+        
+        print(json.dumps(health_report, indent=2, default=str))
         return 0
 
     report = build_report()

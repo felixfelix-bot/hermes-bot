@@ -79,6 +79,19 @@ fi
 
 echo "[$(ts)] nightly sweep done (rc=$rc)"
 
+# --- 3b. db health check (integrity + auto-recovery) ---------------------
+if [ -f "$BOT/db_health_check.py" ]; then
+  echo "[$(ts)] running db health check..."
+  if "$PY" "$BOT/db_health_check.py" 2>&1; then
+    echo "[$(ts)] db health check OK"
+  else
+    echo "[$(ts)] WARN: db health check reported issues"
+    rc=1
+  fi
+else
+  echo "[$(ts)] SKIP db health check (db_health_check.py absent)"
+fi
+
 # --- 4. git commit state changes (version tracking) ---------------------
 STATE_REPO="$HOME_DIR/hermes-orchestration"
 if [ -d "$STATE_REPO/.git" ]; then

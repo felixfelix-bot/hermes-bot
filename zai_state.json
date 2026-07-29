@@ -1,30 +1,30 @@
 {
-  "ts": 1783412020,
+  "ts": 1785313835,
   "ok": true,
   "session_pct": 0,
-  "token_pct": 100,
-  "throttle": true,
-  "critical": true,
+  "token_pct": 0,
+  "throttle": false,
+  "critical": false,
   "quota_pause": false,
-  "ours_available": false,
-  "friend_token_pct": 73,
+  "ours_available": true,
+  "friend_token_pct": 0,
   "friend_pause": false,
   "friend_available": true,
-  "session_reset_ms": 1784467162994,
-  "token_reset_ms": 1783689562993,
-  "friend_reset_ms": 1783415452457,
+  "session_reset_ms": null,
+  "token_reset_ms": null,
+  "friend_reset_ms": null,
   "predictions": {
     "ours": {
-      "will_exhaust": true,
-      "projected_pct": 184.8,
-      "hours_until_reset": 77.1,
-      "burn_rate_pct_per_hour": 1.1
+      "will_exhaust": false,
+      "projected_pct": 0.0,
+      "hours_until_reset": 0.0,
+      "burn_rate_pct_per_hour": 0.0
     },
     "friend": {
       "will_exhaust": false,
-      "projected_pct": 90.2,
-      "hours_until_reset": 0.95,
-      "burn_rate_pct_per_hour": 18.0
+      "projected_pct": 0.0,
+      "hours_until_reset": 0.0,
+      "burn_rate_pct_per_hour": 0.0
     }
   }
 }

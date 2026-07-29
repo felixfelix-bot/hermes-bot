@@ -26,6 +26,15 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
+# Import the multi-resource predictor (available if the module exists)
+try:
+    from multi_resource_kalman import MultiResourceKalmanPredictor, get_resource_history
+    _HAS_MULTI_RESOURCE = True
+except ImportError:
+    _HAS_MULTI_RESOURCE = False
+    MultiResourceKalmanPredictor = None
+    get_resource_history = None
+
 DB_PATH = "~/.hermes/bot/zai_usage.db"
 QUOTA_URL = "http://localhost:9099/quota"
 MIN_DATA_POINTS = 5   # Kalman converges faster than EWMA — lowered from 10
@@ -360,6 +369,129 @@ def predict_all() -> dict:
     }
 
 
+# ── Multi-Resource Prediction API ──────────────────────────────────────────────
+
+def predict_resource_exhaustion(minutes_ahead: int = 30) -> dict:
+    """Predict system resource exhaustion using the multi-resource Kalman filter.
+    
+    Args:
+        minutes_ahead: Minutes to predict ahead (default: 30)
+        
+    Returns:
+        Dict with resource predictions and warnings
+    """
+    if not _HAS_MULTI_RESOURCE or not _HAS_NUMPY:
+        return {
+            "error": "Multi-resource prediction not available",
+            "reason": "numpy or multi_resource_kalman module missing"
+        }
+    
+    try:
+        # Get recent resource history (limited to 2 hours to avoid OOM)
+        history = get_resource_history(hours=2)
+        if not history:
+            return {
+                "error": "No resource history available",
+                "history_points": 0
+            }
+        
+        # Initialize the multi-resource predictor with conservative noise settings
+        predictor = MultiResourceKalmanPredictor(
+            process_noise=0.5,
+            measurement_noise={
+                'tokens': 100000,
+                'cpu_load': 1.0,
+                'memory_pct': 5.0,
+                'worker_count': 2.0
+            }
+        )
+        
+        # Train on available data (limit to avoid memory issues)
+        max_points = 24  # 2 hours * 12 points per hour (5-min intervals)
+        for point in history[:max_points]:
+            measurement = {
+                'tokens': point['tokens'],
+                'cpu_load': point['cpu_load'],
+                'memory_pct': point['memory_pct'],
+                'worker_count': point['worker_count']
+            }
+            predictor.update(measurement)
+        
+        # Get resource warnings for the specified time ahead
+        warnings = predictor.get_resource_warnings(minutes_ahead=minutes_ahead)
+        
+        # Get system health score
+        health = predictor.get_system_health_score()
+        
+        # Get current state
+        current_state = predictor.state_vector
+        
+        return {
+            "status": "success",
+            "minutes_ahead": minutes_ahead,
+            "history_points": len(history[:max_points]),
+            "current_state": {
+                "tokens": float(current_state[0]),
+                "cpu_load": float(current_state[1]), 
+                "memory_pct": float(current_state[2]),
+                "worker_count": int(current_state[3])
+            },
+            "resource_warnings": warnings,
+            "health_score": health,
+            "predictor_initialized": predictor.is_initialized,
+            "update_count": predictor._update_count
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Multi-resource prediction failed: {str(e)}",
+            "traceback": str(type(e).__name__)
+        }
+
+
+def get_system_resource_summary() -> dict:
+    """Get a quick summary of current system resource status.
+    
+    Returns:
+        Dict with current resource levels and simple status
+    """
+    if not _HAS_MULTI_RESOURCE:
+        return {
+            "error": "Multi-resource monitoring not available",
+            "status": "legacy_only"
+        }
+    
+    try:
+        # Get very recent history (last 30 minutes)
+        recent_history = get_resource_history(hours=0.5)
+        if not recent_history:
+            return {
+                "status": "no_data",
+                "message": "No recent resource data available"
+            }
+        
+        # Use the most recent data point
+        latest = recent_history[-1]
+        
+        return {
+            "status": "ok",
+            "timestamp": latest['timestamp'],
+            "resources": {
+                "tokens_per_hour": latest['tokens'],
+                "cpu_load": latest['cpu_load'],
+                "memory_pct": latest['memory_pct'],
+                "worker_count": latest['worker_count']
+            },
+            "data_points": len(recent_history)
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Failed to get resource summary: {str(e)}",
+            "status": "error"
+        }
+
+
 # ── Unified routing decision function (matrix-driven) ───────────────────────
 
 _MATRIX_CACHE: dict | None = None
@@ -385,7 +517,7 @@ def _load_matrix() -> dict:
 
 def _is_peak_hour(cost_model: dict) -> bool:
     """Check if current hour is a peak hour."""
-    peak_hours = cost_model.get("peak_hours_utc", [6, 7, 8, 9])
+    peak_hours = cost_model.get("peak_hours_utc", [6, 7, 8, 9, 10])
     return datetime.now(timezone.utc).hour in peak_hours
 
 
@@ -415,6 +547,36 @@ def route_request(estimated_tokens: int = 0,
     is_peak = _is_peak_hour(cost_model)
     cost_key = "cost_per_1m_peak" if is_peak else "cost_per_1m_offpeak"
     peak_note = "PEAK" if is_peak else "off-peak"
+
+    # Check system resource health if multi-resource monitoring is available
+    resource_health_ok = True
+    resource_penalty = 0.0
+    resource_note = ""
+    
+    if _HAS_MULTI_RESOURCE and _HAS_NUMPY:
+        try:
+            resource_summary = get_system_resource_summary()
+            if resource_summary.get("status") == "ok":
+                resources = resource_summary.get("resources", {})
+                cpu_load = resources.get("cpu_load", 0)
+                memory_pct = resources.get("memory_pct", 0)
+                worker_count = resources.get("worker_count", 0)
+                
+                # Check if system resources are under stress
+                if cpu_load > 6.0:  # High CPU load
+                    resource_health_ok = False
+                    resource_penalty = min(50, (cpu_load - 6.0) * 10)
+                    resource_note = f" (CPU load {cpu_load:.1f} > 6.0)"
+                elif memory_pct > 80.0:  # High memory usage
+                    resource_health_ok = False  
+                    resource_penalty = min(50, (memory_pct - 80.0) * 2)
+                    resource_note = f" (Memory {memory_pct:.1f}% > 80%)"
+                elif worker_count > 35:  # High worker count
+                    resource_penalty = min(30, (worker_count - 35) * 2)
+                    resource_note = f" (Workers {worker_count} > 35)"
+        except Exception:
+            # If resource check fails, proceed with normal routing
+            pass
 
     # Get Kalman predictions for both keys
     preds = predict_all()
@@ -473,6 +635,10 @@ def route_request(estimated_tokens: int = 0,
                 if overage > 0:
                     penalty += overage / 100  # 10pp over = 10% extra penalty
 
+            # Add resource penalty if system is under stress
+            if resource_penalty > 0 and not resource_health_ok:
+                penalty += resource_penalty / 100
+
             effective_cost = base_cost * penalty
 
             candidates.append({
@@ -490,7 +656,7 @@ def route_request(estimated_tokens: int = 0,
         return {
             "tier": "ollama", "key": "local", "model": "qwen2.5-coder:3b",
             "base_url": "http://localhost:11434/v1",
-            "reason": "All providers exhausted - Ollama last resort",
+            "reason": f"All providers exhausted - Ollama last resort{resource_note}",
             "cost_estimate_usd": 0.0,
         }
 
@@ -506,16 +672,22 @@ def route_request(estimated_tokens: int = 0,
     elif best["key"] == "friend":
         over_note = f" (+21% penalty, {friend_over:+.1f}pp)" if abs(friend_over) > 1 else " (+21% penalty)"
 
+    # Add resource note to reason if applicable
+    reason_base = f"{best['model']} via {best['key_id']} - ${best['effective_cost']}/1M ({peak_note}){over_note}"
+    if resource_note:
+        reason_base += resource_note
+
     return {
         "tier": best["tier"],
         "key": best["key"],
         "model": best["model"],
         "base_url": best["base_url"],
-        "reason": f"{best['model']} via {best['key_id']} - ${best['effective_cost']}/1M ({peak_note}){over_note}",
+        "reason": reason_base,
         "cost_estimate_usd": round(cost_usd, 5),
         "effective_cost_per_1m": best["effective_cost"],
         "quality_score": best["quality"],
         "is_peak_hour": is_peak,
+        "resource_healthy": resource_health_ok,
     }
 
 

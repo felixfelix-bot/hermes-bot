@@ -1,50 +1,36 @@
 {
   "ours": {
-    "max_pct": 100,
+    "max_pct": 0,
     "windows": [
       {
-        "name": "5-hour",
+        "name": "unknown",
         "type": "TOKENS_LIMIT",
         "used_pct": 0,
         "resets_at": 0,
-        "window_hours": 5
-      },
-      {
-        "name": "weekly",
-        "type": "TOKENS_LIMIT",
-        "used_pct": 100,
-        "resets_at": 1783689562,
-        "window_hours": 168
-      },
-      {
-        "name": "monthly",
-        "type": "TIME_LIMIT",
-        "used_pct": 0,
-        "resets_at": 1784467162,
-        "window_hours": 720
+        "window_hours": 0
       }
     ],
-    "age_s": 1
+    "age_s": 0
   },
   "friend": {
-    "max_pct": 73,
+    "max_pct": 41,
     "windows": [
       {
         "name": "monthly",
         "type": "TIME_LIMIT",
-        "used_pct": 16,
-        "resets_at": 1784377092,
+        "used_pct": 1,
+        "resets_at": 1787055492,
         "window_hours": 720
       },
       {
         "name": "5-hour",
         "type": "TOKENS_LIMIT",
-        "used_pct": 73,
-        "resets_at": 1783415452,
+        "used_pct": 41,
+        "resets_at": 1785319048,
         "window_hours": 5
       }
     ],
     "age_s": 0
   },
-  "active": "friend"
+  "active": "ours"
 }

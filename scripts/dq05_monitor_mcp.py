@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-ContextVM MCP Server — exposes DQ05's resource-monitor API as MCP tools.
+DQ05 System Monitor MCP Server — exposes DQ05's resource-monitor API as MCP tools.
+
+This is NOT the ContextVM protocol. This is a local system health monitor for
+the DQ05 machine. Named dq05_monitor_* to avoid confusion with the ContextVM
+(Decentralized MCP-over-Nostr) protocol. See the 'contextvm' skill for that.
 
 Auto-detects DQ05 on the local network (192.168.1.218) first, then falls
 back to Netbird WireGuard (100.90.22.201). Caches the discovered host.
 
 Tools exposed:
-  contextvm_detect     — detect which IP DQ05 is reachable on
-  contextvm_health     — full combined report (quota + system + kalman)
-  contextvm_quota      — z.ai quota windows for both API keys
-  contextvm_system     — DQ05 local system stats (CPU, mem, disk, swap)
-  contextvm_kalman     — Kalman convergence backtest report
-  contextvm_remote     — remote (T470) system stats as seen from DQ05
+  dq05_detect     — detect which IP DQ05 is reachable on
+  dq05_health     — full combined report (quota + system + kalman)
+  dq05_quota      — z.ai quota windows for both API keys
+  dq05_system     — DQ05 local system stats (CPU, mem, disk, swap)
+  dq05_kalman     — Kalman convergence backtest report
+  dq05_remote     — remote (T470) system stats as seen from DQ05
 
 Usage:
   Standalone: python3 contextvm_mcp.py --once contextvm_health
@@ -100,11 +104,11 @@ def _build_server():
     """Create the MCP server with all tools registered."""
     from mcp.server.fastmcp import FastMCP
 
-    server = FastMCP("contextvm")
+    server = FastMCP("dq05-monitor")
 
     @server.tool()
-    def contextvm_detect() -> str:
-        """Detect which IP/host DQ05 ContextVM is currently reachable on.
+    def dq05_detect() -> str:
+        """Detect which IP/host DQ05 is currently reachable on.
         Returns the active host (LAN or Netbird) or an error message."""
         host = discover_host()
         if host:
@@ -113,38 +117,38 @@ def _build_server():
         return json.dumps({"host": None, "reachable": False, "error": "DQ05 not reachable on LAN or Netbird"})
 
     @server.tool()
-    def contextvm_health() -> str:
-        """Get the full ContextVM health report: z.ai quota (both API keys),
+    def dq05_health() -> str:
+        """Get the full DQ05 health report: z.ai quota (both API keys),
         DQ05 local system stats, Kalman convergence, and remote T470 probe.
         This is the comprehensive view."""
         return json.dumps(_fetch("/health"))
 
     @server.tool()
-    def contextvm_quota() -> str:
+    def dq05_quota() -> str:
         """Get z.ai quota windows for both API keys (ours + friend).
         Shows used_pct, resets_at, hours_left for 5-hour, weekly, monthly windows."""
         return json.dumps(_fetch("/quota"))
 
     @server.tool()
-    def contextvm_system() -> str:
+    def dq05_system() -> str:
         """Get DQ05 local system stats: CPU load/percent, memory, swap, disk,
         and uptime."""
         return json.dumps(_fetch("/local"))
 
     @server.tool()
-    def contextvm_kalman() -> str:
+    def dq05_kalman() -> str:
         """Get the Kalman convergence backtest report for both API keys.
         Shows prediction error trends, velocity accuracy, coverage, and verdict."""
         return json.dumps(_fetch("/kalman"))
 
     @server.tool()
-    def contextvm_remote() -> str:
+    def dq05_remote() -> str:
         """Get remote (T470) system stats as probed from DQ05 via SSH.
         May be stale or unreachable depending on network state."""
         return json.dumps(_fetch("/remote"))
 
     @server.tool()
-    def contextvm_ppq() -> str:
+    def dq05_ppq() -> str:
         """Get PPQ (api.ppq.ai) account status: real credit balance,
         24h spend breakdown, query history stats, and per-key usage.
 
@@ -223,11 +227,11 @@ def _run_mcp():
 def _run_cli():
     """Run a single tool from the command line."""
     if len(sys.argv) < 2:
-        print("Usage: contextvm_mcp.py <tool_name>")
+        print("Usage: dq05_monitor_mcp.py <tool_name>")
         print("Tools: detect, health, quota, system, kalman, remote, ppq")
         sys.exit(1)
 
-    tool = sys.argv[1].removeprefix("contextvm_")
+    tool = sys.argv[1].removeprefix("dq05_").removeprefix("contextvm_")
 
     def _ppq_cli():
         """CLI handler for PPQ balance query."""

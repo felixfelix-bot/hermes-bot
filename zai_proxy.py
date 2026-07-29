@@ -695,6 +695,52 @@ except Exception:
     _shadow_logger = None
     _shadow_optimizer = None
 
+# ── Phase 2.2: Routing Advisor (optimizer-first, hot-swappable) ──────────────
+# Wraps the shadow optimizer + best_key() into the RoutingAdvisor decision
+# layer (src/routing_advisor.py). This is the half-step between shadow mode
+# (log only) and primary mode (replace best_key entirely): when the feature
+# flag is OFF, best_key() is used exactly as before — zero behaviour change.
+# When ON, the optimizer is consulted FIRST and best_key() is the fallback on
+# any failure. The advisor NEVER raises — every failure degrades to best_key().
+#
+# Hot-swap toggle (no restart needed — checked per request):
+#   touch ~/.hermes/bot/.optimizer_advisor_mode   → ENABLE
+#   rm    ~/.hermes/bot/.optimizer_advisor_mode   → DISABLE
+# The ROUTING_ADVISOR_ENABLED env var (1/true/yes/on) is honoured too.
+_routing_advisor = None
+_ADVISOR_FLAG = os.path.expanduser("~/.hermes/bot/.optimizer_advisor_mode")
+try:
+    if _shadow_optimizer is not None:
+        from src.routing_advisor import (
+            RoutingAdvisor as _RoutingAdvisorCls,
+            AdvisorDecision as _AdvisorDecision,
+        )
+
+        def _best_key_adapter():
+            """Adapt the production best_key() (returns str|None) to the
+            AdvisorDecision contract the advisor expects. Resolved at call
+            time so best_key() (defined later in this module) is in scope."""
+            _k = best_key()
+            _prov = ("ours" if _k == "ours"
+                     else "friend" if _k == "friend"
+                     else "fallback")
+            return _AdvisorDecision(provider=_prov, model="", key=_k,
+                                    source="best_key")
+
+        class _ProxyRoutingAdvisor(_RoutingAdvisorCls):
+            """RoutingAdvisor that ALSO honours the .optimizer_advisor_mode
+            file marker, so operators can hot-swap without touching env vars."""
+            def enabled(self):
+                if os.path.exists(_ADVISOR_FLAG):
+                    return True
+                return super().enabled()
+
+        _routing_advisor = _ProxyRoutingAdvisor(
+            _shadow_optimizer, _best_key_adapter,
+            env_var="ROUTING_ADVISOR_ENABLED")
+except Exception:
+    _routing_advisor = None
+
 def _shadow_live_label(chosen_key):
     """Map the proxy's key name ('ours'/'friend') into the optimizer's
     provider namespace ('zai_ours'/'zai_friend') so the agreement comparison
@@ -998,6 +1044,109 @@ def _log_key_decision(*, chosen_key, reason, ours_pct=0, friend_pct=0,
              ours_available, friend_available))
     except Exception:
         pass
+
+
+# ── P3.4 Fix 2: routing_live_decisions table ────────────────────────────────
+# Same schema as routing_shadow_decisions (so the two strategies can be
+# compared in one query) PLUS a ``pace_mults`` column (JSON text) capturing
+# the per-provider pace multipliers LiveRouter actually used. Mirrors the
+# inline CREATE-TABLE-then-INSERT pattern of _log_rate_limit / _log_key_decision.
+_ROUTING_LIVE_DECISIONS_SQL = """\
+CREATE TABLE IF NOT EXISTS routing_live_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    live_provider TEXT,
+    live_model TEXT,
+    shadow_provider TEXT,
+    shadow_model TEXT,
+    shadow_cost REAL,
+    live_cost REAL,
+    tokens INTEGER,
+    agree INTEGER,
+    reason TEXT,
+    pace_mults TEXT
+);
+"""
+
+
+def _log_live_decision(*, provider, model=None, fallback=None,
+                       fallback_model=None, reason="", pace_mults=None):
+    """Log one LIVE LiveRouter failover decision to ``routing_live_decisions``.
+
+    Column mapping (deliberate reuse of the shadow schema for direct
+    comparison): ``live_provider``/``live_model`` = the provider LiveRouter
+    chose and we routed to; ``shadow_provider``/``shadow_model`` = the
+    fallback LiveRouter considered (second-cheapest viable); ``pace_mults``
+    = JSON of the per-provider pace multipliers used (Fix 2).
+
+    ``pace_mults`` may be a dict (JSON-encoded) or an already-serialised
+    string. Never raises — logging must not break the hot failover path.
+    """
+    try:
+        db = _usage_db()
+        db.execute(_ROUTING_LIVE_DECISIONS_SQL)
+        if pace_mults is None:
+            pace_json = None
+        elif isinstance(pace_mults, str):
+            pace_json = pace_mults
+        else:
+            pace_json = json.dumps(pace_mults, default=str)
+        db.execute(
+            "INSERT INTO routing_live_decisions "
+            "(ts, live_provider, live_model, shadow_provider, shadow_model, "
+            " shadow_cost, live_cost, tokens, agree, reason, pace_mults) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), provider, model, fallback, fallback_model,
+             None, None, 0, 1, reason if reason is not None else "", pace_json))
+    except Exception:
+        pass
+
+
+def _consult_live_router():
+    """Consult LiveRouter for a failover pick. Returns
+    ``(provider, model, fallback, fallback_model)`` or ``(None, None, None,
+    None)`` when disabled / unavailable / no viable pick. Never raises — any
+    failure yields all-None so the caller falls through to the hardcoded
+    ollama->external failover chain.
+
+    This is the single shared entry point used by BOTH the best_key() Phase 5
+    gate AND the request-handler retry-loop terminal fallback (P3.4 Fix 1).
+    Centralising it here fixes the latent tuple-unpack bug (the old gate did
+    ``_provider, _fallback = select_failover(...)`` then used ``_provider`` —
+    a ``(provider, model)`` tuple — as the provider string, so the pick was
+    never routable) and ensures the retry-loop bypass path actually engages
+    LiveRouter under real dual-key-exhaustion.
+
+    Kill switch: ``_LIVE_ROUTING_FLAG`` (``.enable_live_routing``) must exist.
+    Side effect: logs the decision to ``routing_live_decisions`` (Fix 2).
+    """
+    if _LIVE_ROUTER is None or not os.path.exists(_LIVE_ROUTING_FLAG):
+        return (None, None, None, None)
+    try:
+        _pw = None
+        with lock:
+            _pw = dict(_pace_windows) if _pace_windows else None
+        (pick, pick_model), (fb, fb_model) = _LIVE_ROUTER.select_failover(
+            quota_state=_snapshot_quota(),
+            health_state=_snapshot_health(),
+            peak=_is_peak_hour(),
+            pace_windows=_pw,
+        )
+        if not pick:
+            return (None, None, None, None)
+        # Capture the ACTUAL pace multipliers LiveRouter used (single source
+        # of truth — computed inside select_failover under its lock).
+        try:
+            pace_mults = _LIVE_ROUTER.last_pace_mults
+        except Exception:
+            pace_mults = None
+        _log_live_decision(provider=pick, model=pick_model,
+                           fallback=fb, fallback_model=fb_model,
+                           reason=f"live_kalman_failover_{pick}",
+                           pace_mults=pace_mults)
+        return (pick, pick_model, fb, fb_model)
+    except Exception:
+        return (None, None, None, None)
 
 
 def _log_rate_limit(*, key_used=None, attempt=0, duration_ms=None):
@@ -1649,29 +1798,27 @@ def best_key() -> str:
     # ~/.hermes/bot/.enable_live_routing must exist.  Every call wrapped
     # in try/except — on any failure, falls through to None and the
     # hardcoded ollama → ppq → openrouter chain in _proxy() runs.
-    if chosen is None and _LIVE_ROUTER is not None and \
-            os.path.exists(_LIVE_ROUTING_FLAG):
-        try:
-            # Pass pace windows computed by _refresh_loop() — used by
-            # the optimizer's pace_factor_multi for predictive pricing.
-            _pw = None
-            with lock:
-                _pw = dict(_pace_windows) if _pace_windows else None
-            _provider, _fallback = _LIVE_ROUTER.select_failover(
-                quota_state=_snapshot_quota(),
-                health_state=_snapshot_health(),
-                peak=_is_peak_hour(),
-                pace_windows=_pw,
-            )
-            if _provider:
-                chosen = _provider
-                reason = f"live_kalman_failover_{_provider}"
-                _log_key_decision(chosen_key=chosen, reason=reason,
-                                  ours_pct=op, friend_pct=fp,
-                                  ours_available=oa, friend_available=fa)
-                return chosen
-        except Exception:
-            pass  # fall through to hardcoded failover
+    # Phase 5 — LIVE ROUTER FAILOVER (Phase 1.2) ─────────────────────────
+    # Fires when best_key()'s INITIAL health check already sees both z.ai
+    # keys exhausted (chosen is None). Asks LiveRouter for the cheapest
+    # viable external provider via Kalman-converged pricing. Kill switch
+    # (.enable_live_routing) + safe fallthrough live inside _consult_live_router.
+    #
+    # NOTE: this is the LESS common path. In production best_key() usually
+    # returns a key whose health cache lags the real 429; that key 429s
+    # mid-request and the request-handler retry loop exhausts both keys
+    # DURING the loop. That retry-loop terminal fallback now also calls
+    # _consult_live_router() (P3.4 Fix 1) — previously it bypassed
+    # LiveRouter entirely (841 dual-exhaustion events/2h, 0 live events).
+    if chosen is None:
+        _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+        if _pick:
+            chosen = _pick
+            reason = f"live_kalman_failover_{_pick}"
+            _log_key_decision(chosen_key=chosen, reason=reason,
+                              ours_pct=op, friend_pct=fp,
+                              ours_available=oa, friend_available=fa)
+            return chosen
 
     _log_key_decision(chosen_key=chosen, reason=reason, ours_pct=op,
                       friend_pct=fp, ours_available=oa, friend_available=fa)
@@ -1805,12 +1952,21 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def _try_external_failover(self, body: bytes, model: str | None,
-                                response_buffer: bytearray, t0: float) -> bool:
+                                response_buffer: bytearray, t0: float,
+                                preferred: str | None = None) -> bool:
         """Try forwarding to the cheapest funded external provider when z.ai fails.
 
         Dynamically selects the provider with the lowest cost that still has
         credits remaining. On 402 (out of credits), marks that provider
         unfunded for 1 hour and tries the next cheapest.
+
+        Args:
+            preferred: Optional provider name (e.g. LiveRouter's pick) to try
+                FIRST, ahead of the cost-sorted order. If it is funded + keyed
+                it is attempted before the rest; on failure the remaining
+                candidates are tried cheapest-first as normal. Honours the
+                LiveRouter pick (P3.4 Fix 1) without weakening the safe
+                cost-ordered fallback.
 
         Returns True on success (response already sent),
         False on failure (caller should send error response).
@@ -1835,6 +1991,15 @@ class Handler(BaseHTTPRequestHandler):
 
         # Sort cheapest first; ties broken by _PROVIDER_PRIORITY (lower = tried first)
         candidates.sort(key=lambda c: (c[0], _PROVIDER_PRIORITY.get(c[1], 99)))
+
+        # Honour a LiveRouter-chosen provider (P3.4 Fix 1): if `preferred` is
+        # funded + keyed, move it to the front so it is tried FIRST; the rest
+        # keep their cost order as the safe fallback. No-op when preferred is
+        # absent, unknown, or not a viable candidate.
+        if preferred:
+            pref = [c for c in candidates if c[1] == preferred]
+            if pref:
+                candidates = pref + [c for c in candidates if c[1] != preferred]
 
         if not candidates:
             return False
@@ -1965,25 +2130,79 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f'{{"error":"ollama cloud failed for ollama-only model {original_model}"}}'.encode())
             return
 
-        # Step 1d: Peak-hour routing — during z.ai peak (UTC 6-10), prefer
-        # Ollama Cloud FIRST (z.ai burns 3x quota during peak, Ollama has no peak)
+        # Step 1d + Step 2 — choose a routing key.
+        #
+        # ADVISOR MODE (Phase 2.2, hot-swappable): when the feature flag is ON
+        # (touch ~/.hermes/bot/.optimizer_advisor_mode  OR
+        #  ROUTING_ADVISOR_ENABLED=1) the price-first RoutingOptimizer is
+        # consulted FIRST; best_key() is the fallback on any failure. Peak-hour
+        # pricing is now the optimizer's job — during z.ai peak (UTC 6-10) it
+        # charges z.ai 3x, making ollama_cloud cheaper, so it routes there
+        # automatically. best_key() is NEVER removed — it is the fallback on
+        # ANY optimizer exception or "no viable provider" result.
+        #
+        # Flag OFF → behaviour is UNCHANGED: the original peak-hour Ollama
+        # pre-check + best_key() cascade runs exactly as before.
+        # `peak` is computed once here so downstream (failover chain, logging)
+        # always sees a defined value regardless of which branch ran.
         peak = _is_peak_hour()
-        if peak and OLLAMA_CLOUD_KEY:
-            response_buffer = bytearray()
-            if self._try_ollama_cloud(body, original_model, response_buffer, t0):
-                return
-
-        # Step 2: Choose key (logs the key decision)
-        chosen = best_key()
+        if _routing_advisor is not None and _routing_advisor.enabled():
+            chosen = None
+            try:
+                _adv = _routing_advisor.decide(
+                    difficulty="medium", estimated_tokens=0)
+                # Optimizer may route directly to ollama_cloud (self-hosted,
+                # bypasses z.ai). If it does and ollama fails, fall through to
+                # best_key() (chosen stays None → failover chain below).
+                if _adv.routed_directly_to_ollama and OLLAMA_CLOUD_KEY:
+                    response_buffer = bytearray()
+                    if self._try_ollama_cloud(
+                            body, original_model, response_buffer, t0):
+                        return
+                chosen = _adv.key
+                _log_key_decision(
+                    chosen_key=chosen or "",
+                    reason=("optimizer_advisor:"
+                            + (_adv.reason or "price_optimal"))[:120])
+            except Exception:
+                pass  # advisor must never break routing
+            if chosen is None:
+                chosen = best_key()
+        else:
+            # ORIGINAL CASCADE — flag off or advisor module unavailable.
+            # Step 1d: Peak-hour routing — consult LiveRouter first (P3.4-fix),
+            # then fall through to peak-hour Ollama pre-check.
+            if peak:
+                _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+                if _pick:
+                    _log_key_decision(
+                        chosen_key=_pick,
+                        reason=f"live_kalman_failover_{_pick}")
+                    response_buffer = bytearray()
+                    if _pick == "ollama_cloud" and OLLAMA_CLOUD_KEY:
+                        if self._try_ollama_cloud(
+                                body, original_model, response_buffer, t0):
+                            return
+                    elif _pick in EXTERNAL_PROVIDERS or _pick == "deepinfra":
+                        if self._try_external_failover(body, original_model,
+                                                       response_buffer, t0,
+                                                       preferred=_pick):
+                            return
+                    # LiveRouter pick failed — fall through
+            # Peak-hour Ollama pre-check (fallback if LiveRouter disabled/no pick)
+            if peak and OLLAMA_CLOUD_KEY:
+                response_buffer = bytearray()
+                if self._try_ollama_cloud(
+                        body, original_model, response_buffer, t0):
+                    return
+            # Step 2: Choose key.
+            chosen = best_key()
 
         # Shadow mode (Phase 2.1, ADR-014): record what the price-first
-        # optimizer WOULD have chosen, alongside the live best_key() pick.
-        # READ-ONLY — never changes `chosen` or any routing state. Runs
-        # synchronously (<1ms: persistent conn + prepared INSERT per the
-        # ShadowLogger contract); any failure is swallowed so production is
-        # unaffected. Only logged when a real z.ai key was chosen (skips the
-        # both-exhausted fall-through to Ollama/PPQ, where there is no live
-        # best_key decision to compare against).
+        # optimizer WOULD have chosen, alongside the live pick. READ-ONLY —
+        # never changes `chosen`. In advisor mode the live pick already came
+        # from the optimizer, so this logs the agreement (useful monitoring);
+        # any failure is swallowed so production is unaffected.
         if _shadow_logger and _shadow_optimizer and chosen:
             try:
                 _sd = _shadow_optimizer.route(difficulty="medium", estimated_tokens=0)
@@ -2002,8 +2221,25 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # Shadow mode never blocks production
 
-        # If both z.ai keys exhausted, try Ollama Cloud then PPQ
+        # If both z.ai keys exhausted, consult LiveRouter first (P3.4-fix),
+        # then fall through to Ollama Cloud / PPQ hardcoded chain.
         if chosen is None:
+            # LiveRouter consultation (kill switch checked inside)
+            _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+            if _pick:
+                _log_key_decision(
+                    chosen_key=_pick,
+                    reason=f"live_kalman_failover_{_pick}")
+                response_buffer = bytearray()
+                if _pick == "ollama_cloud" and OLLAMA_CLOUD_KEY:
+                    if self._try_ollama_cloud(body, original_model, response_buffer, t0):
+                        return
+                elif _pick in EXTERNAL_PROVIDERS or _pick == "deepinfra":
+                    if self._try_external_failover(body, original_model,
+                                                   response_buffer, t0,
+                                                   preferred=_pick):
+                        return
+                # LiveRouter pick failed — fall through to hardcoded chain
             response_buffer = bytearray()
             if OLLAMA_CLOUD_KEY and self._try_ollama_cloud(body, original_model, response_buffer, t0):
                 return
@@ -2241,6 +2477,32 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(msg)
                     return
+
+            # Phase 1.2 LIVE ROUTER — retry-loop terminal fallback (P3.4 Fix 1).
+            # When BOTH z.ai keys 429-exhaust DURING the retry loop, best_key()'s
+            # initial pick already returned a key (its health cache lagged the
+            # real 429), so the Phase 5 gate inside best_key() never fired. This
+            # is the production path that previously bypassed LiveRouter (841
+            # dual-exhaustion events/2h, 0 live events). Consult LiveRouter HERE
+            # and route its pick before the hardcoded ollama->external chain.
+            # Kill switch + safe fallthrough live inside _consult_live_router;
+            # on any failure / no pick we fall through to the chain below.
+            _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+            if _pick:
+                _log_key_decision(
+                    chosen_key=_pick,
+                    reason=f"live_kalman_failover_{_pick}")
+                response_buffer = bytearray()
+                if _pick == "ollama_cloud" and OLLAMA_CLOUD_KEY:
+                    if self._try_ollama_cloud(body, model, response_buffer, t0):
+                        return
+                elif _pick in EXTERNAL_PROVIDERS:
+                    if self._try_external_failover(body, model,
+                                                   response_buffer, t0,
+                                                   preferred=_pick):
+                        return
+                # LiveRouter pick failed (or was a z.ai key) — fall through to
+                # the hardcoded chain below (safe fallback, criterion 4).
 
             # All z.ai keys exhausted — try Ollama Cloud (primary, not failover)
             if not peak and OLLAMA_CLOUD_KEY:

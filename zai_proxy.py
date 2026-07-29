@@ -2714,6 +2714,156 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path.startswith("/v1/dispatch_gate"):
+            # Dispatch gate — should this job run now?
+            # Pure in-memory decision (no SQLite reads): combines quota snapshot,
+            # Kalman burn-rate predictions, peak-hour cost multiplier, and a
+            # task-type → model downgrade chain.
+            self.close_connection = True
+            from urllib.parse import urlparse, parse_qs
+            from datetime import datetime, timezone
+            try:
+                qs = parse_qs(urlparse(self.path).query)
+                estimated_tokens = int(qs.get("estimated_tokens", ["0"])[0])
+                task_type = qs.get("task_type", ["coding"])[0]
+                urgency = qs.get("urgency", ["standard"])[0]
+
+                # Task type → model tier mapping (hardcoded per design spec)
+                TASK_MODELS = {
+                    "coding":    {"high": "glm-5.2",       "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "reasoning": {"high": "glm-4.5",       "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "chat":      {"high": "glm-4.5-air",   "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "simple":    {"high": "glm-4.5-flash", "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
+                }
+                if task_type not in TASK_MODELS:
+                    task_type = "coding"
+
+                peak = _is_peak_hour()
+                peak_mult = 3.0 if peak else 1.0
+                quota_snap = _snapshot_quota()
+                health_snap = _snapshot_health()
+
+                # 1. Gather healthy candidates with enough remaining quota
+                candidates = []
+                for key in ("ours", "friend"):
+                    if not health_snap.get(key):
+                        continue
+                    q = quota_snap.get(key, {})
+                    remaining = q.get("remaining", 0)
+                    if remaining >= estimated_tokens:
+                        base = (_converged_rates or {}).get(key, 0.001)
+                        eff = base * _KEY_COST_MULTIPLIER.get(key, 1.0) * peak_mult
+                        candidates.append({
+                            "provider": key,
+                            "price_per_m": eff,
+                            "remaining": remaining,
+                            "used_pct": q.get("used_pct", 0.0),
+                        })
+                # Ollama Cloud — flat rate, treated as always having enough quota
+                if health_snap.get("ollama_cloud") and OLLAMA_CLOUD_KEY:
+                    base = (_converged_rates or {}).get("ollama_cloud", 0.024)
+                    eff = base * _KEY_COST_MULTIPLIER.get("ollama_cloud", 1.0) * peak_mult
+                    candidates.append({
+                        "provider": "ollama_cloud",
+                        "price_per_m": eff,
+                        "remaining": quota_snap.get("ollama_cloud", {}).get("remaining", 999999999),
+                        "used_pct": 0.0,
+                    })
+
+                # 2. Sort by effective price (cheapest first)
+                candidates.sort(key=lambda c: c["price_per_m"])
+
+                # 3. Temporal exhaustion prediction (in-memory Kalman cache)
+                hours_until = {}
+                for key in ("ours", "friend"):
+                    preds = _get_cached_predictions(key)
+                    exhaust = _will_exhaust(preds)
+                    hours_until[key] = (exhaust or {}).get("exhausts_in_hours", 999)
+
+                # 4. Defer suggestion (only for background urgency during peak)
+                defer = None
+                if peak and urgency == "background":
+                    defer = {
+                        "reason": "peak_hours_3x_cost",
+                        "wait_until_utc_hour": 11,
+                        "savings_factor": 3.0,
+                    }
+
+                # 5. Model downgrade chain
+                chain = []
+                for tier in ("high", "standard", "low"):
+                    model = TASK_MODELS[task_type][tier]
+                    viable = bool(candidates)
+                    provider = candidates[0]["provider"] if candidates else "none"
+                    chain.append({
+                        "model": model,
+                        "tier": tier,
+                        "provider": provider,
+                        "viable": viable,
+                    })
+
+                # 6. Quota state snapshot (thread-safe)
+                quota_state = {}
+                with lock:
+                    for key in ("ours", "friend"):
+                        wins = quota_cache.get(key, ([], 0.0))[0]
+                        pct = _max_pct(wins)
+                        lckd, _lwin, _lpct, _lthr = is_key_locked(key, wins)
+                        quota_state[key] = {
+                            "used_pct": pct,
+                            "remaining_tokens": int(max(0.0, 2_000_000 * (1.0 - pct / 100.0))),
+                            "locked": lckd,
+                        }
+
+                # 7. Peak timing
+                now_utc = datetime.now(timezone.utc)
+                peak_ends_in = None
+                if peak:
+                    peak_ends_in = max(0, 11 - now_utc.hour)
+
+                # 8. Build response
+                if candidates:
+                    best = candidates[0]
+                    info = {
+                        "can_dispatch": True,
+                        "reason": "quota_healthy_" + ("peak" if peak else "off_peak"),
+                        "recommended_provider": best["provider"],
+                        "recommended_model": TASK_MODELS[task_type]["high"],
+                        "effective_price_per_m": round(best["price_per_m"], 6),
+                        "estimated_cost_usd": round(best["price_per_m"] * estimated_tokens / 1e6, 6),
+                        "hours_until_exhaust": hours_until,
+                        "peak_active": peak,
+                        "peak_ends_in_hours": peak_ends_in,
+                        "defer_suggestion": defer,
+                        "downgrade_chain": chain,
+                        "quota_state": quota_state,
+                        "timestamp": int(time.time()),
+                    }
+                else:
+                    info = {
+                        "can_dispatch": False,
+                        "reason": "all_primary_keys_exhausted",
+                        "recommended_provider": None,
+                        "recommended_model": None,
+                        "effective_price_per_m": None,
+                        "estimated_cost_usd": None,
+                        "hours_until_exhaust": hours_until,
+                        "peak_active": peak,
+                        "peak_ends_in_hours": peak_ends_in,
+                        "defer_suggestion": defer,
+                        "downgrade_chain": chain,
+                        "quota_state": quota_state,
+                        "timestamp": int(time.time()),
+                    }
+            except Exception as e:
+                info = {"can_dispatch": False, "reason": "error: " + str(e)}
+            payload = json.dumps(info, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
         elif self.path == "/v1/models" or self.path == "/models":
             # Model listing — return stub so Hermes doesn't 404 → fall back to PPQ
             self.close_connection = True

@@ -63,6 +63,85 @@ except Exception as _e:
     _shadow_hook = None
     _converged_rates = None
 
+# ── Dispatch gate (P5.1) ─────────────────────────────────────────────────────
+# Pure three-dimension decision fn (hardware → quota-margin → price) extracted
+# into src/dispatch_gate.py so it is unit-testable.  Falls back to None on any
+# import error — the endpoint then degrades to a coarse candidate check.
+_evaluate_dispatch = None
+try:
+    from src.dispatch_gate import evaluate_dispatch as _evaluate_dispatch
+except Exception as _dge:
+    print(f"[dispatch_gate] DISABLED — {_dge}", flush=True)
+    _evaluate_dispatch = None
+
+def _probe_hardware(hardware_req: str) -> dict:
+    """Probe physical hardware state for the dispatch gate (Dimension 1).
+
+    Only runs when ``hardware_req != "none"``.  Fault-tolerant: missing files,
+    failed udevadm/ssh calls, and parse errors all degrade to safe defaults
+    (absent / unknown / unreachable).  Sources per IMPL-SPEC v2:
+      - board presence: ``ls /dev/ttyACM*``
+      - board identity: ``udevadm`` serial of the first ttyACM device
+      - lock status: ``~/.hermes/peripheral_locks/board-lock-monitor.json``
+      - DQ05 reachability: ``ssh -o ConnectTimeout=3 dq05 true``
+    """
+    import glob as _glob, subprocess as _sp
+    if hardware_req == "none":
+        return {"required": "none"}
+    state: dict = {}
+    if hardware_req in ("board", "dual_board"):
+        acm: list = []
+        try:
+            acm = sorted(_glob.glob("/dev/ttyACM*"))
+            state["board_present"] = len(acm) > 0
+            state["board_count"] = len(acm)
+        except Exception:
+            state["board_present"] = False
+            state["board_count"] = 0
+        # Board identity (udevadm serial of first device).
+        try:
+            if acm:
+                out = _sp.run(
+                    ["udevadm", "info", "-q", "property", "-n", acm[0]],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout
+                for _line in out.splitlines():
+                    if _line.startswith("ID_SERIAL_SHORT="):
+                        state["board_id"] = _line.split("=", 1)[1]
+                        break
+        except Exception:
+            pass
+        # Lock status from the board-lock monitor JSON.
+        try:
+            import json as _json
+            _lp = os.path.expanduser(
+                "~/.hermes/peripheral_locks/board-lock-monitor.json")
+            with open(_lp) as _f:
+                _lmon = _json.load(_f) or {}
+            _locks = _lmon.get("locks", []) or []
+            _board_locks = [l for l in _locks
+                            if str(l.get("resource", "")).startswith("board")]
+            _free = [l for l in _board_locks if l.get("status") == "free"]
+            _held = [l for l in _board_locks if l.get("status") == "locked"]
+            state["lock_status"] = (
+                "free" if _free else ("held" if _held else "unknown"))
+            state["queue_depth"] = len(_held)
+            state["estimated_wait_minutes"] = sum(
+                int(l.get("age_minutes", 0) or 0) for l in _held)
+        except Exception:
+            state.setdefault("lock_status", "unknown")
+    elif hardware_req == "dq05":
+        # Lightweight reachability probe — 3s connect timeout, no shell.
+        try:
+            _r = _sp.run(
+                ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                 "dq05", "true"],
+                capture_output=True, timeout=6)
+            state["dq05_reachable"] = (_r.returncode == 0)
+        except Exception:
+            state["dq05_reachable"] = False
+    return state
+
 # ── Token-audit fallback (Phase 2.5.4) ──────────────────────────────────────
 # If the src import above failed, define a never-raising stub so the request
 # path's audit call is still safe.  Real logic lives in src/token_audit.py.
@@ -2118,7 +2197,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Step 1c: Ollama-only models — route directly to Ollama Cloud
         # These models don't exist on z.ai, so skip z.ai entirely
-        _OLLAMA_ONLY_MODELS = {"kimi-k2.7-code", "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b"}
+        _OLLAMA_ONLY_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud", "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b"}
         if original_model in _OLLAMA_ONLY_MODELS and OLLAMA_CLOUD_KEY:
             response_buffer = bytearray()
             if self._try_ollama_cloud(body, original_model, response_buffer, t0):
@@ -2716,9 +2795,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
         elif self.path.startswith("/v1/dispatch_gate"):
             # Dispatch gate — should this job run now?
-            # Pure in-memory decision (no SQLite reads): combines quota snapshot,
-            # Kalman burn-rate predictions, peak-hour cost multiplier, and a
-            # task-type → model downgrade chain.
+            # Three-dimension Kalman-gated decision (no SQLite reads):
+            #   D1 hardware availability (binary) → D2 quota sufficiency
+            #   (hardware-scaled safety margin + flash downgrade) → D3 price
+            #   (scarcity override when hardware present).  See
+            #   IMPL-SPEC-kalman-dispatch-gate.md (v2) + src/dispatch_gate.py.
             self.close_connection = True
             from urllib.parse import urlparse, parse_qs
             from datetime import datetime, timezone
@@ -2727,29 +2808,29 @@ class Handler(BaseHTTPRequestHandler):
                 estimated_tokens = int(qs.get("estimated_tokens", ["0"])[0])
                 task_type = qs.get("task_type", ["coding"])[0]
                 urgency = qs.get("urgency", ["standard"])[0]
-
-                # Task type → model tier mapping (hardcoded per design spec)
-                TASK_MODELS = {
-                    "coding":    {"high": "glm-5.2",       "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
-                    "reasoning": {"high": "glm-4.5",       "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
-                    "chat":      {"high": "glm-4.5-air",   "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
-                    "simple":    {"high": "glm-4.5-flash", "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
-                }
-                if task_type not in TASK_MODELS:
-                    task_type = "coding"
+                hardware_req = qs.get("hardware_req", ["none"])[0]
+                task_subtype = qs.get("task_subtype", [None])[0]
 
                 peak = _is_peak_hour()
                 peak_mult = 3.0 if peak else 1.0
                 quota_snap = _snapshot_quota()
                 health_snap = _snapshot_health()
 
-                # 1. Gather healthy candidates with enough remaining quota
+                # 1. Gather primary candidates (ours/friend) for BOTH the gate
+                #    and the legacy recommended_provider / downgrade_chain fields.
                 candidates = []
+                gate_quota = {}
                 for key in ("ours", "friend"):
                     if not health_snap.get(key):
+                        gate_quota[key] = {"used_pct": 100.0, "remaining": 0.0, "healthy": False}
                         continue
                     q = quota_snap.get(key, {})
                     remaining = q.get("remaining", 0)
+                    gate_quota[key] = {
+                        "used_pct": q.get("used_pct", 0.0),
+                        "remaining": remaining,
+                        "healthy": True,
+                    }
                     if remaining >= estimated_tokens:
                         base = (_converged_rates or {}).get(key, 0.001)
                         eff = base * _KEY_COST_MULTIPLIER.get(key, 1.0) * peak_mult
@@ -2759,50 +2840,127 @@ class Handler(BaseHTTPRequestHandler):
                             "remaining": remaining,
                             "used_pct": q.get("used_pct", 0.0),
                         })
-                # Ollama Cloud — flat rate, treated as always having enough quota
+                # Ollama Cloud — flat rate, BYPASSES the quota margin gate (no
+                # exhaustion risk).  Tracked separately so it can act as a
+                # fallback when the primary-key gate holds.
+                flat_candidates = []
                 if health_snap.get("ollama_cloud") and OLLAMA_CLOUD_KEY:
                     base = (_converged_rates or {}).get("ollama_cloud", 0.024)
                     eff = base * _KEY_COST_MULTIPLIER.get("ollama_cloud", 1.0) * peak_mult
-                    candidates.append({
+                    flat_candidates.append({
                         "provider": "ollama_cloud",
                         "price_per_m": eff,
                         "remaining": quota_snap.get("ollama_cloud", {}).get("remaining", 999999999),
                         "used_pct": 0.0,
                     })
-
-                # 2. Sort by effective price (cheapest first)
                 candidates.sort(key=lambda c: c["price_per_m"])
+                flat_candidates.sort(key=lambda c: c["price_per_m"])
+                all_candidates = candidates + flat_candidates
 
-                # 3. Temporal exhaustion prediction (in-memory Kalman cache)
+                # 2. Cached burn-rate predictions (cache-only → never fetches).
+                burn_rate = {}
                 hours_until = {}
                 for key in ("ours", "friend"):
                     preds = _get_cached_predictions(key)
                     exhaust = _will_exhaust(preds)
+                    burn_rate[key] = (exhaust or {}).get("burn_rate_pct_per_hour", 0.0) or 0.0
                     hours_until[key] = (exhaust or {}).get("exhausts_in_hours", 999)
 
-                # 4. Defer suggestion (only for background urgency during peak)
-                defer = None
-                if peak and urgency == "background":
-                    defer = {
-                        "reason": "peak_hours_3x_cost",
-                        "wait_until_utc_hour": 11,
-                        "savings_factor": 3.0,
+                # 3. Hardware probe (Dimension 1) — only when hardware_req != none.
+                hw_state = _probe_hardware(hardware_req)
+
+                # 4. Run the three-dimension gate (src/dispatch_gate.py).
+                if _evaluate_dispatch is not None:
+                    gate = _evaluate_dispatch(
+                        estimated_tokens=estimated_tokens,
+                        task_type=task_type,
+                        hardware_req=hardware_req,
+                        task_subtype=task_subtype,
+                        quota=gate_quota,
+                        burn_rate_pct_per_hour=burn_rate,
+                        converged_rates=(_converged_rates or {"ours": 0.001, "friend": 0.001}),
+                        is_peak=peak,
+                        peak_mult=peak_mult,
+                        hardware_state=hw_state,
+                    )
+                else:
+                    # Module unavailable — coarse decision, but the HARDWARE
+                    # GATE (D1) must stay FAIL-CLOSED.  Without the real
+                    # module we cannot safely confirm a board/DQ05, so default
+                    # to *unavailable* unless the probed hw_state actually
+                    # confirms presence+free.  This mirrors
+                    # src/dispatch_gate._hardware_available so a board-required
+                    # task can never dispatch on ollama_cloud (flat-rate path
+                    # below also checks gate["hardware"]["available"]).
+                    _hws = hw_state or {}
+                    _lock_free = _hws.get("lock_status") == "free"
+                    _hw_avail = (
+                        hardware_req == "none"
+                        or (hardware_req == "board"
+                            and _hws.get("board_present") and _lock_free)
+                        or (hardware_req == "dual_board"
+                            and _hws.get("board_count", 0) >= 2 and _lock_free)
+                        or (hardware_req == "dq05"
+                            and _hws.get("dq05_reachable"))
+                    )
+                    gate = {
+                        "can_dispatch": bool(candidates) and _hw_avail,
+                        "reason": "dispatch_gate module unavailable; coarse check",
+                        "recommended_model": (candidates[0] and "glm-5.2") if candidates else None,
+                        "effective_price_per_m": round(candidates[0]["price_per_m"], 6) if candidates else None,
+                        "predicted_cost": None,
+                        "hours_until_exhaustion": {k: hours_until[k] for k in ("ours", "friend")},
+                        "quota_used_pct": {k: round(gate_quota[k]["used_pct"], 1) for k in ("ours", "friend")},
+                        "burn_rate_pct_per_hour": {k: round(burn_rate[k], 1) for k in ("ours", "friend")},
+                        "is_peak_hour": peak, "peak_multiplier": peak_mult,
+                        "scarcity_factor": 1.0, "downgraded": False,
+                        "scarcity_override": False,
+                        "hardware": {"required": hardware_req, "available": _hw_avail},
+                        "task_budget": estimated_tokens, "safety_margin": 2.0,
                     }
 
-                # 5. Model downgrade chain
+                # 5. Flat-rate fallback: gate held on QUOTA (primary keys tight)
+                #    but a flat-rate provider is available → dispatch anyway (no
+                #    quota risk).  Does NOT apply to hardware holds — a task that
+                #    needs a board/DQ05 cannot run on a flat-rate LLM provider.
+                recommended_provider = all_candidates[0]["provider"] if all_candidates else None
+                hw_avail = gate.get("hardware", {}).get("available", True)
+                if not gate["can_dispatch"] and flat_candidates and hw_avail:
+                    fc = flat_candidates[0]
+                    gate["can_dispatch"] = True
+                    gate["downgraded"] = True
+                    gate["recommended_model"] = "llama3.3-70b"
+                    gate["reason"] = ("primary keys tight (gate hold); dispatching "
+                                      "on flat-rate " + fc["provider"])
+                    gate["effective_price_per_m"] = round(fc["price_per_m"], 6)
+                    recommended_provider = fc["provider"]
+
+                # 6. Legacy fields (kept for backward compatibility — ADDITIVE).
+                # Urgency-tier model selection incl. the new spec task types.
+                TASK_MODELS = {
+                    "coding":     {"high": "glm-5.2",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "reasoning":  {"high": "glm-4.5",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "chat":       {"high": "glm-4.5-air",    "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "simple":     {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
+                    "mechanical": {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
+                    "research":   {"high": "glm-5.2",        "standard": "glm-5.2",        "low": "glm-4.5-flash"},
+                    "review":     {"high": "glm-5.2",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "docs":       {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
+                }
+                tt = task_type if task_type in TASK_MODELS else "coding"
                 chain = []
                 for tier in ("high", "standard", "low"):
-                    model = TASK_MODELS[task_type][tier]
-                    viable = bool(candidates)
-                    provider = candidates[0]["provider"] if candidates else "none"
-                    chain.append({
-                        "model": model,
-                        "tier": tier,
-                        "provider": provider,
-                        "viable": viable,
-                    })
+                    m = TASK_MODELS[tt][tier]
+                    viable = bool(all_candidates)
+                    provider = all_candidates[0]["provider"] if all_candidates else "none"
+                    chain.append({"model": m, "tier": tier, "provider": provider, "viable": viable})
 
-                # 6. Quota state snapshot (thread-safe)
+                # Defer suggestion (suppressed when scarcity override is active).
+                defer = None
+                if peak and urgency == "background" and not gate.get("scarcity_override"):
+                    defer = {"reason": "peak_hours_3x_cost", "wait_until_utc_hour": 11, "savings_factor": 3.0}
+
+                # Quota state snapshot (thread-safe).
                 quota_state = {}
                 with lock:
                     for key in ("ours", "friend"):
@@ -2815,46 +2973,26 @@ class Handler(BaseHTTPRequestHandler):
                             "locked": lckd,
                         }
 
-                # 7. Peak timing
+                # Peak timing.
                 now_utc = datetime.now(timezone.utc)
-                peak_ends_in = None
-                if peak:
-                    peak_ends_in = max(0, 11 - now_utc.hour)
+                peak_ends_in = max(0, 11 - now_utc.hour) if peak else None
 
-                # 8. Build response
-                if candidates:
-                    best = candidates[0]
-                    info = {
-                        "can_dispatch": True,
-                        "reason": "quota_healthy_" + ("peak" if peak else "off_peak"),
-                        "recommended_provider": best["provider"],
-                        "recommended_model": TASK_MODELS[task_type]["high"],
-                        "effective_price_per_m": round(best["price_per_m"], 6),
-                        "estimated_cost_usd": round(best["price_per_m"] * estimated_tokens / 1e6, 6),
-                        "hours_until_exhaust": hours_until,
-                        "peak_active": peak,
-                        "peak_ends_in_hours": peak_ends_in,
-                        "defer_suggestion": defer,
-                        "downgrade_chain": chain,
-                        "quota_state": quota_state,
-                        "timestamp": int(time.time()),
-                    }
-                else:
-                    info = {
-                        "can_dispatch": False,
-                        "reason": "all_primary_keys_exhausted",
-                        "recommended_provider": None,
-                        "recommended_model": None,
-                        "effective_price_per_m": None,
-                        "estimated_cost_usd": None,
-                        "hours_until_exhaust": hours_until,
-                        "peak_active": peak,
-                        "peak_ends_in_hours": peak_ends_in,
-                        "defer_suggestion": defer,
-                        "downgrade_chain": chain,
-                        "quota_state": quota_state,
-                        "timestamp": int(time.time()),
-                    }
+                # 7. Build response — gate fields (authoritative) + legacy fields.
+                est_cost = None
+                if gate.get("effective_price_per_m") is not None:
+                    est_cost = round(gate["effective_price_per_m"] * estimated_tokens / 1e6, 6)
+                info = dict(gate)
+                info.update({
+                    "recommended_provider": recommended_provider,
+                    "estimated_cost_usd": est_cost,
+                    "hours_until_exhaust": hours_until,
+                    "peak_active": peak,
+                    "peak_ends_in_hours": peak_ends_in,
+                    "defer_suggestion": defer,
+                    "downgrade_chain": chain,
+                    "quota_state": quota_state,
+                    "timestamp": int(time.time()),
+                })
             except Exception as e:
                 info = {"can_dispatch": False, "reason": "error: " + str(e)}
             payload = json.dumps(info, indent=2).encode()
@@ -2874,6 +3012,8 @@ class Handler(BaseHTTPRequestHandler):
                     {"id": "glm-5.2", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "glm-4.5-flash", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "glm-4.5-air", "object": "model", "created": now, "owned_by": "zai"},
+                    {"id": "kimi-k2.7-code", "object": "model", "created": now, "owned_by": "ollama"},
+                    {"id": "kimi-k3:cloud", "object": "model", "created": now, "owned_by": "ollama"},
                 ]
             }
             payload = json.dumps(models_data).encode()

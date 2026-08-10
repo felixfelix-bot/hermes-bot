@@ -29,3 +29,6 @@ venv/
 # Allow secret patterns file (for pre-commit hooks)
 >>>>>>> c36d894 (security: .gitignore excludes secrets + daily .env backup script)
 !.secret-patterns.txt
+zai_usage.db
+api_burn.db
+model_cache.db

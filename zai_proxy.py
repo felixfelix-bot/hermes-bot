@@ -74,6 +74,89 @@ except Exception as _dge:
     print(f"[dispatch_gate] DISABLED — {_dge}", flush=True)
     _evaluate_dispatch = None
 
+# ── Ollama Cloud quota tracker (EUv2-5) ──────────────────────────────────────
+# Real quota regime from cumulative token usage in zai_usage.db.
+# Falls back to "included" (no penalty) on any failure — never breaks routing.
+_ollama_quota_status = None
+try:
+    from src.ollama_quota_tracker import get_quota_status as _get_quota_status
+    from src.ollama_quota_tracker import DEFAULT_SESSION_LIMIT as _OC_SESSION_LIMIT
+except Exception as _oqe:
+    print(f"[ollama_quota] DISABLED — {_oqe}", flush=True)
+    _get_quota_status = None
+    _OC_SESSION_LIMIT = 500_000_000  # fallback default
+
+# ── Cost extraction (RP-2) ───────────────────────────────────────────────────
+# Parses the real $ cost from each provider's API response body. Falls back to
+# None (no per-call cost extraction) on any import error — the proxy's
+# _extract_cost wrapper then zeroes flat-rate providers and estimates ollama.
+_extract_cost_module = None
+try:
+    from src.cost_extraction import extract_cost as _ce_extract_cost
+    _extract_cost_module = _ce_extract_cost
+except Exception as _cee:
+    print(f"[cost_extraction] DISABLED — {_cee}", flush=True)
+    _extract_cost_module = None
+
+# ── Real price tracker (RP-4) ────────────────────────────────────────────────
+# Replaces ALL hardcoded rate constants with real measured rates from
+# real_price_tracker.get_rate_with_fallback(). The tracker resolves:
+#   1. Real measured cost_usd data from the DB
+#   2. Ollama billing API (for ollama_cloud)
+#   3. LAST_RESORT_RATES (clearly-marked estimates)
+# Every import failure degrades gracefully to the inline _FALLBACK_RATES below.
+_rpt_get_rate = None
+try:
+    from src.real_price_tracker import get_rate_with_fallback as _rpt_get_rate
+    print("[real_price_tracker] loaded — cost estimation uses measured rates", flush=True)
+except Exception as _rpte:
+    print(f"[real_price_tracker] DISABLED — {_rpte}", flush=True)
+    _rpt_get_rate = None
+
+# Kill switch: set OLLAMA_EXTRA_USAGE_ENABLED=false to disable regime-based pricing
+_OLLAMA_EXTRA_USAGE_ENABLED = os.environ.get("OLLAMA_EXTRA_USAGE_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# Cache the quota status to avoid DB queries on every snapshot call.
+# Updated by _snapshot_quota() at most every _OLLAMA_QUOTA_CACHE_TTL seconds.
+_ollama_quota_cache: dict | None = None
+_ollama_quota_cache_ts: float = 0.0
+_OLLAMA_QUOTA_CACHE_TTL = 30.0  # seconds
+
+def _get_ollama_quota_status() -> dict:
+    """Get cached or fresh ollama_cloud quota status. Thread-safe.
+
+    Returns a dict with: regime, session_used_pct, weekly_used_pct,
+    session_tokens, weekly_tokens. Falls back to an 'included' default
+    on any error so routing is never broken.
+    """
+    global _ollama_quota_cache, _ollama_quota_cache_ts
+    if _get_quota_status is None or not _OLLAMA_EXTRA_USAGE_ENABLED:
+        return {
+            "regime": "included",
+            "session_used_pct": 0.0,
+            "weekly_used_pct": 0.0,
+            "session_tokens": 0,
+            "weekly_tokens": 0,
+        }
+    now = time.time()
+    if _ollama_quota_cache is not None and (now - _ollama_quota_cache_ts) < _OLLAMA_QUOTA_CACHE_TTL:
+        return _ollama_quota_cache
+    try:
+        status = _get_quota_status(str(USAGE_DB))
+        _ollama_quota_cache = status
+        _ollama_quota_cache_ts = now
+        return status
+    except Exception:
+        if _ollama_quota_cache is not None:
+            return _ollama_quota_cache
+        return {
+            "regime": "included",
+            "session_used_pct": 0.0,
+            "weekly_used_pct": 0.0,
+            "session_tokens": 0,
+            "weekly_tokens": 0,
+        }
+
 def _probe_hardware(hardware_req: str) -> dict:
     """Probe physical hardware state for the dispatch gate (Dimension 1).
 
@@ -193,6 +276,41 @@ except Exception as _le:
     print(f"[live] LiveRouter DISABLED — {_le}", flush=True)
     _LIVE_ROUTER = None
 
+# ── PPQ credit-balance bridge (P3-PPQ) ───────────────────────────────────────
+# quota_state['ppq'] used to be hardcoded {'used_pct': 0.0} — PPQ credit
+# depletion never reached the pricing engine. This imports the bridge fn from
+# the extracted collector (src.ppq_balance_collector.ppq_quota_entry), which
+# reads the newest 'ppq' row from provider_balances in api_burn.db (written by
+# the every-5min ppq_balance_collector cron). _snapshot_quota() calls
+# _ppq_quota_snapshot() instead of the old hardcoded dict. Revert-safe: any
+# failure → the old optimistic {'used_pct': 0.0} so routing never breaks.
+_ppq_quota_entry_fn = None
+try:
+    from src.ppq_balance_collector import ppq_quota_entry as _ppq_quota_entry_fn
+    print("[ppq] balance bridge loaded — quota_state['ppq'] reads real credit balance",
+          flush=True)
+except Exception as _pqe:
+    print(f"[ppq] balance bridge DISABLED — {_pqe}", flush=True)
+    _ppq_quota_entry_fn = None
+
+# ── OpenRouter credit-balance bridge (T1T3) ──────────────────────────────────
+# quota_state['openrouter'] was hardcoded {used_pct:0.0, remaining:inf} — credit
+# depletion never reached the pricing engine. Mirrors the PPQ bridge above:
+# imports openrouter_quota_entry (reads newest 'openrouter' row from
+# provider_balances, written by the every-5min openrouter_balance_collector
+# cron). Revert-safe: any failure → old optimistic {used_pct:0.0, remaining:inf}
+# so routing never breaks. REVERT: delete this block + restore the one-line
+# hardcode `snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}`
+# in _snapshot_quota().
+_openrouter_quota_entry_fn = None
+try:
+    from src.openrouter_balance_collector import openrouter_quota_entry as _openrouter_quota_entry_fn
+    print("[openrouter] balance bridge loaded — quota_state['openrouter'] reads real credit balance",
+          flush=True)
+except Exception as _oqe:
+    print(f"[openrouter] balance bridge DISABLED — {_oqe}", flush=True)
+    _openrouter_quota_entry_fn = None
+
 # ── config ──────────────────────────────────────────────────────────────────
 def _load_keys():
     """Load keys from the manager .env (gitignored, never in repo)."""
@@ -225,7 +343,7 @@ LOCK_THRESHOLDS = {
 #                         Subscription may be cancelled → mark dead with:
 #                         touch ~/.hermes/bot/.key_disabled_ours
 #   friend        1.21  — z.ai courtesy key (21% premium over base rate).
-#   ollama_cloud  1.0   — flat-rate cloud ($100/mo, ~$0.024/M tokens). Preferred
+#   ollama_cloud  1.0   — flat-rate cloud ($100/mo, rate from real_price_tracker). Preferred
 #                         during z.ai peak hours (UTC 6-10) or when z.ai is dead.
 #   ppq           — pay-per-token; most expensive, last-resort failover only.
 _KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0}
@@ -600,8 +718,8 @@ def _mark_funded(name: str) -> None:
 
 def _get_provider_cost(name: str, model_id: str) -> float:
     """Look up the combined cost per 1M tokens for a model on a provider.
-    Reads from model_matrix.json if available; falls back to PPQ_PRICING dict.
-    Returns 999.0 if unknown."""
+    Reads from model_matrix.json if available; then real_price_tracker (RP-4);
+    finally falls back to PPQ_PRICING dict. Returns 999.0 if unknown."""
     # Try model_matrix.json first (live pricing)
     try:
         matrix_path = BOT / "model_matrix.json"
@@ -616,7 +734,15 @@ def _get_provider_cost(name: str, model_id: str) -> float:
                     return k.get("cost_per_1m_offpeak", k.get("cost_per_1m_combined", 999.0))
     except Exception:
         pass
-    # Fallback to known pricing
+    # RP-4: Try real_price_tracker (measured rates)
+    if _rpt_get_rate is not None:
+        try:
+            tracked = _rpt_get_rate(name, model_id)
+            if tracked is not None and tracked < 999.0:
+                return tracked
+        except Exception:
+            pass
+    # Last-resort fallback to known pricing
     from model_matrix import PPQ_PRICING
     pricing = PPQ_PRICING.get(model_id, PPQ_PRICING.get(model_id.lower(), (0.14, 0.28)))
     return pricing[0] + pricing[1]
@@ -646,6 +772,49 @@ _pace_windows: dict[str, list[tuple[float, float, float, float, float]]] = {}
 lock = threading.Lock()
 
 # ── Shadow mode snapshot helpers ────────────────────────────────────────────
+def _ppq_quota_snapshot() -> dict:
+    """quota_state['ppq'] from the latest collected PPQ credit balance (P3-PPQ).
+
+    Delegates to the extracted ``ppq_quota_entry`` (reads provider_balances in
+    api_burn.db). Cold-start contract: no/stale row → ``{}`` (passes through)
+    so LiveRouter's ``_compute_ppq_pressure`` applies conservative
+    ``cold_start_pressure`` (Task 4) instead of the old optimistic 1.0 — a PPQ
+    endpoint we have no fresh data for must not look artificially cheap.
+    Only falls back to ``{'used_pct': 0.0}`` when the bridge import is disabled
+    or raises. Never raises.
+    """
+    if _ppq_quota_entry_fn is None:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+    try:
+        entry = _ppq_quota_entry_fn()
+        # Pass {} (cold-start marker) through unchanged; only fall back on a
+        # genuinely bad (non-dict) return.
+        return entry if isinstance(entry, dict) else {
+            "used_pct": 0.0, "remaining": float("inf"),
+        }
+    except Exception:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+
+
+def _openrouter_quota_entry_snapshot() -> dict:
+    """quota_state['openrouter'] from the latest collected balance (T1T3).
+
+    Mirrors _ppq_quota_snapshot: delegates to the extracted
+    ``openrouter_quota_entry`` (reads provider_balances in api_burn.db). Returns
+    the cold-start ``{}`` marker when there is no/stale row, which the proxy
+    maps to the optimistic ``{used_pct:0.0, remaining:inf}`` below. Never raises.
+    """
+    if _openrouter_quota_entry_fn is None:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+    try:
+        entry = _openrouter_quota_entry_fn()
+        return entry if isinstance(entry, dict) else {
+            "used_pct": 0.0, "remaining": float("inf"),
+        }
+    except Exception:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -659,11 +828,25 @@ def _snapshot_quota() -> dict:
                     "remaining": max(0.0, 2_000_000 * (1.0 - pct / 100.0)),
                     "total": 2_000_000,
                 }
-        # Ollama Cloud — no quota API, approximate from health
-        snap["ollama_cloud"] = {"used_pct": 0.0, "remaining": 1_000_000, "total": 1_000_000}
+        # Ollama Cloud — real quota from ollama_quota_tracker (EUv2-5)
+        oc_status = _get_ollama_quota_status()
+        oc_used_pct = max(oc_status["session_used_pct"], oc_status["weekly_used_pct"])
+        # Use the session limit for remaining/total display
+        oc_total = _OC_SESSION_LIMIT
+        oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0))
+        snap["ollama_cloud"] = {
+            "used_pct": float(oc_used_pct),
+            "remaining": oc_remaining,
+            "total": oc_total,
+            "regime": oc_status["regime"],
+            "session_used_pct": oc_status["session_used_pct"],
+            "weekly_used_pct": oc_status["weekly_used_pct"],
+            "session_tokens": oc_status["session_tokens"],
+            "weekly_tokens": oc_status["weekly_tokens"],
+        }
         # Per-token providers — effectively unlimited
-        snap["ppq"] = {"used_pct": 0.0, "remaining": float("inf")}
-        snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}
+        snap["ppq"] = _ppq_quota_snapshot()  # P3-PPQ: real credit balance
+        snap["openrouter"] = _openrouter_quota_entry_snapshot()  # T1T3: real credit balance
     except Exception:
         pass
     return snap
@@ -931,7 +1114,9 @@ def _usage_db() -> sqlite3.Connection:
             ppq_hit INTEGER DEFAULT 0,
             status_code INTEGER,
             error TEXT,
-            duration_ms INTEGER
+            duration_ms INTEGER,
+            cost_usd REAL DEFAULT NULL,
+            cost_source TEXT DEFAULT NULL
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS key_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1098,18 +1283,36 @@ def _extract_model(body: bytes):
 def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   prompt_tokens=0, completion_tokens=0, total_tokens=0,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
-                  status_code=None, error=None, duration_ms=None):
-    """Log one API call event. Swallows all errors — logging must never break a request."""
+                  status_code=None, error=None, duration_ms=None,
+                  cost_usd=None, cost_source=None):
+    """Log one API call event. Swallows all errors — logging must never break a request.
+
+    cost_usd / cost_source (RP-2): the real $ cost of this call and how it was
+    determined ('measured' from the response, 'estimated' from a rate model,
+    'flat_rate' for subscriptions). Both default to NULL when unknown.
+    """
     try:
         _usage_db().execute(
             "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
             "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-            "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status_code, error, duration_ms, cost_usd, cost_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
              total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-             duration_ms))
+             duration_ms, cost_usd, cost_source))
     except Exception:
-        pass
+        # Fallback: if cost_usd/cost_source columns are absent (pre-RP-1 DB),
+        # retry without them so we don't lose the whole row.
+        try:
+            _usage_db().execute(
+                "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
+                "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
+                "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
+                 total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
+                 duration_ms))
+        except Exception:
+            pass
 
 
 def _log_key_decision(*, chosen_key, reason, ours_pct=0, friend_pct=0,
@@ -1310,7 +1513,8 @@ _TELEMETRY_SCHEMA = """CREATE TABLE IF NOT EXISTS provider_telemetry (
     error_type TEXT,
     billed_tokens INTEGER,
     actual_tokens INTEGER,
-    token_mismatch INTEGER
+    token_mismatch INTEGER,
+    model TEXT
 )"""
 
 
@@ -1319,6 +1523,11 @@ def _ensure_telemetry_table(conn: sqlite3.Connection | None) -> None:
 
     Idempotent — safe to call on every request or at startup.  Swallows all
     errors so a schema migration failure never breaks request handling.
+
+    Phase 4.5b: also adds the ``model`` column to legacy DBs that predate it
+    (idempotent ALTER; the duplicate-column error is swallowed) so the
+    model-aware CPVO calculator (``cpvo_calculator.py``) can track quality
+    per ``(provider, model)`` pair.
     """
     if conn is None:
         return
@@ -1332,6 +1541,15 @@ def _ensure_telemetry_table(conn: sqlite3.Connection | None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_telemetry_provider "
             "ON provider_telemetry(provider)"
         )
+        # Ensure legacy DBs (created before the model column was added to
+        # _TELEMETRY_SCHEMA) get the column too.  Idempotent: the
+        # OperationalError on a duplicate column is expected and swallowed.
+        try:
+            conn.execute(
+                "ALTER TABLE provider_telemetry ADD COLUMN model TEXT"
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -1347,11 +1565,17 @@ def _log_provider_telemetry(
     billed_tokens: int | None,
     actual_tokens: int | None,
     token_mismatch: bool | None,
+    model: str | None = None,
 ) -> None:
     """Insert one telemetry row.  NEVER raises — telemetry failure is silent.
 
     Called from the _proxy() finally block after every request completes.
     One INSERT per request using the existing shared DB connection.
+
+    Phase 4.5b: ``model`` is the model that served the request.  When present
+    it lets ``cpvo_calculator.CPVOCalculator`` track quality per
+    ``(provider, model)`` pair.  Defaults to ``None`` for backward
+    compatibility (legacy callers / pre-existing rows stay NULL).
     """
     if conn is None:
         return
@@ -1361,7 +1585,7 @@ def _log_provider_telemetry(
             "INSERT INTO provider_telemetry "
             "(ts, provider, response_received, response_valid, "
             "latency_ms, error_type, billed_tokens, actual_tokens, "
-            "token_mismatch) VALUES (?,?,?,?,?,?,?,?,?)",
+            "token_mismatch, model) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (datetime.now(timezone.utc).isoformat(),
              provider or "unknown",
              int(response_received) if response_received is not None else 0,
@@ -1370,7 +1594,8 @@ def _log_provider_telemetry(
              error_type or "none",
              int(billed_tokens) if billed_tokens is not None else 0,
              int(actual_tokens) if actual_tokens is not None else 0,
-             int(token_mismatch) if token_mismatch is not None else 0),
+             int(token_mismatch) if token_mismatch is not None else 0,
+             model),
         )
     except Exception:
         pass
@@ -1387,37 +1612,34 @@ def _log_provider_telemetry(
 _SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "10.0"))
 _SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "3.0"))
 
-# Cost per 1M tokens with the new pricing model:
-# - ollama: $100/mo flat rate subscription (calculated as ~$0.024/M tokens typical usage)
-# - friend: 21% premium over base rate 
-# - ours: $0 (cancelled subscription)
-_MODEL_COST_PER_1M: dict[str, float] = {
-    # Ollama Cloud - flat rate ($100/mo ≈ $0.024/M tokens at typical usage)
-    "ollama_cloud": 0.024,
-    
-    # Friend key - 21% premium over ollama rate  
-    "friend": 0.029,  # 0.024 * 1.21 = 0.02904
-    
-    # Our key - cancelled subscription ($0)
-    "ours": 0.0,
-    
-    # Legacy model pricing (kept for compatibility but may not be used)
-    "glm-5.2":                 0.0,
-    "glm-4.5-flash":           0.0,
-    "glm-4.5":                 0.88,
-    "glm-4.5-air":             0.65,
-    "glm-4.5-airx":            2.80,
-    "glm-4.5-x":               5.55,
-    "deepseek/deepseek-v4-pro":   1.30,
-    "deepseek/deepseek-v4-flash": 0.09,
-    # DeepInfra — same models as PPQ, fallback if estimated_cost is missing
-    "deepinfra":                  1.30,
-    # Legacy ollama models (kept for compatibility)
-    "gpt-oss:120b":            0.0,
-    "gemma4:31b":              0.0,
-    "qwen3.5:397b":            0.0,
-    "kimi-k2.7-code":          0.0,
+# ── Cost per 1M tokens (RP-4: real_price_tracker is the source of truth) ──────
+# Hardcoded rate constants have been replaced by real_price_tracker.
+# get_rate_with_fallback() resolves: real data → Ollama API → LAST_RESORT_RATES.
+# The values below are EMERGENCY FALLBACKS for when the tracker module fails to
+# import — they mirror LAST_RESORT_RATES in src/real_price_tracker.py.
+_FALLBACK_OLLAMA_CLOUD_BASE = 0.0155    # was 0.024 (35% wrong); measured = 0.0155
+_FALLBACK_OLLAMA_CLOUD_EXTRA = 0.15     # above-quota rate
+_FALLBACK_RATES: dict[str, float] = {
+    "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
+    "friend":       0.001,    # shared z.ai subscription → marginal $0
+    "ours":         0.001,    # z.ai subscription → marginal $0
+    "deepinfra":    1.30,
 }
+
+
+def _rpt_rate(provider: str, model: str | None = None) -> float:
+    """Get a $/M rate from real_price_tracker, falling back to inline constants.
+
+    Resolution chain: real_price_tracker.get_rate_with_fallback() →
+    inline _FALLBACK_RATES → 0.0 (safe zero for unknown providers).
+    Never raises.
+    """
+    if _rpt_get_rate is not None:
+        try:
+            return _rpt_get_rate(provider, model)
+        except Exception:
+            pass
+    return _FALLBACK_RATES.get(provider, 0.0)
 
 
 def _spend_tier(key_name: str | None) -> str:
@@ -1433,11 +1655,44 @@ def _spend_tier(key_name: str | None) -> str:
     return "unknown"
 
 
+def _get_ollama_cloud_cost_per_1m() -> float:
+    """Dynamic cost per 1M tokens for ollama_cloud based on quota regime.
+
+    RP-4: Rates are sourced from real_price_tracker.get_rate_with_fallback()
+    which uses real measured cost_usd data, falling back to LAST_RESORT_RATES.
+    - included:  real measured rate (≈ $0.0155/M)
+    - extra:     above-quota rate (≈ $0.15/M, above PPQ $0.14/M → optimizer reroutes)
+    - exhausted: float('inf') (effectively removes from routing)
+    """
+    regime = _get_ollama_quota_status()["regime"]
+    if regime == "extra":
+        if _rpt_get_rate is not None:
+            try:
+                return _rpt_get_rate("ollama_cloud_extra")
+            except Exception:
+                pass
+        return _FALLBACK_OLLAMA_CLOUD_EXTRA
+    elif regime == "exhausted":
+        return float("inf")
+    return _rpt_rate("ollama_cloud")
+
+
 def _estimate_cost_usd(key_name: str | None, total_tokens: int) -> float:
-    """Estimate USD cost for a request based on key type. Returns 0.0 for unknown/free keys."""
+    """Estimate USD cost for a request based on key type. Returns 0.0 for unknown/free keys.
+
+    RP-4: Rates are sourced from real_price_tracker.get_rate_with_fallback()
+    which uses real measured cost_usd data from the DB, falling back to
+    LAST_RESORT_RATES estimates. For ollama_cloud, applies dynamic pricing
+    based on the current quota regime (included/extra/exhausted).
+    """
     if not key_name or total_tokens <= 0:
         return 0.0
-    cost_per_1m = _MODEL_COST_PER_1M.get(key_name, 0.0)
+    if key_name == "ollama_cloud":
+        cost_per_1m = _get_ollama_cloud_cost_per_1m()
+    else:
+        cost_per_1m = _rpt_rate(key_name)
+    if cost_per_1m == float("inf"):
+        return float("inf")
     return (total_tokens / 1_000_000) * cost_per_1m
 
 
@@ -1446,7 +1701,7 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
     """Record spend for today. Called from the finally block of every request.
 
     When actual_cost is provided (e.g., from DeepInfra's estimated_cost field),
-    it is used directly instead of computing from _MODEL_COST_PER_1M. This
+    it is used directly instead of computing from the tracker. This
     captures prompt-caching discounts and real-time pricing changes.
     """
     try:
@@ -1525,6 +1780,49 @@ def _get_deepinfra_balance() -> float:
 # Initialize balance on module load
 if DEEPINFRA_KEY:
     _init_deepinfra_balance()
+
+
+def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
+                  total_tokens: int = 0) -> tuple[float | None, str | None]:
+    """Extract the real USD cost for one API call (RP-2).
+
+    Returns ``(cost_usd, cost_source)`` or ``(None, None)``. Never raises.
+
+    Resolution order:
+      1. **Measured** — if the provider returns cost in the response body
+         (openrouter ``usage.cost``, deepinfra ``usage.estimated_cost``, ppq
+         multi-path probe), parse it via src/cost_extraction.py. Source =
+         'measured'.
+      2. **Flat-rate** — ours/friend (z.ai subscription): marginal cost is $0.
+         Source = 'flat_rate'.
+      3. **Estimated** — ollama_cloud (flat-rate, but compute an estimated
+         per-call cost from the current quota regime rate × tokens so the
+         real_price_tracker has a non-zero signal). Source = 'estimated'.
+      4. **Unknown** — provider is None/unknown or cost can't be determined.
+         Returns (None, None).
+    """
+    try:
+        if not provider:
+            return (None, None)
+        # 1. Paid providers: parse real cost from the response body.
+        if _extract_cost_module is not None:
+            cost, source = _extract_cost_module(provider, bytes(response_buffer))
+            if cost is not None:
+                return (cost, source)
+        # 2. z.ai flat-rate subscription — marginal cost is always $0.
+        if provider in ("ours", "friend"):
+            return (0.0, "flat_rate")
+        # 3. ollama_cloud flat-rate — estimate from regime rate × tokens.
+        if provider == "ollama_cloud":
+            rate = _get_ollama_cloud_cost_per_1m()
+            if rate == float("inf"):
+                # Exhausted regime — no meaningful cost; let it stay NULL.
+                return (None, None)
+            return ((total_tokens / 1_000_000) * rate, "estimated")
+        # 4. Unknown / unhandled provider.
+        return (None, None)
+    except Exception:
+        return (None, None)
 
 
 def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
@@ -2007,6 +2305,9 @@ class Handler(BaseHTTPRequestHandler):
                 _record_spend("ollama_cloud", ollama_model, ollama_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy("ollama_cloud")
+                # RP-2: extract real cost (estimated from regime rate × tokens)
+                _oc_cost, _oc_cost_src = _extract_cost(
+                    "ollama_cloud", bytes(response_buffer), ollama_tokens)
                 _log_api_call(
                     key_name="ollama_cloud", key_suffix=OLLAMA_CLOUD_KEY[-4:],
                     model=ollama_model,
@@ -2015,6 +2316,7 @@ class Handler(BaseHTTPRequestHandler):
                     total_tokens=ollama_tokens,
                     tier="ollama_cloud", status_code=resp.status, error=None,
                     duration_ms=int((time.time() - t0) * 1000),
+                    cost_usd=_oc_cost, cost_source=_oc_cost_src,
                 )
                 # Log key decision so dashboard shows the switch to ollama_cloud
                 _log_key_decision(
@@ -2122,18 +2424,20 @@ class Handler(BaseHTTPRequestHandler):
                         # Parse usage from the streamed response for spend tracking
                         ext_usage = _parse_usage(bytes(response_buffer))
                         ext_tokens = int(ext_usage.get("total_tokens") or 0)
-                        # DeepInfra returns estimated_cost (actual charge incl. caching)
-                        # Use it directly for accurate spend tracking + balance deduction
-                        ext_estimated_cost = ext_usage.get("estimated_cost")
-                        if ext_estimated_cost is not None:
-                            ext_actual_cost = float(ext_estimated_cost)
-                        else:
-                            ext_actual_cost = None
+                        # RP-2: extract real cost from the response body.
+                        # Unifies per-provider cost parsing (openrouter usage.cost,
+                        # deepinfra usage.estimated_cost, ppq multi-path probe)
+                        # into one call. Returns (None, None) when the provider
+                        # doesn't return a cost field.
+                        ext_cost_usd, ext_cost_source = _extract_cost(
+                            provider_name, bytes(response_buffer), ext_tokens)
+                        # Use extracted cost for spend tracking (falls back to
+                        # _estimate_cost_usd inside _record_spend when None).
                         _record_spend(provider_name, ext_model, ext_tokens,
-                                      actual_cost=ext_actual_cost)
+                                      actual_cost=ext_cost_usd)
                         # Deduct from DeepInfra local credit balance
-                        if provider_name == "deepinfra" and ext_actual_cost is not None:
-                            remaining = _deduct_deepinfra_balance(ext_actual_cost)
+                        if provider_name == "deepinfra" and ext_cost_usd is not None and ext_cost_usd > 0:
+                            remaining = _deduct_deepinfra_balance(ext_cost_usd)
                         self._spend_recorded = True
                         _log_api_call(
                             key_name=provider_name, key_suffix=prov["key"][-4:],
@@ -2143,6 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
                             total_tokens=ext_tokens,
                             tier=provider_name, status_code=resp.status, error=None,
                             duration_ms=int((time.time() - t0) * 1000),
+                            cost_usd=ext_cost_usd, cost_source=ext_cost_source,
                         )
                         # Log key decision so dashboard shows the failover switch
                         _log_key_decision(
@@ -2282,21 +2587,73 @@ class Handler(BaseHTTPRequestHandler):
         # never changes `chosen`. In advisor mode the live pick already came
         # from the optimizer, so this logs the agreement (useful monitoring);
         # any failure is swallowed so production is unaffected.
+        #
+        # T7 / C1 fix (docs/shadow-7d-report.md §3/§6): ALSO compute the
+        # LiveRouter's pressure-routing pick so the P6 divergence and 429
+        # exit-gate columns get genuine data.  Before this fix the live path
+        # called log_decision() (legacy API) which left pressure_provider,
+        # actual_cost, divergence, is_429 all NULL — making the exit gate
+        # degenerate (passed trivially on empty inputs).  The pressure pick
+        # bypasses the kill switch intentionally — that's the point of SHADOW
+        # mode (log, don't route).
         if _shadow_logger and _shadow_optimizer and chosen:
             try:
                 _sd = _shadow_optimizer.route(difficulty="medium", estimated_tokens=0)
                 if _sd:
-                    _shadow_logger.log_decision(
-                        ts=time.time(),
-                        live_provider=_shadow_live_label(chosen),
-                        live_model=original_model,
-                        shadow_provider=_sd.get("chosen_provider"),
-                        shadow_model=_sd.get("chosen_model"),
-                        shadow_cost=_sd.get("effective_cost_per_1m"),
-                        tokens=0,
-                        reason=(_sd.get("reason") or "")[:200],
-                        live_cost=None,
-                    )
+                    # ── C1: compute LiveRouter pressure pick (best-effort) ──
+                    _pr_prov = _pr_mod = _pr_cost = _act_cost = None
+                    if _LIVE_ROUTER is not None:
+                        try:
+                            _pw_s = None
+                            with lock:
+                                _pw_s = dict(_pace_windows) if _pace_windows else None
+                            (_pr_prov, _pr_mod), _ = _LIVE_ROUTER.select_failover(
+                                quota_state=_snapshot_quota(),
+                                health_state=_snapshot_health(),
+                                peak=_is_peak_hour(),
+                                pace_windows=_pw_s,
+                            )
+                            _rates = _converged_rates or {}
+                            if _pr_prov:
+                                _pr_cost = (_rates.get(_pr_prov)
+                                            or _rates.get(str(_pr_prov).replace("zai_", "")))
+                            _ll = _shadow_live_label(chosen)
+                            _act_cost = (_rates.get(_ll)
+                                         or _rates.get(chosen)
+                                         or _rates.get(_ll.replace("zai_", "")))
+                        except Exception:
+                            pass  # pressure pick is best-effort only
+                    # ── Log with pressure dimension if available ──
+                    if hasattr(_shadow_logger, 'log_decision_with_pressure'):
+                        _shadow_logger.log_decision_with_pressure(
+                            ts=time.time(),
+                            live_provider=_shadow_live_label(chosen),
+                            live_model=original_model,
+                            shadow_provider=_sd.get("chosen_provider"),
+                            shadow_model=_sd.get("chosen_model"),
+                            shadow_cost=_sd.get("effective_cost_per_1m"),
+                            tokens=0,
+                            reason=(_sd.get("reason") or "")[:200],
+                            live_cost=_act_cost,
+                            quota_regime=_get_ollama_quota_status().get("regime"),
+                            pressure_provider=_pr_prov,
+                            pressure_model=_pr_mod,
+                            pressure_cost=_pr_cost,
+                            actual_cost=_act_cost,
+                        )
+                    else:
+                        _shadow_logger.log_decision(
+                            ts=time.time(),
+                            live_provider=_shadow_live_label(chosen),
+                            live_model=original_model,
+                            shadow_provider=_sd.get("chosen_provider"),
+                            shadow_model=_sd.get("chosen_model"),
+                            shadow_cost=_sd.get("effective_cost_per_1m"),
+                            tokens=0,
+                            reason=(_sd.get("reason") or "")[:200],
+                            live_cost=None,
+                            quota_regime=_get_ollama_quota_status().get("regime"),
+                        )
             except Exception:
                 pass  # Shadow mode never blocks production
 
@@ -2603,16 +2960,21 @@ class Handler(BaseHTTPRequestHandler):
             suffix = None
             if key_used and KEYS.get(key_used):
                 suffix = KEYS[key_used][-4:]
+            # RP-2: extract real cost (flat-rate $0 for ours/friend z.ai keys)
+            _zai_tokens = int(usage.get("total_tokens") or 0)
+            _zai_cost, _zai_cost_src = _extract_cost(
+                key_used, bytes(response_buffer), _zai_tokens)
             _log_api_call(
                 key_name=key_used, key_suffix=suffix, model=model,
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
                 completion_tokens=int(usage.get("completion_tokens") or 0),
-                total_tokens=int(usage.get("total_tokens") or 0),
+                total_tokens=_zai_tokens,
                 tier="zai", status_code=status_code, error=error_text,
                 duration_ms=int((time.time() - t0) * 1000),
+                cost_usd=_zai_cost, cost_source=_zai_cost_src,
             )
             if not getattr(self, '_spend_recorded', False):
-                _record_spend(key_used, model, int(usage.get("total_tokens") or 0))
+                _record_spend(key_used, model, _zai_tokens)
 
             # ── Provider telemetry (Phase 2.5.1) ─────────────────────────────
             # One row per request: success/fail, latency, token-mismatch.
@@ -2669,6 +3031,7 @@ class Handler(BaseHTTPRequestHandler):
                     billed_tokens=_billed,
                     actual_tokens=_actual,
                     token_mismatch=_mismatch,
+                    model=model,
                 )
             except Exception:
                 pass
@@ -2733,6 +3096,8 @@ class Handler(BaseHTTPRequestHandler):
             for n in KEYS:
                 if n in data:
                     data[n]["predictions"] = _get_cached_predictions(n)
+            # Ollama Cloud quota from tracker (EUv2-5)
+            data["ollama_cloud"] = _snapshot_quota().get("ollama_cloud", {})
             payload = json.dumps(data, indent=2).encode()
             self.close_connection = True   # honor the Connection: close header below
             self.send_response(200)
@@ -2832,7 +3197,9 @@ class Handler(BaseHTTPRequestHandler):
                         "healthy": True,
                     }
                     if remaining >= estimated_tokens:
-                        base = (_converged_rates or {}).get(key, 0.001)
+                        base = (_converged_rates or {}).get(key)
+                        if base is None:
+                            base = _rpt_rate(key)
                         eff = base * _KEY_COST_MULTIPLIER.get(key, 1.0) * peak_mult
                         candidates.append({
                             "provider": key,
@@ -2845,7 +3212,9 @@ class Handler(BaseHTTPRequestHandler):
                 # fallback when the primary-key gate holds.
                 flat_candidates = []
                 if health_snap.get("ollama_cloud") and OLLAMA_CLOUD_KEY:
-                    base = (_converged_rates or {}).get("ollama_cloud", 0.024)
+                    base = (_converged_rates or {}).get("ollama_cloud")
+                    if base is None:
+                        base = _rpt_rate("ollama_cloud")
                     eff = base * _KEY_COST_MULTIPLIER.get("ollama_cloud", 1.0) * peak_mult
                     flat_candidates.append({
                         "provider": "ollama_cloud",

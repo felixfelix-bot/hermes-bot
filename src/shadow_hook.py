@@ -44,24 +44,33 @@ from src.shadow_logger import ShadowLogger
 from src.provider_names import normalize_provider_name
 from src.pricing_engine import pace_factor_multi
 
+# RP-4: real_price_tracker replaces hardcoded seed costs.
+try:
+    from src.real_price_tracker import get_rate_with_fallback as _rpt_get_rate
+except Exception:
+    _rpt_get_rate = None
+
 __all__ = ["ShadowHook"]
 
 
-# ── Seed costs ($/M) — reasonable starting points; Kalman converges ──────────
+# ── Seed costs ($/M) — last-resort fallback only ─────────────────────────────
+# RP-4: Real rates are resolved from real_price_tracker at init time. These
+# values mirror LAST_RESORT_RATES in real_price_tracker.py and are used ONLY
+# when the tracker is unavailable or returns no data.
 _SEED_COSTS = {
-    "ours":          0.31,   # €155/mo, ~500M tokens/mo
-    "friend":        0.375,  # 21% premium over ours
-    "ollama_cloud":  0.50,   # $100/mo, ~200M tokens/mo
-    "ppq":           0.14,   # avg of $0.09 input + $0.19 output
-    "openrouter":    0.135,  # avg of $0.09 input + $0.18 output
-    "deepinfra":     1.30,   # historical effective rate from daily_spend DB
+    "ours":         0.001,    # z.ai flat-rate → marginal $0, floored
+    "friend":       0.001,    # shared z.ai subscription → marginal $0
+    "ollama_cloud": 0.0155,   # measured included rate (pre-RP-3)
+    "ppq":          0.14,     # known list price
+    "openrouter":   0.135,    # known list price
+    "deepinfra":    1.30,     # known list price
 }
 
 # Quota totals (approximate, for scarcity factor)
 _QUOTA_TOTALS = {
     "ours":         2_000_000,    # ~2M tokens per 5h window
     "friend":       2_000_000,
-    "ollama_cloud": 1_000_000,    # rate-limited daily
+    "ollama_cloud": 500_000_000,  # 500M tokens per 5h session window
     "ppq":          float("inf"),  # pay-per-token, no hard quota
     "openrouter":   float("inf"),
     "deepinfra":    float("inf"),  # pay-per-token, no hard quota
@@ -101,8 +110,8 @@ class ShadowHook:
             db_path: SQLite path for ShadowLogger. Defaults to production usage DB.
             converged_rates: Converged base rates ($/M) from historical data.
                 When provided, PriceKalman instances are seeded with these
-                values instead of the static ``_SEED_COSTS`` defaults.  Keys
-                not present in the dict fall back to ``_SEED_COSTS``.
+                values instead of the tracker-resolved rates.  Keys not
+                present in the dict fall back to tracker or ``_SEED_COSTS``.
         """
         if db_path is None:
             db_path = os.path.expanduser("~/.hermes/bot/zai_usage.db")
@@ -110,9 +119,22 @@ class ShadowHook:
         self._logger = ShadowLogger(db_path)
         self._last_update = time.time()
 
-        # Build the effective seed table: converged overrides take precedence
-        # over the static _SEED_COSTS defaults.
+        # RP-4: Build the effective seed table from real_price_tracker.
+        # Resolution: tracker (real measured rates) → converged_rates override
+        # → _SEED_COSTS (last-resort fallback).
         effective_seeds: dict[str, float] = dict(_SEED_COSTS)
+
+        # 1. Try real_price_tracker for each provider
+        if _rpt_get_rate is not None:
+            for name in _SEED_COSTS:
+                try:
+                    rate = _rpt_get_rate(name, db_path=db_path)
+                    if rate is not None and rate == rate and rate >= 0:
+                        effective_seeds[name] = float(rate)
+                except Exception:
+                    pass  # keep last-resort seed
+
+        # 2. Explicit converged_rates override takes precedence
         if converged_rates:
             for name, rate in converged_rates.items():
                 effective_seeds[name] = rate
@@ -333,6 +355,144 @@ class ShadowHook:
         if "5.2" in m or "4.5" in m or "pro" in m:
             return "high"
         return "medium"
+
+    # ── P6: pressure-routing divergence comparison ──────────────────────
+
+    def compare_pressure(
+        self,
+        actual_provider: str | None,
+        actual_model: str | None,
+        tokens: int,
+        quota_state: dict[str, Any],
+        health_state: dict[str, bool],
+        peak: bool,
+        failure_counts: dict[str, int] | None = None,
+        pace_windows: dict[str, list[tuple[float, float, float, float, float]]] | None = None,
+        is_429: bool = False,
+        actual_cost: float | None = None,
+    ) -> None:
+        """Log the divergence between the actual provider and what the
+        LiveRouter's **pressure routing** would have chosen (P6-SHADOW).
+
+        Unlike :meth:`compare` (which runs the price-first routing_optimizer),
+        this invokes :meth:`LiveRouter.select_failover` — the quota-pressure-
+        based selection that production will eventually promote.  The result is
+        logged via :meth:`ShadowLogger.log_pressure_decision` so the divergence
+        metric and exit criteria can be evaluated after the soak.
+
+        NEVER raises — pressure comparison must not break production.
+
+        Args:
+            actual_provider / actual_model: what production actually used.
+            tokens: total tokens for this request.
+            quota_state / health_state / peak / failure_counts / pace_windows:
+                same shape as :meth:`compare` — forwarded to select_failover.
+            is_429: whether the actual request hit a 429.
+            actual_cost: optional effective $/M of the actual provider.  When
+                None, estimated from the seed price table (best-effort).
+        """
+        try:
+            self._do_compare_pressure(
+                actual_provider, actual_model, tokens,
+                quota_state, health_state, peak,
+                failure_counts, pace_windows, is_429, actual_cost,
+            )
+        except Exception:
+            pass  # pressure comparison must never break production
+
+    def _do_compare_pressure(
+        self,
+        actual_provider: str | None,
+        actual_model: str | None,
+        tokens: int,
+        quota_state: dict[str, Any],
+        health_state: dict[str, bool],
+        peak: bool,
+        failure_counts: dict[str, int] | None,
+        pace_windows: dict[str, list[tuple[float, float, float, float, float]]] | None,
+        is_429: bool,
+        actual_cost: float | None,
+    ) -> None:
+        """Internal pressure comparison — may raise (wrapped by caller)."""
+        now = time.time()
+        actual_provider = normalize_provider_name(actual_provider)
+
+        # ── Ask the LiveRouter what pressure routing would choose ────────
+        # We import locally to avoid a hard dependency at module load time
+        # (LiveRouter pulls in many provider modules).  select_failover never
+        # raises — it returns ((None, None), (None, None)) on failure.
+        from src.live_router import LiveRouter
+
+        router = LiveRouter.get_instance()
+        (chosen, chosen_model), _fallback = router.select_failover(
+            quota_state=quota_state,
+            health_state=health_state,
+            peak=peak,
+            failure_counts=failure_counts,
+            pace_windows=pace_windows,
+            model=actual_model,
+        )
+
+        pressure_provider = chosen or "unknown"
+        pressure_model = chosen_model or "unknown"
+
+        # ── Estimate effective costs ─────────────────────────────────────
+        # Use the shadow_hook's own PriceKalman base rates — these are the
+        # smoothed $/M per provider that the hook already maintains.  This
+        # avoids importing live_router internals and stays consistent with the
+        # price-first comparison in _do_compare().
+        pressure_cost = 0.0
+        if pressure_provider in self._price_kalmans:
+            pressure_cost = self._price_kalmans[pressure_provider].base_rate
+
+        # Actual cost: use the explicit value when provided, otherwise
+        # estimate from the hook's price kalman for the actual provider.
+        if actual_cost is not None:
+            actual_cost = float(actual_cost)
+        elif actual_provider in self._price_kalmans:
+            actual_cost = self._price_kalmans[actual_provider].base_rate
+        else:
+            actual_cost = 0.0
+
+        # ── PM-T6: per-model pricing context for the shadow row ─────────
+        # The LiveRouter exposes the requested model and the per-model base
+        # rate it resolved for every candidate during select_failover. We log
+        # the chosen (pressure) provider's rate + source, and append a compact
+        # per-candidate breakdown to the reason so the full picture of how each
+        # provider was priced for this model is recorded (plan §4.3).
+        requested_model = router.last_requested_model
+        pm_rates = router.last_per_model_rates
+        pm_sources = router.last_per_model_sources
+        pm_base_rate = pm_rates.get(pressure_provider) if pm_rates else None
+        pm_source = pm_sources.get(pressure_provider) if pm_sources else None
+
+        reason = (
+            f"pressure_compare: actual={actual_provider} "
+            f"pressure={pressure_provider}"
+        )
+        if pm_rates:
+            _cand = ",".join(
+                f"{_n}={pm_rates[_n]:.4g}" for _n in sorted(pm_rates)
+            )
+            reason += f" | per_model_rates[{_cand}]"
+
+        # ── Log the divergence row ───────────────────────────────────────
+        self._logger.log_pressure_decision(
+            ts=now,
+            actual_provider=actual_provider or "none",
+            actual_model=actual_model or "unknown",
+            pressure_provider=pressure_provider,
+            pressure_model=pressure_model,
+            actual_cost=actual_cost,
+            pressure_cost=pressure_cost,
+            tokens=tokens,
+            reason=reason,
+            is_429=is_429,
+            requested_model=requested_model,
+            per_model_base_rate=pm_base_rate,
+            per_model_source=pm_source,
+            quota_regime=getattr(router, "last_quota_regime", None),
+        )
 
     def get_stats(self) -> dict:
         """Return shadow mode statistics for monitoring."""

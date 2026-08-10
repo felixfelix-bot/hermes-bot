@@ -26,3 +26,6 @@ venv/
 
 # Allow secret patterns file (for pre-commit hooks)
 !.secret-patterns.txt
+zai_usage.db
+api_burn.db
+model_cache.db

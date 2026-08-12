@@ -985,6 +985,14 @@ try:
         quota_remaining=_di_balance, model_tier="low",
         quota_total=DEEPINFRA_STARTING_BALANCE * 1_000_000,
     )
+    # telnyx — per-token, low tier (expensive per-token), last resort.
+    # Seed rate: 5.40/M = blended kimi-k3 cost: (2.70*3 + 13.50*1) / 4
+    _shadow_optimizer.add_provider(
+        "telnyx", _shadow_pk(5.40), _ShadowConsumptionKalman(),
+        quota_remaining=TELNYX_STARTING_BALANCE * 1_000_000,
+        model_tier="low",
+        quota_total=TELNYX_STARTING_BALANCE * 1_000_000,
+    )
     # Defaults to ~/.hermes/bot/zai_usage.db (config/providers.yaml :: shadow_mode.db_path)
     _shadow_logger = _ShadowLogger()
 except Exception:

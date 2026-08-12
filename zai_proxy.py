@@ -1707,6 +1707,7 @@ _FALLBACK_RATES: dict[str, float] = {
     "friend":       0.001,    # shared z.ai subscription → marginal $0
     "ours":         0.001,    # z.ai subscription → marginal $0
     "deepinfra":    1.30,
+    "telnyx":       5.40,     # seed: blended kimi-k3 cost (2.70*3 + 13.50*1) / 4
 }
 
 
@@ -1874,14 +1875,17 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
     Resolution order:
       1. **Measured** — if the provider returns cost in the response body
          (openrouter ``usage.cost``, deepinfra ``usage.estimated_cost``, ppq
-         multi-path probe), parse it via src/cost_extraction.py. Source =
-         'measured'.
+         and telnyx multi-path probe), parse it via src/cost_extraction.py.
+         Source = 'measured'.
       2. **Flat-rate** — ours/friend (z.ai subscription): marginal cost is $0.
          Source = 'flat_rate'.
       3. **Estimated** — ollama_cloud (flat-rate, but compute an estimated
          per-call cost from the current quota regime rate × tokens so the
          real_price_tracker has a non-zero signal). Source = 'estimated'.
-      4. **Unknown** — provider is None/unknown or cost can't be determined.
+      4. **Rate-derived** — telnyx (when no in-body cost field is found):
+         compute from token count × published rate so the balance collector
+         has a non-zero spend signal. Source = 'rate_derived'.
+      5. **Unknown** — provider is None/unknown or cost can't be determined.
          Returns (None, None).
     """
     try:
@@ -1902,7 +1906,15 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 # Exhausted regime — no meaningful cost; let it stay NULL.
                 return (None, None)
             return ((total_tokens / 1_000_000) * rate, "estimated")
-        # 4. Unknown / unhandled provider.
+        # 4. telnyx — if no in-body cost was found (step 1), derive from
+        # token count × published rate so the balance collector (which sums
+        # cost_usd) has a non-zero signal. Source = 'rate_derived'.
+        if provider == "telnyx":
+            rate = _rpt_rate("telnyx")
+            if rate == float("inf") or rate <= 0:
+                return (None, None)
+            return ((total_tokens / 1_000_000) * rate, "rate_derived")
+        # 5. Unknown / unhandled provider.
         return (None, None)
     except Exception:
         return (None, None)

@@ -408,7 +408,7 @@ _TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud"}
 
 # Provider priority for failover sort (lower = tried first).
 # DeepInfra preferred over PPQ because of prompt-caching discounts.
-_PROVIDER_PRIORITY = {"deepinfra": 0, "telnyx": 1, "ppq": 2, "openrouter": 3}
+_PROVIDER_PRIORITY = {"deepinfra": 0, "ppq": 1, "openrouter": 2, "telnyx": 3}
 
 # Per-provider model name translation.
 # PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
@@ -421,8 +421,12 @@ _PROVIDER_MODEL_NAMES = {
         "glm-5.2":                    "zai-org/GLM-5.2",
     },
     "telnyx": {
-        "kimi-k3:cloud":  "moonshotai/Kimi-K3",
-        "kimi-k2.7-code": "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
+        "kimi-k3":         "moonshotai/Kimi-K3",
+        "kimi-k2.5":       "moonshotai/Kimi-K2.5",
+        "glm-5.2":         "zai-org/GLM-5.2",
+        "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",
+        "kimi-k3:cloud":   "moonshotai/Kimi-K3",
+        "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
     },
 }
 

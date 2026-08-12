@@ -356,9 +356,10 @@ STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
 
 # ── external failover providers ─────────────────────────────────────────────
 def _load_external_keys():
-    """Load PPQ, OpenRouter, Ollama Cloud, and DeepInfra keys from .env."""
+    """Load PPQ, OpenRouter, Ollama Cloud, DeepInfra, and Telnyx keys from .env."""
     keys = {}
-    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env"]:
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env",
+               Path.home()/".hermes/bot/.env"]:
         if ep.exists():
             for line in ep.read_text(errors="ignore").splitlines():
                 line = line.strip()
@@ -396,6 +397,11 @@ TELNYX_KEY = _EXTERNAL_KEYS.get("telnyx", "")
 TELNYX_BASE = "https://api.telnyx.com/v2/ai"
 TELNYX_DEMO_URL = "https://telnyx.com/api/inference"
 TELNYX_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("telnyx_balance", "10.0") or "10.0")
+
+# Startup diagnostics — print key/balance status like other external providers
+print(f"[telnyx] key={'loaded' if TELNYX_KEY else 'MISSING'} "
+      f"suffix={TELNYX_KEY[-4:] if TELNYX_KEY else 'N/A'} "
+      f"starting_balance=${TELNYX_STARTING_BALANCE:.2f}", flush=True)
 
 # Models that have Telnyx fallback when Ollama Cloud fails
 _TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud"}

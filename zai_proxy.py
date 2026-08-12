@@ -312,6 +312,25 @@ except Exception as _oqe:
     print(f"[openrouter] balance bridge DISABLED — {_oqe}", flush=True)
     _openrouter_quota_entry_fn = None
 
+# ── Telnyx self-tracking balance bridge (TELNYX-3.2) ───────────────────────────
+# quota_state['telnyx'] was hardcoded {used_pct:0.0, remaining:inf} — balance
+# depletion never reached the pricing engine. Mirrors the PPQ/OpenRouter
+# bridges above: imports telnyx_quota_entry from the merged balance_collectors
+# module (reads newest 'telnyx' row from provider_balances, written by the
+# every-5min balance_collectors --provider telnyx cron). Revert-safe: any
+# failure → old optimistic {used_pct:0.0, remaining:inf} so routing never
+# breaks. REVERT: delete this block + restore the one-line hardcode
+# `snap["telnyx"] = {"used_pct": 0.0, "remaining": float("inf")}`
+# in _snapshot_quota().
+_telnyx_quota_entry_fn = None
+try:
+    from src.balance_collectors import telnyx_quota_entry as _telnyx_quota_entry_fn
+    print("[telnyx] balance bridge loaded — quota_state['telnyx'] reads real balance",
+          flush=True)
+except Exception as _tqe:
+    print(f"[telnyx] balance bridge DISABLED — {_tqe}", flush=True)
+    _telnyx_quota_entry_fn = None
+
 # ── config ──────────────────────────────────────────────────────────────────
 def _load_keys():
     """Load keys from the manager .env (gitignored, never in repo)."""
@@ -849,6 +868,26 @@ def _openrouter_quota_entry_snapshot() -> dict:
         return {"used_pct": 0.0, "remaining": float("inf")}
 
 
+def _telnyx_quota_snapshot() -> dict:
+    """quota_state['telnyx'] from the latest collected balance (TELNYX-3.2).
+
+    Mirrors _ppq_quota_snapshot / _openrouter_quota_entry_snapshot: delegates
+    to the extracted ``telnyx_quota_entry`` (reads provider_balances in
+    api_burn.db). Returns the cold-start ``{}`` marker when there is no/stale
+    row, which the proxy maps to the optimistic ``{used_pct:0.0, remaining:inf}``
+    below. Never raises.
+    """
+    if _telnyx_quota_entry_fn is None:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+    try:
+        entry = _telnyx_quota_entry_fn()
+        return entry if isinstance(entry, dict) else {
+            "used_pct": 0.0, "remaining": float("inf"),
+        }
+    except Exception:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -881,6 +920,7 @@ def _snapshot_quota() -> dict:
         # Per-token providers — effectively unlimited
         snap["ppq"] = _ppq_quota_snapshot()  # P3-PPQ: real credit balance
         snap["openrouter"] = _openrouter_quota_entry_snapshot()  # T1T3: real credit balance
+        snap["telnyx"] = _telnyx_quota_snapshot()  # TELNYX-3.2: real balance
     except Exception:
         pass
     return snap
@@ -894,6 +934,7 @@ def _snapshot_health() -> dict:
         h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
         h["ppq"] = _is_key_healthy("ppq")
         h["openrouter"] = True
+        h["telnyx"] = _is_key_healthy("telnyx")
     except Exception:
         pass
     return h

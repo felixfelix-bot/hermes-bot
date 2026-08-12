@@ -279,14 +279,14 @@ except Exception as _le:
 # ── PPQ credit-balance bridge (P3-PPQ) ───────────────────────────────────────
 # quota_state['ppq'] used to be hardcoded {'used_pct': 0.0} — PPQ credit
 # depletion never reached the pricing engine. This imports the bridge fn from
-# the extracted collector (src.ppq_balance_collector.ppq_quota_entry), which
-# reads the newest 'ppq' row from provider_balances in api_burn.db (written by
-# the every-5min ppq_balance_collector cron). _snapshot_quota() calls
-# _ppq_quota_snapshot() instead of the old hardcoded dict. Revert-safe: any
-# failure → the old optimistic {'used_pct': 0.0} so routing never breaks.
+# the merged collector (src.balance_collectors.ppq_quota_entry), which reads
+# the newest 'ppq' row from provider_balances in api_burn.db (written by
+# the every-5min balance_collectors --provider ppq cron). _snapshot_quota()
+# calls _ppq_quota_snapshot() instead of the old hardcoded dict. Revert-safe:
+# any failure → the old optimistic {'used_pct': 0.0} so routing never breaks.
 _ppq_quota_entry_fn = None
 try:
-    from src.ppq_balance_collector import ppq_quota_entry as _ppq_quota_entry_fn
+    from src.balance_collectors import ppq_quota_entry as _ppq_quota_entry_fn
     print("[ppq] balance bridge loaded — quota_state['ppq'] reads real credit balance",
           flush=True)
 except Exception as _pqe:
@@ -296,15 +296,16 @@ except Exception as _pqe:
 # ── OpenRouter credit-balance bridge (T1T3) ──────────────────────────────────
 # quota_state['openrouter'] was hardcoded {used_pct:0.0, remaining:inf} — credit
 # depletion never reached the pricing engine. Mirrors the PPQ bridge above:
-# imports openrouter_quota_entry (reads newest 'openrouter' row from
-# provider_balances, written by the every-5min openrouter_balance_collector
-# cron). Revert-safe: any failure → old optimistic {used_pct:0.0, remaining:inf}
-# so routing never breaks. REVERT: delete this block + restore the one-line
-# hardcode `snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}`
+# imports openrouter_quota_entry from the merged balance_collectors module
+# (reads newest 'openrouter' row from provider_balances, written by the
+# every-5min balance_collectors --provider openrouter cron). Revert-safe: any
+# failure → old optimistic {used_pct:0.0, remaining:inf} so routing never
+# breaks. REVERT: delete this block + restore the one-line hardcode
+# `snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}`
 # in _snapshot_quota().
 _openrouter_quota_entry_fn = None
 try:
-    from src.openrouter_balance_collector import openrouter_quota_entry as _openrouter_quota_entry_fn
+    from src.balance_collectors import openrouter_quota_entry as _openrouter_quota_entry_fn
     print("[openrouter] balance bridge loaded — quota_state['openrouter'] reads real credit balance",
           flush=True)
 except Exception as _oqe:
@@ -371,6 +372,10 @@ def _load_external_keys():
                     keys["deepinfra"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("DEEPINFRA_STARTING_BALANCE=") and "deepinfra_balance" not in keys:
                     keys["deepinfra_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("TELNYX_API_KEY=") and "telnyx" not in keys:
+                    keys["telnyx"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("TELNYX_STARTING_BALANCE=") and "telnyx_balance" not in keys:
+                    keys["telnyx_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
@@ -384,9 +389,20 @@ DEEPINFRA_KEY = _EXTERNAL_KEYS.get("deepinfra", "")
 DEEPINFRA_BASE = "https://api.deepinfra.com/v1/openai"
 DEEPINFRA_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("deepinfra_balance", "5.0") or "5.0")
 
+# Telnyx — Kimi K3 failover provider (demo endpoint needs no API key)
+# Demo endpoint: POST https://telnyx.com/api/inference (10 req/min, SSE streaming)
+# Production API: https://api.telnyx.com/v2/ai (requires account + API key)
+TELNYX_KEY = _EXTERNAL_KEYS.get("telnyx", "")
+TELNYX_BASE = "https://api.telnyx.com/v2/ai"
+TELNYX_DEMO_URL = "https://telnyx.com/api/inference"
+TELNYX_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("telnyx_balance", "10.0") or "10.0")
+
+# Models that have Telnyx fallback when Ollama Cloud fails
+_TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud"}
+
 # Provider priority for failover sort (lower = tried first).
 # DeepInfra preferred over PPQ because of prompt-caching discounts.
-_PROVIDER_PRIORITY = {"deepinfra": 0, "ppq": 1, "openrouter": 2}
+_PROVIDER_PRIORITY = {"deepinfra": 0, "telnyx": 1, "ppq": 2, "openrouter": 3}
 
 # Per-provider model name translation.
 # PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
@@ -398,12 +414,20 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
         "glm-5.2":                    "zai-org/GLM-5.2",
     },
+    "telnyx": {
+        "kimi-k3:cloud":  "moonshotai/Kimi-K3",
+        "kimi-k2.7-code": "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
+    },
 }
 
 EXTERNAL_PROVIDERS = {
     "deepinfra": {
         "base_url": DEEPINFRA_BASE,
         "key": DEEPINFRA_KEY,
+    },
+    "telnyx": {
+        "base_url": TELNYX_BASE,
+        "key": TELNYX_KEY,
     },
     "ppq": {
         "base_url": "https://api.ppq.ai/v1",
@@ -2332,6 +2356,100 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def _try_telnyx(self, body: bytes, model: str | None,
+                     response_buffer: bytearray, t0: float) -> bool:
+        """Forward request to Telnyx as failover for Kimi models.
+
+        Uses the demo endpoint (https://telnyx.com/api/inference) which
+        requires no API key — only browser-like Origin/Referer headers.
+        Rate-limited to 10 req/min per IP. Returns SSE stream.
+
+        If a production API key (TELNYX_KEY) is available, uses the
+        production endpoint instead (no rate limit).
+
+        Returns True on success (response already sent),
+        False on failure (caller should send 503).
+        """
+        # Skip if Telnyx was recently rate-limited (circuit breaker)
+        if not _is_key_healthy("telnyx"):
+            return False
+
+        # Map model name to Telnyx model ID
+        telnyx_model = _PROVIDER_MODEL_NAMES.get("telnyx", {}).get(
+            model or "", model or "")
+        if not telnyx_model:
+            return False
+
+        try:
+            body_json = json.loads(body) if body else {}
+            body_json["model"] = telnyx_model
+            fwd_body = json.dumps(body_json).encode()
+
+            # Use production API if key available, else demo endpoint
+            if TELNYX_KEY:
+                url = TELNYX_BASE + "/chat/completions"
+                hdrs = {
+                    "Authorization": f"Bearer {TELNYX_KEY}",
+                    "Content-Type": "application/json",
+                }
+            else:
+                url = TELNYX_DEMO_URL
+                hdrs = {
+                    "Content-Type": "application/json",
+                    "Origin": "https://telnyx.com",
+                    "Referer": "https://telnyx.com/products/inference",
+                    "User-Agent": "Mozilla/5.0",
+                }
+
+            req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                self.send_response(resp.status)
+                for h, v in resp.headers.items():
+                    if h.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(h, v)
+                self.send_header("X-Provider", "telnyx")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    response_buffer.extend(chunk)
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+                # Parse usage for spend tracking
+                telnyx_usage = _parse_usage(bytes(response_buffer))
+                telnyx_tokens = int(telnyx_usage.get("total_tokens") or 0)
+                _record_spend("telnyx", telnyx_model, telnyx_tokens)
+                self._spend_recorded = True
+                telnyx_cost, telnyx_cost_src = _extract_cost(
+                    "telnyx", bytes(response_buffer), telnyx_tokens)
+                _mark_key_healthy("telnyx")
+                _log_api_call(
+                    key_name="telnyx",
+                    key_suffix=TELNYX_KEY[-4:] if TELNYX_KEY else "demo",
+                    model=telnyx_model,
+                    prompt_tokens=int(telnyx_usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(telnyx_usage.get("completion_tokens") or 0),
+                    total_tokens=telnyx_tokens,
+                    tier="telnyx", status_code=resp.status, error=None,
+                    duration_ms=int((time.time() - t0) * 1000),
+                    cost_usd=telnyx_cost, cost_source=telnyx_cost_src,
+                )
+                _log_key_decision(
+                    chosen_key="telnyx",
+                    reason="ollama_cloud_failed_telnyx_fallback",
+                )
+                return True
+
+        except urllib.error.HTTPError as he:
+            if he.code == 429:
+                # Rate limited — mark telnyx as temporarily unhealthy
+                _mark_key_failure("telnyx", error_type="exhausted")
+            return False
+        except Exception:
+            return False
+
     def _try_external_failover(self, body: bytes, model: str | None,
                                 response_buffer: bytearray, t0: float,
                                 preferred: str | None = None) -> bool:
@@ -2507,11 +2625,16 @@ class Handler(BaseHTTPRequestHandler):
             response_buffer = bytearray()
             if self._try_ollama_cloud(body, original_model, response_buffer, t0):
                 return
-            # If ollama cloud fails for an ollama-only model, don't try z.ai
+            # Try Telnyx fallback for Kimi models before returning 503
+            if original_model in _TELNYX_FALLBACK_MODELS:
+                telnyx_buffer = bytearray()
+                if self._try_telnyx(body, original_model, telnyx_buffer, t0):
+                    return
+            # If both Ollama Cloud and Telnyx fail, return 503
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(f'{{"error":"ollama cloud failed for ollama-only model {original_model}"}}'.encode())
+            self.wfile.write(f'{{"error":"both ollama cloud and telnyx failed for ollama-only model {original_model}"}}'.encode())
             return
 
         # Step 1d + Step 2 — choose a routing key.

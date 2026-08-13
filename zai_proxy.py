@@ -1726,8 +1726,31 @@ _FALLBACK_RATES: dict[str, float] = {
     "friend":       0.001,    # shared z.ai subscription → marginal $0
     "ours":         0.001,    # z.ai subscription → marginal $0
     "deepinfra":    1.30,
-    "telnyx":       5.40,     # seed: blended kimi-k3 cost (2.70*3 + 13.50*1) / 4
+    "telnyx":       1.50,     # blended fallback (was 5.40 — 100x too high)
 }
+
+# ── Telnyx per-model rates ($/M tokens) ──────────────────────────────────────
+# Sourced from https://telnyx.com/ai/inference-models.json (2026-08-13).
+# Used by _extract_cost() for granular per-request cost tracking.
+# Calibration factor from periodic balance API checks adjusts these rates
+# to account for prompt-caching discounts (which Telnyx applies automatically).
+_TELNYX_MODEL_RATES: dict[str, dict[str, float]] = {
+    "moonshotai/Kimi-K3":           {"input": 2.70,  "output": 13.50},
+    "moonshotai/Kimi-K2.5":        {"input": 0.95,  "output": 4.00},
+    "moonshotai/Kimi-K2-5":        {"input": 0.95,  "output": 4.00},
+    "zai-org/GLM-5.2":             {"input": 1.40,  "output": 4.40},  # GLM-5.1-FP8 rate
+    "thudm/glm-5.1-fp8":           {"input": 1.40,  "output": 4.40},
+    "MiniMaxAI/MiniMax-M3-MXFP8":  {"input": 0.30,  "output": 1.20},
+    "minimax/minimax-m2-5":        {"input": 0.30,  "output": 1.20},
+    "openai/gpt-5":                {"input": 1.25,  "output": 10.00},
+    "anthropic/claude-haiku-4-5":  {"input": 1.00,  "output": 5.00},
+}
+
+# Calibration factor applied to telnyx cost estimates. Updated every 10 min
+# by _calibrate_telnyx_rates() in _refresh_loop() by comparing the real
+# balance API delta with the sum of estimated costs. Default 1.0 (no
+# calibration until the first balance check runs).
+_telnyx_calibration_factor: float = 1.0
 
 
 def _rpt_rate(provider: str, model: str | None = None) -> float:
@@ -1957,13 +1980,35 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 return (None, None)
             return ((total_tokens / 1_000_000) * rate, "estimated")
         # 4. telnyx — if no in-body cost was found (step 1), derive from
-        # token count × published rate so the balance collector (which sums
-        # cost_usd) has a non-zero signal. Source = 'rate_derived'.
+        # per-model rates × token breakdown so the balance collector (which
+        # sums cost_usd) has a non-zero signal. Source = 'rate_derived'.
+        # Calibration factor from periodic balance API checks adjusts for
+        # prompt-caching discounts (which Telnyx applies automatically).
         if provider == "telnyx":
-            rate = _rpt_rate("telnyx")
-            if rate == float("inf") or rate <= 0:
-                return (None, None)
-            return ((total_tokens / 1_000_000) * rate, "rate_derived")
+            usage = _parse_usage(bytes(response_buffer))
+            prompt_toks = int(usage.get("prompt_tokens") or 0)
+            completion_toks = int(usage.get("completion_tokens") or 0)
+            # Extract model from the response to look up per-model rates
+            model_name = None
+            try:
+                _obj = json.loads(bytes(response_buffer))
+                if isinstance(_obj, dict):
+                    model_name = _obj.get("model")
+            except Exception:
+                pass
+            rates = _TELNYX_MODEL_RATES.get(model_name or "", {})
+            if rates:
+                input_rate = rates.get("input", 0.95)
+                output_rate = rates.get("output", 4.00)
+                raw_cost = (prompt_toks * input_rate + completion_toks * output_rate) / 1_000_000
+            else:
+                # Fallback to blended rate if model not in table
+                rate = _rpt_rate("telnyx")
+                if rate == float("inf") or rate <= 0:
+                    return (None, None)
+                raw_cost = (total_tokens / 1_000_000) * rate
+            calibrated = raw_cost * _telnyx_calibration_factor
+            return (calibrated, "rate_derived")
         # 5. Unknown / unhandled provider.
         return (None, None)
     except Exception:
@@ -2125,8 +2170,61 @@ def is_key_locked(key_name: str, windows: list[dict]):
     return False, None, 0, 0
 
 
+def _calibrate_telnyx_rates():
+    """Calibrate Telnyx cost estimates against the real balance API.
+
+    Called every 10 minutes from _refresh_loop(). Queries the Telnyx balance
+    API, compares the real balance delta (since last check) with the sum of
+    estimated costs recorded in api_calls for the same period, and updates
+    _telnyx_calibration_factor to correct for prompt-caching discounts and
+    any rate discrepancies.
+
+    The calibration factor is applied to all future _extract_cost() results
+    for telnyx until the next calibration. This gives accurate spend tracking
+    without adding latency to individual requests.
+    """
+    global _telnyx_calibration_factor
+    try:
+        if not TELNYX_KEY:
+            return
+        # Query the real balance from Telnyx API
+        real_balance = _get_telnyx_balance()
+        if real_balance is None:
+            return
+        # Get the last calibration timestamp (or 10 min ago if first run)
+        last_ts = getattr(_calibrate_telnyx_rates, "_last_ts", time.time() - 600)
+        now = time.time()
+        # Sum estimated costs for telnyx since last calibration
+        try:
+            row = _usage_db().execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                "WHERE key_name = 'telnyx' AND ts >= ?",
+                (last_ts,)).fetchone()
+            estimated_spend = row[0] if row else 0.0
+        except Exception:
+            estimated_spend = 0.0
+        # Get the balance at last calibration (or starting balance if first run)
+        last_balance = getattr(_calibrate_telnyx_rates, "_last_balance", TELNYX_STARTING_BALANCE)
+        real_spend = last_balance - real_balance
+        # Calculate calibration factor
+        if estimated_spend > 0 and real_spend > 0:
+            factor = real_spend / estimated_spend
+            # Clamp to reasonable range (0.1x to 10x) to avoid wild swings
+            _telnyx_calibration_factor = max(0.1, min(10.0, factor))
+            print(f"[telnyx] calibration: real_spend=${real_spend:.4f} "
+                  f"estimated=${estimated_spend:.4f} factor={_telnyx_calibration_factor:.3f} "
+                  f"balance=${real_balance:.2f}", flush=True)
+        # Store state for next calibration
+        _calibrate_telnyx_rates._last_ts = now
+        _calibrate_telnyx_rates._last_balance = real_balance
+    except Exception:
+        pass  # calibration must never break the refresh loop
+
+
 def _refresh_loop():
+    _refresh_iteration = 0
     while True:
+        _refresh_iteration += 1
         with lock:
             for name, key in KEYS.items():
                 quota_cache[name] = (_fetch_quota_windows(key), time.time())
@@ -2157,6 +2255,11 @@ def _refresh_loop():
                         _pace_windows = pw
         except Exception:
             pass  # pace window computation must never block refresh
+        # ── Telnyx balance calibration (every 10 min = every 2nd iteration) ──
+        # Compares real Telnyx balance API with estimated costs to compute a
+        # calibration factor that corrects for prompt-caching discounts.
+        if _refresh_iteration % 2 == 0:
+            _calibrate_telnyx_rates()
         time.sleep(CACHE_TTL)
 
 
@@ -2561,10 +2664,11 @@ class Handler(BaseHTTPRequestHandler):
                 # Parse usage for spend tracking
                 telnyx_usage = _parse_usage(bytes(response_buffer))
                 telnyx_tokens = int(telnyx_usage.get("total_tokens") or 0)
-                _record_spend("telnyx", telnyx_model, telnyx_tokens)
-                self._spend_recorded = True
                 telnyx_cost, telnyx_cost_src = _extract_cost(
                     "telnyx", bytes(response_buffer), telnyx_tokens)
+                _record_spend("telnyx", telnyx_model, telnyx_tokens,
+                              actual_cost=telnyx_cost)
+                self._spend_recorded = True
                 _mark_key_healthy("telnyx")
                 _log_api_call(
                     key_name="telnyx",

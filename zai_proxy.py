@@ -423,11 +423,15 @@ print(f"[telnyx] key={'loaded' if TELNYX_KEY else 'MISSING'} "
       f"starting_balance=${TELNYX_STARTING_BALANCE:.2f}", flush=True)
 
 # Models that have Telnyx fallback when Ollama Cloud fails
-_TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud"}
+_TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud", "kimi-k3"}
+
+# Models that route DIRECTLY to Telnyx (bypass z.ai entirely — these models
+# don't exist on z.ai).  The proxy sends them straight to Telnyx's API.
+_TELNYX_DIRECT_MODELS = {"kimi-k3"}
 
 # Provider priority for failover sort (lower = tried first).
-# DeepInfra preferred over PPQ because of prompt-caching discounts.
-_PROVIDER_PRIORITY = {"deepinfra": 0, "ppq": 1, "openrouter": 2, "telnyx": 3}
+# Telnyx preferred over PPQ/OpenRouter for Kimi K3 (prompt caching support).
+_PROVIDER_PRIORITY = {"deepinfra": 0, "telnyx": 1, "ppq": 2, "openrouter": 3}
 
 # Per-provider model name translation.
 # PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
@@ -443,8 +447,10 @@ _PROVIDER_MODEL_NAMES = {
         "kimi-k3":         "moonshotai/Kimi-K3",
         "kimi-k2.5":       "moonshotai/Kimi-K2.5",
         "glm-5.2":         "zai-org/GLM-5.2",
+        "gpt-5":           "openai/gpt-5",
+        "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
         "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",
-        "kimi-k3:cloud":   "moonshotai/Kimi-K3",
+        "kimi-k3:cloud":   "moonshotai/Kimi-K2.5",  # Fallback to cheaper K2.5 (K3 costs extra on Ollama Cloud)
         "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
     },
 }
@@ -876,8 +882,21 @@ def _telnyx_quota_snapshot() -> dict:
     api_burn.db). Returns the cold-start ``{}`` marker when there is no/stale
     row, which the proxy maps to the optimistic ``{used_pct:0.0, remaining:inf}``
     below. Never raises.
+
+    Fallback: when the balance_collectors bridge is disabled, queries the
+    Telnyx balance API directly (https://api.telnyx.com/v2/balance) and
+    derives used_pct from the starting balance.
     """
     if _telnyx_quota_entry_fn is None:
+        # Direct API fallback — query Telnyx balance endpoint
+        balance = _get_telnyx_balance()
+        if balance is not None and TELNYX_STARTING_BALANCE > 0:
+            used_pct = max(0.0, (1.0 - balance / TELNYX_STARTING_BALANCE) * 100.0)
+            return {
+                "used_pct": round(used_pct, 2),
+                "remaining": balance,
+                "total": TELNYX_STARTING_BALANCE,
+            }
         return {"used_pct": 0.0, "remaining": float("inf")}
     try:
         entry = _telnyx_quota_entry_fn()
@@ -1729,13 +1748,16 @@ def _rpt_rate(provider: str, model: str | None = None) -> float:
 def _spend_tier(key_name: str | None) -> str:
     """Classify a request by key type for cost tracking.
     Key types: ours (z.ai subscription), friend (courtesy key),
-    ollama_cloud (flat-rate), deepinfra (pay-per-use with prompt caching)."""
+    ollama_cloud (flat-rate), deepinfra (pay-per-use with prompt caching),
+    telnyx/ppq/openrouter (paid external failover providers)."""
     if key_name in ("ours", "friend"):
         return key_name
     elif key_name == "ollama_cloud":
         return "ollama_cloud"
     elif key_name == "deepinfra":
         return "deepinfra"
+    elif key_name in ("telnyx", "ppq", "openrouter"):
+        return key_name
     return "unknown"
 
 
@@ -1866,6 +1888,34 @@ if DEEPINFRA_KEY:
     _init_deepinfra_balance()
 
 
+# ── Telnyx balance tracking (direct API) ────────────────────────────────────
+def _get_telnyx_balance() -> float | None:
+    """Fetch the current Telnyx account balance via the Telnyx API.
+
+    GET https://api.telnyx.com/v2/balance → response.data.balance (USD).
+    Returns None on any error (network, parse, auth). Never raises.
+    """
+    if not TELNYX_KEY:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.telnyx.com/v2/balance",
+            headers={
+                "Authorization": f"Bearer {TELNYX_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            # Telnyx balance API returns: {"data": {"balance": "12.34", ...}}
+            balance = data.get("data", {}).get("balance")
+            if balance is not None:
+                return float(balance)
+            return None
+    except Exception:
+        return None
+
+
 def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                   total_tokens: int = 0) -> tuple[float | None, str | None]:
     """Extract the real USD cost for one API call (RP-2).
@@ -1929,8 +1979,9 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     try:
         tier = _spend_tier(key_name)
         # Use manager cap for: ollama_cloud, friend (used for manager-tier work),
-        # deepinfra (preferred external failover). Default: worker cap.
-        if tier in ("ollama_cloud", "friend", "deepinfra"):
+        # deepinfra (preferred external failover), telnyx/ppq/openrouter (paid
+        # external failover). Default: worker cap.
+        if tier in ("ollama_cloud", "friend", "deepinfra", "telnyx", "ppq", "openrouter"):
             cap = _SPEND_CAP_MANAGER  # Manager-tier work, generous allowance
         else:  # ours or unknown
             cap = _SPEND_CAP_WORKER    # Default worker cap
@@ -1941,6 +1992,25 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
             (today, tier)).fetchone()
         current = row[0] if row else 0.0
         return (current < cap, current, cap)
+    except Exception:
+        return (True, 0.0, 0.0)
+
+
+def _check_global_spend_cap() -> tuple[bool, float, float]:
+    """Check total daily spend across ALL tiers against the manager cap.
+
+    Used as a pre-key-selection circuit breaker to prevent any single tier
+    from blocking all traffic when total spend is still within budget.
+    Returns (allowed, total_spend, cap).
+    """
+    try:
+        cap = _SPEND_CAP_MANAGER
+        today = _date.today().isoformat()
+        row = _usage_db().execute(
+            "SELECT COALESCE(SUM(spend_usd), 0.0) FROM daily_spend WHERE date=?",
+            (today,)).fetchone()
+        total = row[0] if row else 0.0
+        return (total < cap, total, cap)
     except Exception:
         return (True, 0.0, 0.0)
 
@@ -2509,7 +2579,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 _log_key_decision(
                     chosen_key="telnyx",
-                    reason="ollama_cloud_failed_telnyx_fallback",
+                    reason="telnyx_direct" if model in _TELNYX_DIRECT_MODELS else "ollama_cloud_failed_telnyx_fallback",
                 )
                 return True
 
@@ -2517,6 +2587,9 @@ class Handler(BaseHTTPRequestHandler):
             if he.code == 429:
                 # Rate limited — mark telnyx as temporarily unhealthy
                 _mark_key_failure("telnyx", error_type="exhausted")
+            elif he.code == 402:
+                # Out of credits — mark unfunded for 1 hour
+                _mark_unfunded("telnyx")
             return False
         except Exception:
             return False
@@ -2673,11 +2746,12 @@ class Handler(BaseHTTPRequestHandler):
         tier_hint = self.headers.get("X-Model-Tier", "")
 
         # Step 1b: Global spend cap — circuit breaker for runaway loops
-        allowed, current_spend, cap = _check_spend_cap("unknown")  # Pre-key selection check
+        # Use global sum across ALL tiers (not just "unknown") to prevent a
+        # single paid tier from blocking free/cheap providers.
+        allowed, current_spend, cap = _check_global_spend_cap()
         if not allowed:
-            tier = _spend_tier(original_model)
             err = json.dumps({
-                "error": f"daily spend cap exceeded for {tier}",
+                "error": f"daily spend cap exceeded (global)",
                 "spend_usd": round(current_spend, 4),
                 "cap_usd": cap,
                 "reset_at": "midnight local"
@@ -2707,6 +2781,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(f'{{"error":"both ollama cloud and telnyx failed for ollama-only model {original_model}"}}'.encode())
             return
+
+        # Step 1c-2: Telnyx-direct models — route directly to Telnyx.
+        # These models (e.g. kimi-k3) don't exist on z.ai or Ollama, so
+        # skip z.ai entirely and send straight to Telnyx's API.
+        if original_model in _TELNYX_DIRECT_MODELS and TELNYX_KEY:
+            response_buffer = bytearray()
+            if self._try_telnyx(body, original_model, response_buffer, t0):
+                return
+            # Telnyx failed — fall through to normal z.ai/failover chain
+            # (z.ai will also fail, but Ollama/external failover may work)
 
         # Step 1d + Step 2 — choose a routing key.
         #
@@ -3577,6 +3661,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"id": "glm-4.5-air", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "kimi-k2.7-code", "object": "model", "created": now, "owned_by": "ollama"},
                     {"id": "kimi-k3:cloud", "object": "model", "created": now, "owned_by": "ollama"},
+                    {"id": "kimi-k3", "object": "model", "created": now, "owned_by": "telnyx"},
                 ]
             }
             payload = json.dumps(models_data).encode()

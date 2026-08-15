@@ -1290,7 +1290,6 @@ try:
 except Exception:
     pass
 
-_PROACTIVE_COOLDOWN_SECONDS = 300          # 30-min hysteresis after a switch
 _PROACTIVE_PREDICTION_TTL   = 60            # cache predictions for 60 s
 _proactive_switch_state     = {"key": None, "until": 0.0}
 _prediction_cache: dict[str, tuple[list[dict], float]] = {}
@@ -1340,13 +1339,6 @@ def _will_exhaust(predictions: list[dict]) -> dict | None:
         if p.get("will_exhaust") and not p.get("note"):
             return p
     return None
-
-
-def _can_proactive_switch() -> bool:
-    """Hysteresis: once a proactive switch happens, don't switch back for
-    _PROACTIVE_COOLDOWN_SECONDS (30 min)."""
-    return not (_proactive_switch_state["key"] is not None
-                and time.time() < _proactive_switch_state["until"])
 
 
 def _usage_db() -> sqlite3.Connection:

@@ -405,13 +405,23 @@ def predict_exhaustion(key_name: str) -> list[dict]:
 
 
 def predict_all() -> dict:
-    """Get predictions for both keys."""
-    return {
-        "ours": predict_exhaustion("ours"),
-        "friend": predict_exhaustion("friend"),
+    """Get predictions for all keys that actually burn tokens.
+
+    Keys with ZERO burn-history rows (dead/deactivated keys — e.g. 'ours'
+    since 2026-08-15) are skipped entirely: with no data there is nothing
+    to project, and emitting per-window insufficient_data dicts was pure
+    noise for consumers. Keys with sparse-but-nonzero history still emit
+    their predict_exhaustion output unchanged.
+    """
+    out: dict = {
         "timestamp": _utc_now(),
         "method": "kalman" if _HAS_NUMPY else "none",
     }
+    for key_name in ("ours", "friend"):
+        if not _get_burn_history(key_name):
+            continue  # zero-history key: skip, no insufficient_data noise
+        out[key_name] = predict_exhaustion(key_name)
+    return out
 
 
 # ── Multi-Resource Prediction API ──────────────────────────────────────────────

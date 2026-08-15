@@ -331,6 +331,29 @@ except Exception as _tqe:
     print(f"[telnyx] balance bridge DISABLED — {_tqe}", flush=True)
     _telnyx_quota_entry_fn = None
 
+_routstr_quota_entry_fn = None
+try:
+    from src.balance_collectors import routstr_quota_entry as _routstr_quota_entry_fn
+    print("[routstr] balance bridge loaded — quota_state['routstr'] reads real sats balance",
+          flush=True)
+except Exception as _rqe:
+    print(f"[routstr] balance bridge DISABLED — {_rqe}", flush=True)
+    _routstr_quota_entry_fn = None
+
+# ── ProfitTracker (consumer-mode savings ledger, MRE Phase 2.3) ─────────────
+# Records every external-failover routing decision + savings vs the next-best
+# alternative into the routing_profit table. Fire-and-forget daemon writer;
+# revert-safe (None → calls are skipped).
+_PROFIT_TRACKER = None
+try:
+    from src.profit_tracker import ProfitTracker as _ProfitTrackerCls
+    _PROFIT_TRACKER = _ProfitTrackerCls()
+    print("[profit] ProfitTracker loaded — routing_profit savings ledger active",
+          flush=True)
+except Exception as _pte:
+    print(f"[profit] ProfitTracker DISABLED — {_pte}", flush=True)
+    _PROFIT_TRACKER = None
+
 # ── config ──────────────────────────────────────────────────────────────────
 def _load_keys():
     """Load keys from the manager .env (gitignored, never in repo)."""
@@ -396,6 +419,14 @@ def _load_external_keys():
                     keys["telnyx"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("TELNYX_STARTING_BALANCE=") and "telnyx_balance" not in keys:
                     keys["telnyx_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTR_API_KEY=") and "routstr" not in keys:
+                    keys["routstr"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTR_BASE=") and "routstr_base" not in keys:
+                    keys["routstr_base"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTRD_API_KEY=") and "routstrd" not in keys:
+                    keys["routstrd"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTRD_BASE=") and "routstrd_base" not in keys:
+                    keys["routstrd_base"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
@@ -453,6 +484,17 @@ _PROVIDER_MODEL_NAMES = {
         "kimi-k3:cloud":   "moonshotai/Kimi-K2.5",  # Fallback to cheaper K2.5 (K3 costs extra on Ollama Cloud)
         "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
     },
+    "openrouter": {
+        "glm-5.2":                    "z-ai/glm-5.2",
+        "kimi-k3":                    "moonshotai/kimi-k3",
+        "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro":    "deepseek/deepseek-v4-pro",
+    },
+    "ppq": {
+        "glm-5.2":                    "z-ai/glm-5.2",
+        "kimi-k3":                    "moonshotai/kimi-k3",
+        "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
+    },
 }
 
 EXTERNAL_PROVIDERS = {
@@ -471,6 +513,18 @@ EXTERNAL_PROVIDERS = {
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "key": _EXTERNAL_KEYS.get("openrouter", ""),
+    },
+    "routstr": {
+        # Our own VPS2 routstr node — z.ai-backed upstream, Cashu-metered.
+        # Identity model mapping (node uses the same IDs as us).
+        "base_url": _EXTERNAL_KEYS.get("routstr_base", "http://23.182.128.51:8009") + "/v1",
+        "key": _EXTERNAL_KEYS.get("routstr", ""),
+    },
+    "routstrd": {
+        # Local routstrd daemon — buys from cheapest network node via Cashu.
+        # Model IDs come from the network catalog (same short IDs as ours).
+        "base_url": _EXTERNAL_KEYS.get("routstrd_base", "http://localhost:8008") + "/v1",
+        "key": _EXTERNAL_KEYS.get("routstrd", ""),
     },
 }
 
@@ -494,7 +548,7 @@ def _is_peak_hour() -> bool:
 # Tracks which providers have credits remaining. A 402 response marks a
 # provider unfunded for 1 hour (credits may be replenished). The failover
 # logic only tries funded providers, sorted by cost.
-_UNFUNDED_RETRY_SECONDS = 3600  # retry unfunded provider after 1 hour
+_UNFUNDED_RETRY_SECONDS = 300  # retry unfunded provider after 5 min
 
 _provider_health: dict[str, dict] = {}
 
@@ -561,6 +615,59 @@ _zai_key_health: dict[str, dict] = {}
 def _disabled_flag_path(name: str) -> Path:
     """Filesystem flag path used to manually disable key *name*."""
     return Path.home() / ".hermes" / "bot" / f".key_disabled_{name}"
+
+
+# ── Ollama Cloud paywall flag (G1/G2) ───────────────────────────────────────
+# Ollama signals quota exhaustion on the largest plan as 403 "requires a
+# subscription" — NOT 429 — and the quota tracker's LOCAL token counting
+# can't see the server-side weekly window. The 403 handler arms this file
+# with the next Monday-00:00-UTC reset (minus probe margin). While fresh:
+#   * _is_key_healthy('ollama_cloud') → False (skip round-trips)
+#   * quota state used_pct=100 → quota_pressure +inf (price-level avoidance)
+_OLLAMA_PAYWALL_FLAG = Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until"
+
+
+def _next_monday_utc(now: float | None = None) -> float:
+    """Next Monday 00:00 UTC strictly after *now* (86400*4 probe margin is
+    subtracted by the caller, not here)."""
+    import datetime as _dt
+    now = now if now is not None else time.time()
+    d = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
+    days_ahead = (7 - d.weekday()) % 7  # Monday=0
+    if days_ahead == 0 and d.time() == _dt.time(0, 0):
+        days_ahead = 7
+    nxt = (d + _dt.timedelta(days=days_ahead)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return nxt.timestamp()
+
+
+def _arm_ollama_paywall_flag() -> float:
+    """Arm the paywall flag until next Monday 00:00 UTC minus a 4h probe
+    margin. Returns the armed expiry. Never raises."""
+    try:
+        until = _next_monday_utc() - 4 * 3600
+        _OLLAMA_PAYWALL_FLAG.write_text(str(until))
+        return until
+    except Exception:
+        return 0.0
+
+
+def _ollama_paywall_active() -> bool:
+    """True while the persisted paywall flag is fresh. Never raises."""
+    try:
+        if not _OLLAMA_PAYWALL_FLAG.exists():
+            return False
+        return time.time() < float(_OLLAMA_PAYWALL_FLAG.read_text().strip())
+    except Exception:
+        return False
+
+
+def _clear_ollama_paywall_flag() -> None:
+    """Clear the paywall flag (Monday reset confirmed by a probe)."""
+    try:
+        _OLLAMA_PAYWALL_FLAG.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _is_manually_disabled(name: str) -> bool:
@@ -637,6 +744,10 @@ def _is_key_healthy(name: str) -> bool:
     Re-enable by removing the file, e.g.:
         rm ~/.hermes/bot/.key_disabled_ours
     """
+    # G2: Ollama paywall flag — skip round-trips while the largest plan is
+    # quota-exhausted (403) until the Monday reset.
+    if name == "ollama_cloud" and _ollama_paywall_active():
+        return False
     # Manual disable via flag file — checked first, overrides everything.
     try:
         if (Path.home() / ".hermes" / "bot" / f".key_disabled_{name}").exists():
@@ -777,9 +888,35 @@ def _mark_funded(name: str) -> None:
 
 def _get_provider_cost(name: str, model_id: str) -> float:
     """Look up the combined cost per 1M tokens for a model on a provider.
-    Reads from model_matrix.json if available; then real_price_tracker (RP-4);
-    finally falls back to PPQ_PRICING dict. Returns 999.0 if unknown."""
-    # Try model_matrix.json first (live pricing)
+    Resolution: per-model rate tables → model_matrix.json → real_price_tracker → PPQ_PRICING.
+    Returns 999.0 if unknown."""
+    # 1. Per-model rate tables (accurate, verified from provider APIs)
+    provider_model = _MODEL_ID_TO_PROVIDER_ID.get(model_id, {}).get(name)
+    if provider_model:
+        rates = None
+        if name == "telnyx":
+            rates = _TELNYX_MODEL_RATES.get(provider_model)
+            if rates:
+                return _blended_rate(rates["input"], rates["output"]) * _telnyx_calibration_factor
+        elif name == "openrouter":
+            rates = _OPENROUTER_MODEL_RATES.get(provider_model)
+            if rates:
+                return _blended_rate(rates["input"], rates["output"])
+        elif name == "ppq":
+            rates = _PPQ_MODEL_RATES.get(provider_model)
+            if rates:
+                return _blended_rate(rates["input"], rates["output"])
+    # 1b. Routstr/routstrd: fully dynamic rates from the node/daemon catalogs
+    # (no static table — prices come from their pricing engines, BTC-indexed).
+    if name == "routstr":
+        rate = _get_routstr_rates().get(model_id)
+        if rate is not None:
+            return rate
+    elif name == "routstrd":
+        rate = _get_routstrd_rates().get(model_id)
+        if rate is not None:
+            return rate
+    # 2. Try model_matrix.json (live pricing)
     try:
         matrix_path = BOT / "model_matrix.json"
         if matrix_path.exists():
@@ -793,7 +930,7 @@ def _get_provider_cost(name: str, model_id: str) -> float:
                     return k.get("cost_per_1m_offpeak", k.get("cost_per_1m_combined", 999.0))
     except Exception:
         pass
-    # RP-4: Try real_price_tracker (measured rates)
+    # 3. Try real_price_tracker (measured rates)
     if _rpt_get_rate is not None:
         try:
             tracked = _rpt_get_rate(name, model_id)
@@ -801,7 +938,7 @@ def _get_provider_cost(name: str, model_id: str) -> float:
                 return tracked
         except Exception:
             pass
-    # Last-resort fallback to known pricing
+    # 4. Last-resort fallback to known pricing
     from model_matrix import PPQ_PRICING
     pricing = PPQ_PRICING.get(model_id, PPQ_PRICING.get(model_id.lower(), (0.14, 0.28)))
     return pricing[0] + pricing[1]
@@ -813,7 +950,7 @@ MODEL_TIER_MAP: dict[str, str] = {
     "flash": "glm-4.5-flash",
     "air":   "glm-4.5-air",
     "mid":   "glm-4.5",
-    "heavy": "glm-5.2",
+    "heavy": "glm-5.3",
 }
 
 # ── usage logging DB (separate from response_cache.db) ──────────────────────
@@ -907,6 +1044,23 @@ def _telnyx_quota_snapshot() -> dict:
         return {"used_pct": 0.0, "remaining": float("inf")}
 
 
+def _routstr_quota_snapshot() -> dict:
+    """quota_state['routstr'] from the balance bridge (provider_balances).
+
+    Cold-start / bridge-disabled / stale row → optimistic fallback so
+    routing never breaks. Never raises.
+    """
+    if _routstr_quota_entry_fn is None:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+    try:
+        entry = _routstr_quota_entry_fn()
+        return entry if isinstance(entry, dict) else {
+            "used_pct": 0.0, "remaining": float("inf"),
+        }
+    except Exception:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -923,6 +1077,12 @@ def _snapshot_quota() -> dict:
         # Ollama Cloud — real quota from ollama_quota_tracker (EUv2-5)
         oc_status = _get_ollama_quota_status()
         oc_used_pct = max(oc_status["session_used_pct"], oc_status["weekly_used_pct"])
+        # G2: while the 403-paywall flag is fresh, force used_pct=100 so
+        # quota_pressure sends the effective price to +inf (the paywall has
+        # no extra-usage path) — the router avoids Ollama on PRICE, not just
+        # health. Local token counting can't see the server-side window.
+        if _ollama_paywall_active():
+            oc_used_pct = 100.0
         # Use the session limit for remaining/total display
         oc_total = _OC_SESSION_LIMIT
         oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0))
@@ -930,7 +1090,7 @@ def _snapshot_quota() -> dict:
             "used_pct": float(oc_used_pct),
             "remaining": oc_remaining,
             "total": oc_total,
-            "regime": oc_status["regime"],
+            "regime": "paywalled" if _ollama_paywall_active() else oc_status["regime"],
             "session_used_pct": oc_status["session_used_pct"],
             "weekly_used_pct": oc_status["weekly_used_pct"],
             "session_tokens": oc_status["session_tokens"],
@@ -940,6 +1100,7 @@ def _snapshot_quota() -> dict:
         snap["ppq"] = _ppq_quota_snapshot()  # P3-PPQ: real credit balance
         snap["openrouter"] = _openrouter_quota_entry_snapshot()  # T1T3: real credit balance
         snap["telnyx"] = _telnyx_quota_snapshot()  # TELNYX-3.2: real balance
+        snap["routstr"] = _routstr_quota_snapshot()  # VPS2 node sats balance
     except Exception:
         pass
     return snap
@@ -1746,6 +1907,139 @@ _TELNYX_MODEL_RATES: dict[str, dict[str, float]] = {
     "anthropic/claude-haiku-4-5":  {"input": 1.00,  "output": 5.00},
 }
 
+# OpenRouter per-model rates (from openrouter.ai/api/v1/models, 2026-08-14).
+# Used by _get_provider_cost so the failover sorts by REAL prices.
+_OPENROUTER_MODEL_RATES: dict[str, dict[str, float]] = {
+    "z-ai/glm-5.2":                {"input": 0.63,  "output": 1.98},
+    "moonshotai/kimi-k3":          {"input": 3.00,  "output": 15.00},
+    "deepseek/deepseek-v4-flash":  {"input": 0.14,  "output": 0.28},
+    "deepseek/deepseek-v4-pro":    {"input": 0.53,  "output": 2.12},
+}
+
+# PPQ per-model rates (from api.ppq.ai/v1/models pricing field, 2026-08-14).
+_PPQ_MODEL_RATES: dict[str, dict[str, float]] = {
+    "z-ai/glm-5.2":                {"input": 1.477,  "output": 4.642},
+    "moonshotai/kimi-k3":          {"input": 3.165,  "output": 15.825},
+    "deepseek/deepseek-v4-flash":  {"input": 0.1477, "output": 0.2954},
+}
+
+# Map proxy model IDs to provider-specific model IDs for rate lookup.
+# The proxy uses short IDs (e.g. "glm-5.2") but providers use vendor-prefixed IDs.
+_MODEL_ID_TO_PROVIDER_ID: dict[str, dict[str, str]] = {
+    "glm-5.2": {
+        "telnyx": "zai-org/GLM-5.2",
+        "openrouter": "z-ai/glm-5.2",
+        "ppq": "z-ai/glm-5.2",
+    },
+    "kimi-k3": {
+        "telnyx": "moonshotai/Kimi-K3",
+        "openrouter": "moonshotai/kimi-k3",
+        "ppq": "moonshotai/kimi-k3",
+    },
+    "deepseek/deepseek-v4-flash": {
+        "openrouter": "deepseek/deepseek-v4-flash",
+        "ppq": "deepseek/deepseek-v4-flash",
+    },
+}
+
+# Blended rate ratio: typical LLM usage is ~3:1 input:output tokens.
+# Used to compute a single $/M number from input + output rates.
+_BLENDED_RATIO_INPUT = 0.75  # 3 parts input
+_BLENDED_RATIO_OUTPUT = 0.25  # 1 part output
+
+
+def _blended_rate(input_rate: float, output_rate: float) -> float:
+    """Compute blended $/M from input + output rates (3:1 ratio)."""
+    return input_rate * _BLENDED_RATIO_INPUT + output_rate * _BLENDED_RATIO_OUTPUT
+
+
+# Cached Routstr model rates (dynamic — refreshed every 10 min from the node's
+# /v1/models endpoint, which is auth-free). Returns {model_id: blended_usd_per_M}.
+_routstr_rates_cache: dict = {"rates": None, "ts": 0.0}
+# Same, for the local routstrd daemon (network catalog prices).
+_routstrd_rates_cache: dict = {"rates": None, "ts": 0.0}
+
+# Endpoint liveness probes (5-min cache). A routstr/routstrd endpoint that
+# accepts TCP but cannot serve (e.g. VPS2 memory pressure, dead Cashu mint)
+# would otherwise stall the failover chain for the full 180s timeout.
+_endpoint_alive_cache: dict = {"probes": {}, "ts": 0.0}
+
+
+def _endpoint_alive(base_url: str) -> bool:
+    """Cheap GET health probe with a 5-min cache. Never raises."""
+    now = time.time()
+    probes = _endpoint_alive_cache["probes"]
+    if now - _endpoint_alive_cache["ts"] > 300:
+        probes.clear()
+        _endpoint_alive_cache["ts"] = now
+    if base_url in probes:
+        return probes[base_url]
+    alive = False
+    try:
+        root = base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        path = "/health" if ":8008" in root else "/v1/models"
+        req = urllib.request.Request(root + path, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            alive = 200 <= resp.status < 500
+    except Exception:
+        alive = False
+    probes[base_url] = alive
+    return alive
+
+
+def _get_routstr_rates() -> dict:
+    """Fetch per-model blended $/M rates from our Routstr node (10-min cache).
+
+    The node's /v1/models returns per-token USD pricing in
+    pricing.prompt / pricing.completion. Multiply by 1e6 and blend 3:1.
+    Never raises; on failure returns the last known cache (or {}).
+    """
+    if time.time() - _routstr_rates_cache["ts"] < 600 and _routstr_rates_cache["rates"] is not None:
+        return _routstr_rates_cache["rates"]
+    base = _EXTERNAL_KEYS.get("routstr_base", "http://23.182.128.51:8009")
+    rates = _fetch_openrouter_style_rates(base, _routstr_rates_cache)
+    return rates
+
+
+def _get_routstrd_rates() -> dict:
+    """Per-model blended $/M rates from the local routstrd daemon (10-min cache).
+
+    The daemon's /v1/models is auth-free and returns network-catalog prices
+    in pricing.prompt / pricing.completion per token. Never raises.
+    """
+    if time.time() - _routstrd_rates_cache["ts"] < 600 and _routstrd_rates_cache["rates"] is not None:
+        return _routstrd_rates_cache["rates"]
+    base = _EXTERNAL_KEYS.get("routstrd_base", "http://localhost:8008")
+    return _fetch_openrouter_style_rates(base, _routstrd_rates_cache)
+
+
+def _fetch_openrouter_style_rates(base: str, cache: dict) -> dict:
+    """Shared fetcher for OpenAI-style /v1/models pricing (per-token USD)."""
+    try:
+        root = base.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        req = urllib.request.Request(root + "/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        rates: dict[str, float] = {}
+        for m in data.get("data", []):
+            pricing = m.get("pricing", {}) or {}
+            try:
+                p = float(pricing.get("prompt", 0) or 0)
+                c = float(pricing.get("completion", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            rates[m.get("id", "")] = _blended_rate(p * 1e6, c * 1e6)
+        if rates:
+            cache["rates"] = rates
+            cache["ts"] = time.time()
+        return cache.get("rates", {}) or {}
+    except Exception:
+        return cache.get("rates", {}) or {}
+
 # Calibration factor applied to telnyx cost estimates. Updated every 10 min
 # by _calibrate_telnyx_rates() in _refresh_loop() by comparing the real
 # balance API delta with the sum of estimated costs. Default 1.0 (no
@@ -1772,14 +2066,14 @@ def _spend_tier(key_name: str | None) -> str:
     """Classify a request by key type for cost tracking.
     Key types: ours (z.ai subscription), friend (courtesy key),
     ollama_cloud (flat-rate), deepinfra (pay-per-use with prompt caching),
-    telnyx/ppq/openrouter (paid external failover providers)."""
+    telnyx/ppq/openrouter/routstr (paid external failover providers)."""
     if key_name in ("ours", "friend"):
         return key_name
     elif key_name == "ollama_cloud":
         return "ollama_cloud"
     elif key_name == "deepinfra":
         return "deepinfra"
-    elif key_name in ("telnyx", "ppq", "openrouter"):
+    elif key_name in ("telnyx", "ppq", "openrouter", "routstr", "routstrd"):
         return key_name
     return "unknown"
 
@@ -1846,6 +2140,293 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
             (today, tier, cost, total_tokens))
     except Exception:
         pass
+
+
+# ── PPQ good-use policy (D6) ─────────────────────────────────────────────────
+# Guardrails for when PPQ (api.ppq.ai) is refilled and again eligible as the
+# last-resort external failover. Before D6, PPQ burned 21.6M tokens in 48h via
+# unattended fallback traffic. Policy, enforced BEFORE any PPQ request:
+#
+#   * daily spend cap        (default $2.00/day)  — PPQ suspended at cap
+#   * max requests per hour  (default 20)         — hard rate ceiling
+#   * crash-retry-storm block (same request-body sha256 attempted >=3 times
+#     within 10 minutes = crash-loop signature; PPQ refuses that prompt —
+#     other prompts unaffected, failover falls through to openrouter)
+#   * warning at 80% of the daily cap, raised through the existing
+#     anomaly_events chain (anomaly-notify.sh 5-min cron delivers it;
+#     alert_dedup.py backoff applies)
+#
+# Config precedence: PPQ_* env vars > ~/.hermes/bot/ppq_policy.json > defaults.
+# Runtime state lives in the `ppq_daily_used` table in zai_usage.db — one row
+# per day (spend_usd, requests, tokens, storm_blocked, per-hour counts).
+# Fail-open on internal errors: a broken tracker must not block failover, the
+# caps themselves are the safety net and they never raise.
+
+PPQ_POLICY_FILE = Path.home() / ".hermes" / "bot" / "ppq_policy.json"
+_PPQ_POLICY_DEFAULTS: dict = {
+    "enabled": True,
+    "daily_cap_usd": 2.0,
+    "max_requests_per_hour": 20,
+    "storm_min_hits": 3,
+    "storm_window_s": 600,
+    "alert_pct": 0.8,
+}
+_ppq_policy_cache: tuple[float, dict] = (0.0, dict(_PPQ_POLICY_DEFAULTS))
+_ppq_prompt_attempts: dict[str, list[float]] = {}   # sha256(body) -> [timestamps]
+_ppq_state_lock = threading.Lock()
+
+_PPQ_ANOMALY_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS anomaly_events (\n"
+    "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "    ts REAL NOT NULL,\n"
+    "    severity TEXT NOT NULL,\n"
+    "    category TEXT NOT NULL,\n"
+    "    title TEXT,\n"
+    "    detail TEXT,\n"
+    "    alerted INTEGER DEFAULT 0,\n"
+    "    resolved INTEGER DEFAULT 0\n"
+    ")"
+)
+
+
+def _ppq_policy() -> dict:
+    """Merged PPQ policy: env vars override ppq_policy.json overrides defaults.
+
+    Cached for 60s — the failover path is rare (z.ai down), so a cached
+    dict lookup per call is effectively free and keeps file IO off the
+    hot path.
+    """
+    global _ppq_policy_cache
+    now = time.time()
+    cached_at, cached = _ppq_policy_cache
+    if now - cached_at < 60:
+        return cached
+    merged = dict(_PPQ_POLICY_DEFAULTS)
+    try:
+        with open(PPQ_POLICY_FILE) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            merged.update(loaded)
+    except Exception:
+        pass  # no/invalid policy file -> defaults
+    for env_key, cfg_key, conv in (
+        ("PPQ_POLICY_ENABLED", "enabled",
+         lambda v: str(v).strip().lower() not in ("0", "false", "no", "off")),
+        ("PPQ_DAILY_CAP_USD", "daily_cap_usd", float),
+        ("PPQ_MAX_REQ_PER_HOUR", "max_requests_per_hour", int),
+        ("PPQ_STORM_MIN_HITS", "storm_min_hits", int),
+        ("PPQ_STORM_WINDOW_S", "storm_window_s", int),
+        ("PPQ_ALERT_PCT", "alert_pct", float),
+    ):
+        raw = os.environ.get(env_key)
+        if raw is not None and raw.strip() != "":
+            try:
+                merged[cfg_key] = conv(raw)
+            except (TypeError, ValueError):
+                pass
+    _ppq_policy_cache = (now, merged)
+    return merged
+
+
+def _ppq_hash_body(body: bytes) -> str:
+    """Stable identity of a chat request for storm detection.
+
+    Hashes the raw client body as received (before per-provider model
+    rewriting) — a crash-retry loop re-sends byte-identical payloads.
+    """
+    import hashlib
+    return hashlib.sha256(body or b"").hexdigest()
+
+
+def _ppq_today() -> str:
+    return _date.today().isoformat()
+
+
+def _ppq_hour_bucket() -> str:
+    """UTC hour bucket, e.g. '2026-08-15T14' — matches alert/usage day basis."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def _ppq_usage_row() -> dict:
+    """Today's ppq_daily_used row (zeroed dict when absent). Creates table."""
+    today = _ppq_today()
+    db = _usage_db()
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS ppq_daily_used (\n"
+        "    date TEXT PRIMARY KEY,\n"
+        "    spend_usd REAL NOT NULL DEFAULT 0,\n"
+        "    requests INTEGER NOT NULL DEFAULT 0,\n"
+        "    tokens INTEGER NOT NULL DEFAULT 0,\n"
+        "    storm_blocked INTEGER NOT NULL DEFAULT 0,\n"
+        "    hour_requests TEXT NOT NULL DEFAULT '{}',\n"
+        "    last_ts REAL NOT NULL DEFAULT 0\n"
+        ")"
+    )
+    # Day rollover hygiene: auto-resolve yesterday's ppq_budget anomalies so
+    # the anomaly chain doesn't show stale alerts after the cap resets.
+    try:
+        day_start = time.mktime(time.strptime(today, "%Y-%m-%d"))
+        db.execute(
+            "UPDATE anomaly_events SET resolved=1 "
+            "WHERE category='ppq_budget' AND resolved=0 AND ts < ?",
+            (day_start,))
+    except Exception:
+        pass
+    row = db.execute(
+        "SELECT spend_usd, requests, tokens, storm_blocked, hour_requests, last_ts "
+        "FROM ppq_daily_used WHERE date=?", (today,)).fetchone()
+    if row is None:
+        return {"date": today, "spend_usd": 0.0, "requests": 0, "tokens": 0,
+                "storm_blocked": 0, "hour_requests": "{}", "last_ts": 0.0}
+    return {"date": today, "spend_usd": float(row[0]), "requests": int(row[1]),
+            "tokens": int(row[2]), "storm_blocked": int(row[3]),
+            "hour_requests": row[4] or "{}", "last_ts": float(row[5])}
+
+
+def _ppq_alert(severity: str, title: str, detail: str) -> None:
+    """Raise an anomaly via the existing anomaly_events chain. Never raises.
+
+    anomaly-notify.sh (5-min no-agent cron) delivers unalerted+unresolved
+    events; alert_dedup.py applies exponential backoff on repeated stable
+    titles. Local dedup: one unresolved alert per title at a time.
+    """
+    try:
+        db = _usage_db()
+        db.execute(_PPQ_ANOMALY_SCHEMA)
+        dup = db.execute(
+            "SELECT 1 FROM anomaly_events WHERE category='ppq_budget' "
+            "AND title=? AND resolved=0", (title,)).fetchone()
+        if dup:
+            return
+        db.execute(
+            "INSERT INTO anomaly_events (ts, severity, category, title, detail, "
+            "alerted, resolved) VALUES (?,?, 'ppq_budget', ?,?,0,0)",
+            (time.time(), severity, title, detail))
+        print(f"[ppq-policy] ALERT [{severity}] {title}: {detail}", flush=True)
+    except Exception as e:
+        print(f"[ppq-policy] anomaly insert failed: {e}", flush=True)
+
+
+def _ppq_gate_ok(prompt_hash: str) -> tuple[bool, str]:
+    """Decide whether PPQ may serve this request. Pure-local, no network.
+
+    Returns (ok, reason). reason explains the block in [ppq-policy] logs.
+    Fail-open: if the tracker read raises, PPQ is allowed (the 402 path and
+    spend caps downstream still bound the damage).
+    """
+    pol = _ppq_policy()
+    if not pol.get("enabled", True):
+        return True, "policy_disabled"
+    try:
+        usage = _ppq_usage_row()
+    except Exception as e:
+        print(f"[ppq-policy] tracker read failed ({e}) — fail-open", flush=True)
+        return True, "tracker_error_fail_open"
+    try:
+        if usage["spend_usd"] >= float(pol["daily_cap_usd"]):
+            _ppq_alert(
+                "critical", "PPQ daily cap reached",
+                f"${usage['spend_usd']:.2f} of ${float(pol['daily_cap_usd']):.2f} "
+                f"used today — PPQ failover suspended until the cap resets at 00:00")
+            return False, (f"daily_cap ${usage['spend_usd']:.2f}/"
+                           f"${float(pol['daily_cap_usd']):.2f}")
+        hours = json.loads(usage["hour_requests"] or "{}")
+        this_hour = int(hours.get(_ppq_hour_bucket(), 0))
+        if this_hour >= int(pol["max_requests_per_hour"]):
+            return False, (f"hourly_cap {this_hour}/"
+                           f"{int(pol['max_requests_per_hour'])}")
+    except Exception as e:
+        print(f"[ppq-policy] gate check failed ({e}) — fail-open", flush=True)
+        return True, "gate_error_fail_open"
+    # Crash-retry storm: same prompt attempted >= storm_min_hits times within
+    # the storm window. Blocking is per-hash — other traffic still allowed.
+    now = time.time()
+    window = int(pol["storm_window_s"])
+    min_hits = int(pol["storm_min_hits"])
+    try:
+        with _ppq_state_lock:
+            ts = [t for t in _ppq_prompt_attempts.get(prompt_hash, [])
+                  if now - t < window]
+            if len(ts) >= min_hits:
+                _ppq_count_storm_block()
+                _ppq_alert(
+                    "warning", "PPQ retry-storm blocked",
+                    f"identical prompt (sha256 {prompt_hash[:8]}) attempted "
+                    f"{len(ts)}x in {window}s — crash-loop signature, PPQ refused")
+                return False, f"retry_storm {len(ts)} hits/{window}s"
+    except Exception as e:
+        print(f"[ppq-policy] storm check failed ({e}) — fail-open", flush=True)
+        return True, "storm_error_fail_open"
+    return True, "ok"
+
+
+def _ppq_note_attempt(prompt_hash: str) -> None:
+    """Record a PPQ attempt for storm detection (called pre-request)."""
+    now = time.time()
+    global _ppq_prompt_attempts
+    with _ppq_state_lock:
+        ts = _ppq_prompt_attempts.setdefault(prompt_hash, [])
+        ts.append(now)
+        _ppq_prompt_attempts[prompt_hash] = [t for t in ts if now - t < 3600]
+        # Opportunistic GC — bounded memory even under pathological load.
+        if len(_ppq_prompt_attempts) > 512:
+            cutoff = now - 3600
+            _ppq_prompt_attempts = {
+                h: [t for t in v if t >= cutoff]
+                for h, v in _ppq_prompt_attempts.items()
+                if any(t >= cutoff for t in v)}
+
+
+def _ppq_count_storm_block() -> None:
+    """Bump today's storm_blocked counter (best-effort)."""
+    try:
+        _usage_db().execute(
+            "INSERT INTO ppq_daily_used (date, storm_blocked) VALUES (?,1) "
+            "ON CONFLICT(date) DO UPDATE SET storm_blocked = storm_blocked + 1",
+            (_ppq_today(),))
+    except Exception:
+        pass
+
+
+def _ppq_record_success(total_tokens: int, cost_usd: float | None) -> None:
+    """Update the ppq_daily_used tracker after a successful PPQ response.
+
+    Also fires the 80%-of-cap warning exactly once per crossing.
+    Never raises — spend tracking must not break the response path.
+    """
+    try:
+        pol = _ppq_policy()
+        cap = float(pol["daily_cap_usd"])
+        usage = _ppq_usage_row()
+        prev = usage["spend_usd"]
+        cost = cost_usd
+        if cost is None:
+            cost = _estimate_cost_usd("ppq", total_tokens)
+        if cost == float("inf") or cost != cost:  # inf or NaN
+            cost = 0.0
+        cost = max(0.0, float(cost))
+        hours = json.loads(usage["hour_requests"] or "{}")
+        hb = _ppq_hour_bucket()
+        hours[hb] = int(hours.get(hb, 0)) + 1
+        _usage_db().execute(
+            "INSERT INTO ppq_daily_used (date, spend_usd, requests, tokens, "
+            "storm_blocked, hour_requests, last_ts) VALUES (?,?,1,?,0,?,?) "
+            "ON CONFLICT(date) DO UPDATE SET "
+            "spend_usd = spend_usd + excluded.spend_usd, "
+            "requests = requests + 1, "
+            "tokens = tokens + excluded.tokens, "
+            "hour_requests = excluded.hour_requests, "
+            "last_ts = excluded.last_ts",
+            (_ppq_today(), cost, total_tokens, json.dumps(hours), time.time()))
+        new_total = prev + cost
+        alert_at = float(pol.get("alert_pct", 0.8)) * cap
+        if cap > 0 and prev < alert_at <= new_total:
+            _ppq_alert(
+                "warning", "PPQ daily spend at 80% of cap",
+                f"${new_total:.2f} of ${cap:.2f} used today — PPQ failover "
+                f"suspends at ${cap:.2f}")
+    except Exception as e:
+        print(f"[ppq-policy] record_success failed: {e}", flush=True)
 
 
 # ── DeepInfra local credit balance tracking (no billing API available) ───────
@@ -2026,7 +2607,7 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
         # Use manager cap for: ollama_cloud, friend (used for manager-tier work),
         # deepinfra (preferred external failover), telnyx/ppq/openrouter (paid
         # external failover). Default: worker cap.
-        if tier in ("ollama_cloud", "friend", "deepinfra", "telnyx", "ppq", "openrouter"):
+        if tier in ("ollama_cloud", "friend", "deepinfra", "telnyx", "ppq", "openrouter", "routstr"):
             cap = _SPEND_CAP_MANAGER  # Manager-tier work, generous allowance
         else:  # ours or unknown
             cap = _SPEND_CAP_WORKER    # Default worker cap
@@ -2537,8 +3118,12 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
         # Map model names: z.ai names work directly on Ollama Cloud API
-        # (glm-5.2 → glm-5.2, no :cloud suffix needed for direct API)
+        # (glm-5.2 → glm-5.2, no :cloud suffix needed for direct API).
+        # glm-5.3 is NOT in Ollama Cloud's catalog — downgrade to glm-5.2
+        # (same 743B base; externals only have 5.2 until open weights land).
         ollama_model = model or "glm-5.2"
+        if ollama_model == "glm-5.3":
+            ollama_model = "glm-5.2"
 
         try:
             body_json = json.loads(body) if body else {}
@@ -2596,6 +3181,22 @@ class Handler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as he:
             if he.code == 429:
                 _mark_key_exhausted("ollama_cloud")
+            elif he.code == 403:
+                # G1: quota-exhaustion on the largest plan surfaces as
+                # 403 "requires a subscription" (not 429). Read the body to
+                # distinguish a real paywall from an auth/ACL problem, then
+                # arm the persisted until-Monday flag so quota_pressure sends
+                # the price to +inf (routing avoids Ollama on PRICE, not just
+                # health) and the health tracker skips it too.
+                try:
+                    body403 = he.read(4096).decode(errors="ignore").lower()
+                except Exception:
+                    body403 = ""
+                if "subscription" in body403 or "upgrade" in body403:
+                    _mark_key_exhausted("ollama_cloud")
+                    _arm_ollama_paywall_flag()
+                    print("[ollama] 403 paywall — armed .ollama_exhausted_until "
+                          "(price → +inf until Monday reset)", flush=True)
             return False
         except Exception:
             return False
@@ -2719,9 +3320,10 @@ class Handler(BaseHTTPRequestHandler):
         False on failure (caller should send error response).
         """
         # Choose failover model based on requesting profile's quality tier.
-        # Manager (glm-5.2): quality floor at deepseek-v4-pro (55.4% SWE-bench).
+        # Manager (glm-5.2/glm-5.3): quality floor at glm-5.2 externally
+        # (externals lack 5.3 until open weights land ~Aug 28).
         # Workers (glm-4.5-flash): cheapest available (output gets vetted).
-        if model == "glm-5.2":
+        if model in ("glm-5.2", "glm-5.3"):
             ext_model = MANAGER_FALLBACK_MODEL
         else:
             ext_model = WORKER_FALLBACK_MODEL
@@ -2732,6 +3334,19 @@ class Handler(BaseHTTPRequestHandler):
             if not prov.get("key"):
                 continue
             if not _is_provider_funded(name):
+                continue
+            # D6: PPQ good-use policy — daily cap / hourly cap / retry-storm
+            # gate, enforced before PPQ can even join the candidate list.
+            if name == "ppq":
+                ok, why = _ppq_gate_ok(_ppq_hash_body(body))
+                if not ok:
+                    print(f"[ppq-policy] skipping PPQ — {why}", flush=True)
+                    continue
+            # Cashu-routed providers must pass an endpoint liveness probe:
+            # a TCP-accepting-but-starved endpoint (VPS2 memory pressure /
+            # dead mint) would otherwise stall the chain for the full timeout.
+            if name in ("routstr", "routstrd") and not _endpoint_alive(prov["base_url"]):
+                print(f"[failover] skipping {name} — endpoint probe failed ({prov['base_url']})", flush=True)
                 continue
             cost = _get_provider_cost(name, ext_model)
             candidates.append((cost, name, prov))
@@ -2749,6 +3364,7 @@ class Handler(BaseHTTPRequestHandler):
                 candidates = pref + [c for c in candidates if c[1] != preferred]
 
         if not candidates:
+            print(f"[failover] no candidates available for ext_model={ext_model}", flush=True)
             return False
 
         for cost, provider_name, prov in candidates:
@@ -2770,6 +3386,11 @@ class Handler(BaseHTTPRequestHandler):
                     hdrs["HTTP-Referer"] = "https://hermes.local"
                     hdrs["X-Title"] = "Hermes Agent"
 
+                print(f"[failover] trying {provider_name} model={actual_model} cost=${cost:.4f}/M", flush=True)
+                # D6: record the PPQ attempt so a crash-retry loop of this
+                # exact prompt is detected and refused on later gate checks.
+                if provider_name == "ppq":
+                    _ppq_note_attempt(_ppq_hash_body(body))
                 req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
                 try:
                     with urllib.request.urlopen(req, timeout=180) as resp:
@@ -2801,6 +3422,9 @@ class Handler(BaseHTTPRequestHandler):
                         # _estimate_cost_usd inside _record_spend when None).
                         _record_spend(provider_name, ext_model, ext_tokens,
                                       actual_cost=ext_cost_usd)
+                        # D6: PPQ daily-budget tracker (cap / hourly / 80% alert)
+                        if provider_name == "ppq":
+                            _ppq_record_success(ext_tokens, ext_cost_usd)
                         # Deduct from DeepInfra local credit balance
                         if provider_name == "deepinfra" and ext_cost_usd is not None and ext_cost_usd > 0:
                             remaining = _deduct_deepinfra_balance(ext_cost_usd)
@@ -2820,13 +3444,31 @@ class Handler(BaseHTTPRequestHandler):
                             chosen_key=provider_name,
                             reason=f"zai_exhausted_{provider_name}_failover",
                         )
+                        # ProfitTracker: record consumer-mode savings (next-best
+                        # alternative minus what we paid). Fire-and-forget.
+                        if _PROFIT_TRACKER is not None:
+                            try:
+                                idx = candidates.index((cost, provider_name, prov))
+                                next_cost = candidates[idx + 1][0] if idx + 1 < len(candidates) else None
+                            except Exception:
+                                next_cost = None
+                            _PROFIT_TRACKER.record_decision(
+                                provider=provider_name,
+                                effective_price=float(cost),
+                                next_best_price=float(next_cost) if next_cost is not None else None,
+                                tokens=ext_tokens,
+                                is_peak=_is_peak_hour(),
+                            )
                         return True
                 except urllib.error.HTTPError as he:
                     if he.code == 402:
+                        print(f"[failover] {provider_name} returned 402 (unfunded) — marking unfunded, trying next", flush=True)
                         _mark_unfunded(provider_name)
                         continue
+                    print(f"[failover] {provider_name} returned HTTP {he.code} — trying next", flush=True)
                     raise
-            except Exception:
+            except Exception as e:
+                print(f"[failover] {provider_name} exception: {type(e).__name__}: {e} — trying next", flush=True)
                 continue
 
         return False
@@ -3240,16 +3882,26 @@ class Handler(BaseHTTPRequestHandler):
 
                         # Non-empty response — send to client
                         _mark_key_healthy(name)
-                        self.send_response(resp.status)
-                        for h, v in resp.headers.items():
-                            if h.lower() not in ("transfer-encoding", "connection"):
-                                self.send_header(h, v)
-                        if is_truncated:
-                            self.send_header("X-Response-Truncated", "true")
-                        self.end_headers()
-                        response_buffer.extend(full_body)
-                        self.wfile.write(full_body)
-                        self.wfile.flush()
+                        status_code = resp.status
+                        try:
+                            self.send_response(resp.status)
+                            for h, v in resp.headers.items():
+                                if h.lower() not in ("transfer-encoding", "connection"):
+                                    self.send_header(h, v)
+                            if is_truncated:
+                                self.send_header("X-Response-Truncated", "true")
+                            self.end_headers()
+                            response_buffer.extend(full_body)
+                            self.wfile.write(full_body)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError) as _ce:
+                            # Client vanished mid-stream — the upstream
+                            # succeeded, so the key stays healthy and must
+                            # NOT be marked failed (nor retried elsewhere).
+                            # Truthful api_calls row: upstream status + a
+                            # client-disconnect note instead of a fake 502.
+                            error_text = f"client disconnect: {_ce.__class__.__name__}"
+                            return
                         # Success — reset the Kalman consecutive-429 streak.
                         if _rate_limit_predictor is not None:
                             _rate_limit_predictor.record_success()
@@ -3286,7 +3938,12 @@ class Handler(BaseHTTPRequestHandler):
                     if _is_retryable_error(e):
                         if _attempt_retry(e, attempt, name, t0, order):
                             continue
-                    # Non-retryable error
+                    # Non-retryable error. A timeout / connection failure IS
+                    # an upstream server-side failure: mark the key so the
+                    # anomaly trail (and the recent_503 gate) sees the burst
+                    # class that previously surfaced only as client 502s with
+                    # zero anomaly rows (t_8e2673cd, 2026-08-15 read timeouts).
+                    _mark_key_server_error(name)
                     status_code = 502
                     error_text = f"proxy error: {e}"
                     msg = f"proxy error: {e}".encode()
@@ -3689,13 +4346,13 @@ class Handler(BaseHTTPRequestHandler):
                 # 6. Legacy fields (kept for backward compatibility — ADDITIVE).
                 # Urgency-tier model selection incl. the new spec task types.
                 TASK_MODELS = {
-                    "coding":     {"high": "glm-5.2",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "coding":     {"high": "glm-5.3",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
                     "reasoning":  {"high": "glm-4.5",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
                     "chat":       {"high": "glm-4.5-air",    "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
                     "simple":     {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
                     "mechanical": {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
                     "research":   {"high": "glm-5.2",        "standard": "glm-5.2",        "low": "glm-4.5-flash"},
-                    "review":     {"high": "glm-5.2",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
+                    "review":     {"high": "glm-5.3",        "standard": "glm-4.5-air",   "low": "glm-4.5-flash"},
                     "docs":       {"high": "glm-4.5-flash",  "standard": "glm-4.5-flash", "low": "glm-4.5-flash"},
                 }
                 tt = task_type if task_type in TASK_MODELS else "coding"
@@ -3760,6 +4417,7 @@ class Handler(BaseHTTPRequestHandler):
             models_data = {
                 "object": "list",
                 "data": [
+                    {"id": "glm-5.3", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "glm-5.2", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "glm-4.5-flash", "object": "model", "created": now, "owned_by": "zai"},
                     {"id": "glm-4.5-air", "object": "model", "created": now, "owned_by": "zai"},
@@ -3788,6 +4446,27 @@ class Handler(BaseHTTPRequestHandler):
                     "caps": {"manager": _SPEND_CAP_MANAGER, "worker": _SPEND_CAP_WORKER},
                     "tiers": {},
                 }
+                # D6: PPQ good-use policy state (daily cap / hourly / storms)
+                try:
+                    pol = _ppq_policy()
+                    ppq_row = _ppq_usage_row()
+                    data["ppq_policy"] = {
+                        "enabled": pol.get("enabled", True),
+                        "daily_cap_usd": pol["daily_cap_usd"],
+                        "max_requests_per_hour": pol["max_requests_per_hour"],
+                        "spend_usd": round(ppq_row["spend_usd"], 4),
+                        "pct_of_cap": round(
+                            ppq_row["spend_usd"] / pol["daily_cap_usd"] * 100, 1
+                        ) if pol["daily_cap_usd"] > 0 else 0,
+                        "requests_today": ppq_row["requests"],
+                        "requests_this_hour": int(
+                            json.loads(ppq_row["hour_requests"] or "{}").get(
+                                _ppq_hour_bucket(), 0)),
+                        "tokens_today": ppq_row["tokens"],
+                        "storm_blocked_today": ppq_row["storm_blocked"],
+                    }
+                except Exception as _ppq_e:
+                    data["ppq_policy"] = {"error": str(_ppq_e)}
                 for tier, spend, calls, tokens in rows:
                     cap = _SPEND_CAP_MANAGER if tier == "manager" else _SPEND_CAP_WORKER
                     data["tiers"][tier] = {

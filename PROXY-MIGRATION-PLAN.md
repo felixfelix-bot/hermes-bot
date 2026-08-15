@@ -64,3 +64,24 @@ The `reverse-tunnel-to-remote.service` on the laptop was hijacking port 9099 loc
 - DQ05 has its own z.ai key (`038e51301df1...`) which will be overwritten with laptop's keys
 - No tunnel needed — each machine is self-sufficient
 - The `reverse-tunnel-to-remote.service` and DQ05's `reverse-tunnel.service` are disabled (not deleted) in case we need them later
+
+### Maintenance: dead-code cleanup (2026-08-16, t_1bd8747e)
+
+- Removed `_can_proactive_switch()` — dead code with zero callers anywhere in
+  the repo (2026-08-15 code-read verdict). Its orphaned constant
+  `_PROACTIVE_COOLDOWN_SECONDS` (referenced only inside the dead function's
+  docstring, never in executable code) was removed with it.
+- Deliberately KEPT: `_proactive_switch_state` (still read by the `/status`
+  handler's `proactive_cooldown` block — permanently dormant since nothing
+  writes it, but removing it would change `/status` output) and
+  `_PROACTIVE_PREDICTION_TTL` (gates the prediction-cache TTL in
+  `_fetch_predictions`).
+- `best_key()` retained and marked LEGACY in its docstring with its four live
+  callers listed — it predates the price-argmin (RoutingAdvisor/optimizer)
+  selection path but remains the fallback whenever the advisor is off or fails.
+  Caller inventory (all in zai_proxy.py): `_best_key_adapter()` (RoutingAdvisor
+  fallback), the request-path advisor fallback (`chosen = best_key()` when the
+  advisor returns nothing), the original cascade (advisor flag OFF), and the
+  `/tier` endpoint handler.
+- Regressions pinned by `tests/test_dead_code_cleanup.py` (absence guards +
+  collateral-survivor guards + import-surface proof).

@@ -1290,7 +1290,6 @@ try:
 except Exception:
     pass
 
-_PROACTIVE_COOLDOWN_SECONDS = 300          # 30-min hysteresis after a switch
 _PROACTIVE_PREDICTION_TTL   = 60            # cache predictions for 60 s
 _proactive_switch_state     = {"key": None, "until": 0.0}
 _prediction_cache: dict[str, tuple[list[dict], float]] = {}
@@ -1340,13 +1339,6 @@ def _will_exhaust(predictions: list[dict]) -> dict | None:
         if p.get("will_exhaust") and not p.get("note"):
             return p
     return None
-
-
-def _can_proactive_switch() -> bool:
-    """Hysteresis: once a proactive switch happens, don't switch back for
-    _PROACTIVE_COOLDOWN_SECONDS (30 min)."""
-    return not (_proactive_switch_state["key"] is not None
-                and time.time() < _proactive_switch_state["until"])
 
 
 def _usage_db() -> sqlite3.Connection:
@@ -2949,14 +2941,31 @@ def _best_unlocked():
 
 
 def best_key() -> str:
-    """Pick a key for this request using PROACTIVE prediction first.
+    """LEGACY binary key-pick ("ours" | "friend").
 
-    Proactive (primary): use Kalman burn-rate predictions to select the key
-    least likely to exhaust before its window resets.  Predictions are fetched
-    OUTSIDE the quota lock (the predictor does a safe self-HTTP GET to /quota).
+    Legacy status (marked 2026-08-16, t_1bd8747e, from the 2026-08-15
+    code-read): this is the original two-key selector that predates the
+    price-argmin selection path now provided by the RoutingAdvisor /
+    routing_optimizer (Phase 2.1, ADR-014).  It is NOT removed because it
+    still has live callers and remains the guaranteed fallback whenever
+    the advisor is disabled, unavailable, or fails to produce a pick.
 
-    Reactive (fallback): when predictions are unavailable (cold start, no data),
-    fall back to per-window lock thresholds in _best_unlocked().
+    Live callers (all in this module):
+      * _best_key_adapter()        — wraps best_key() for the RoutingAdvisor's
+                                     fallback path (advisor mode).
+      * request-path advisor       — `if chosen is None: chosen = best_key()`
+                                     after the advisor attempt fails.
+      * original cascade (flag off)— `chosen = best_key()` when the advisor
+                                     feature flag is OFF or its module is
+                                     unavailable.
+      * /tier endpoint             — `chosen = best_key()` for tier queries.
+
+    Selection: PROACTIVE prediction first — Kalman burn-rate predictions
+    pick the key least likely to exhaust before its window resets.
+    Predictions are fetched OUTSIDE the quota lock (the predictor does a
+    safe self-HTTP GET to /quota).  Reactive (fallback): when predictions
+    are unavailable (cold start, no data), fall back to per-window lock
+    thresholds in _best_unlocked().
 
     Safety: a predictor failure never breaks key selection — every path is
     wrapped so the proxy always returns a valid key.

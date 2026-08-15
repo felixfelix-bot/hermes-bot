@@ -18,8 +18,10 @@ Run:  python3 -m pytest tests/test_kalman_reseed.py -v   (from ~/.hermes/bot)
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -85,6 +87,55 @@ class StepReseedTests(unittest.TestCase):
         self.assertAlmostEqual(kf.volume, 40_000_000, delta=1)
         self.assertEqual(kf.velocity, 0.0)
         self.assertAlmostEqual(kf.uncertainty, R_NOISE ** 0.5, delta=1e-6)
+
+
+@unittest.skipUnless(bp._HAS_NUMPY, "numpy not available")
+class PredictAllSkipTests(unittest.TestCase):
+    def setUp(self):
+        now = time.time()
+        self.friend_history = [
+            {"hour_ts": now - 3600 * (6 - i), "tokens": t}
+            for i, t in enumerate([2.0e6, 2.1e6, 1.9e6, 2.0e6, 2.2e6, 2.1e6])
+        ]
+        self.histories = {"ours": [], "friend": self.friend_history}
+        self.windows = [{"name": "5h", "used_pct": 40, "resets_at": now + 7200,
+                         "window_hours": 5}]
+
+    def _predict_all(self):
+        with mock.patch.object(bp, "_get_burn_history",
+                               side_effect=lambda k, **kw: self.histories[k]), \
+             mock.patch.object(bp, "_get_quota_windows",
+                               side_effect=lambda k: self.windows), \
+             mock.patch.object(bp, "TUNING_FILE",
+                               Path("/nonexistent-kalman-tuning.json")):
+            bp._predictors.clear()
+            return bp.predict_all()
+
+    def test_dead_key_omitted_entirely(self):
+        """Zero-history key produces NO entry (no insufficient_data noise)."""
+        out = self._predict_all()
+        self.assertIn("friend", out)
+        self.assertNotIn("ours", out)
+        self.assertNotIn("insufficient", str(out).lower())
+        self.assertIn("timestamp", out)
+        self.assertIn("method", out)
+
+    def test_friend_still_produces_predictions(self):
+        out = self._predict_all()
+        preds = out["friend"]
+        self.assertIsInstance(preds, list)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(preds[0]["window"], "5h")
+        self.assertIn("burn_rate_tph", preds[0])
+        # real projection, not a fallback row (those note insufficient data)
+        self.assertNotIn("Insufficient", preds[0].get("note", ""))
+
+    def test_live_keys_all_present(self):
+        """Both keys with history -> both present (no over-skipping)."""
+        self.histories["ours"] = self.friend_history
+        out = self._predict_all()
+        self.assertIn("ours", out)
+        self.assertIn("friend", out)
 
 
 if __name__ == "__main__":

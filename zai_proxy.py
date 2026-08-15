@@ -1379,7 +1379,8 @@ def _usage_db() -> sqlite3.Connection:
             error TEXT,
             duration_ms INTEGER,
             cost_usd REAL DEFAULT NULL,
-            cost_source TEXT DEFAULT NULL
+            cost_source TEXT DEFAULT NULL,
+            session_id TEXT DEFAULT NULL
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS key_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1393,6 +1394,18 @@ def _usage_db() -> sqlite3.Connection:
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_calls_ts ON api_calls(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_api_calls_key_model ON api_calls(key_name, model)")
+        # ── Phase 1 attribution (productivity-gate §1.4) ────────────────────
+        # Legacy DBs predate the session_id column (fresh DBs get it via the
+        # CREATE TABLE above). Idempotent ALTER — swallow the duplicate-column
+        # error, mirroring the telemetry schema pattern. Index backs the
+        # attribution queries (per-session burn over time windows).
+        try:
+            conn.execute("ALTER TABLE api_calls ADD COLUMN session_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already migrated
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_calls_session_ts "
+            "ON api_calls(session_id, ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_key_decisions_ts ON key_decisions(ts)")
         conn.execute("""CREATE TABLE IF NOT EXISTS model_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1547,35 +1560,52 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   prompt_tokens=0, completion_tokens=0, total_tokens=0,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
                   status_code=None, error=None, duration_ms=None,
-                  cost_usd=None, cost_source=None):
+                  cost_usd=None, cost_source=None, session_id=None):
     """Log one API call event. Swallows all errors — logging must never break a request.
 
     cost_usd / cost_source (RP-2): the real $ cost of this call and how it was
     determined ('measured' from the response, 'estimated' from a rate model,
     'flat_rate' for subscriptions). Both default to NULL when unknown.
+
+    session_id (productivity-gate §1.4): the originating agent session, from
+    the X-Hermes-Session request header. NULL when the client doesn't send it
+    (pre-upgrade agents, curl probes) — those rows stay unattributed and are
+    covered by the time-window fallback join.
     """
     try:
         _usage_db().execute(
             "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
             "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-            "status_code, error, duration_ms, cost_usd, cost_source) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status_code, error, duration_ms, cost_usd, cost_source, session_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
              total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-             duration_ms, cost_usd, cost_source))
+             duration_ms, cost_usd, cost_source, session_id))
     except Exception:
-        # Fallback: if cost_usd/cost_source columns are absent (pre-RP-1 DB),
-        # retry without them so we don't lose the whole row.
+        # Fallback 1: session_id column absent (DB predates the §1.4
+        # migration) but cost columns present — retry without session_id.
         try:
             _usage_db().execute(
                 "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
                 "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-                "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status_code, error, duration_ms, cost_usd, cost_source) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
                  total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-                 duration_ms))
+                 duration_ms, cost_usd, cost_source))
         except Exception:
-            pass
+            # Fallback 2: cost_usd/cost_source columns absent too (pre-RP-1
+            # DB) — retry with the base columns so we don't lose the row.
+            try:
+                _usage_db().execute(
+                    "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
+                    "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
+                    "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
+                     total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
+                     duration_ms))
+            except Exception:
+                pass
 
 
 def _log_key_decision(*, chosen_key, reason, ours_pct=0, friend_pct=0,
@@ -3170,6 +3200,7 @@ class Handler(BaseHTTPRequestHandler):
                     tier="ollama_cloud", status_code=resp.status, error=None,
                     duration_ms=int((time.time() - t0) * 1000),
                     cost_usd=_oc_cost, cost_source=_oc_cost_src,
+                    session_id=getattr(self, "_session_id", None),
                 )
                 # Log key decision so dashboard shows the switch to ollama_cloud
                 _log_key_decision(
@@ -3281,6 +3312,7 @@ class Handler(BaseHTTPRequestHandler):
                     tier="telnyx", status_code=resp.status, error=None,
                     duration_ms=int((time.time() - t0) * 1000),
                     cost_usd=telnyx_cost, cost_source=telnyx_cost_src,
+                    session_id=getattr(self, "_session_id", None),
                 )
                 _log_key_decision(
                     chosen_key="telnyx",
@@ -3438,6 +3470,7 @@ class Handler(BaseHTTPRequestHandler):
                             tier=provider_name, status_code=resp.status, error=None,
                             duration_ms=int((time.time() - t0) * 1000),
                             cost_usd=ext_cost_usd, cost_source=ext_cost_source,
+                            session_id=getattr(self, "_session_id", None),
                         )
                         # Log key decision so dashboard shows the failover switch
                         _log_key_decision(
@@ -3490,6 +3523,10 @@ class Handler(BaseHTTPRequestHandler):
         # Step 1: Extract original model + client tier hint
         original_model = _extract_model(body)
         tier_hint = self.headers.get("X-Model-Tier", "")
+        # Phase 1 attribution (productivity-gate §1.4): originating agent
+        # session, threaded into every _log_api_call below. Loopback trust
+        # boundary — same handling as X-Model-Tier (proxy is localhost-only).
+        self._session_id = (self.headers.get("X-Hermes-Session", "") or "").strip() or None
 
         # Step 1b: Global spend cap — circuit breaker for runaway loops
         # Use global sum across ALL tiers (not just "unknown") to prevent a
@@ -4011,6 +4048,7 @@ class Handler(BaseHTTPRequestHandler):
                 tier="zai", status_code=status_code, error=error_text,
                 duration_ms=int((time.time() - t0) * 1000),
                 cost_usd=_zai_cost, cost_source=_zai_cost_src,
+                session_id=getattr(self, "_session_id", None),
             )
             if not getattr(self, '_spend_recorded', False):
                 _record_spend(key_used, model, _zai_tokens)

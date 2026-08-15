@@ -36,6 +36,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+import ppq_common
+
 DB_PATH = os.path.expanduser(
     os.environ.get("API_BURN_DB_PATH", "~/.hermes/bot/api_burn.db")
 )
@@ -365,6 +367,20 @@ def collect_all(dry_run=False):
         )
         conn.commit()
         conn.close()
+
+        # R6: persist per-query records (PPQ dashboard data) through the
+        # shared dedup layer so ppq_queries fills live on every tick.
+        qrecs = result.get("query_records") or []
+        if isinstance(qrecs, list) and qrecs:
+            qconn = _get_conn()
+            try:
+                ppq_common.record_ppq_queries(qconn, qrecs)
+            except Exception as e:
+                print(
+                    f"  ppq_queries persist failed: {e}", file=sys.stderr
+                )
+            finally:
+                qconn.close()
 
     return results
 

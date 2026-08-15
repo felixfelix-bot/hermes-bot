@@ -76,5 +76,26 @@ class TestNoImportOrBehaviorChange(unittest.TestCase):
         self.assertTrue(callable(z._usage_db))
 
 
+class TestBestKeyLegacyDocstring(unittest.TestCase):
+    """(4) best_key() stays, but must self-identify as the legacy path.
+
+    From the 2026-08-15 code-read verdict: best_key() is the legacy binary
+    key-pick ("ours" | "friend") that predates the price-argmin selection
+    path.  It has live callers, so it must NOT be deleted — instead its
+    docstring marks it LEGACY and names its call sites.
+    """
+
+    def test_docstring_marks_legacy(self):
+        doc = z.best_key.__doc__ or ""
+        self.assertIn("LEGACY", doc,
+                      "best_key() docstring must carry the LEGACY marker")
+
+    def test_docstring_lists_live_callers(self):
+        doc = z.best_key.__doc__ or ""
+        for marker in ("_best_key_adapter", "/tier"):
+            self.assertIn(marker, doc,
+                          f"best_key() docstring must list caller {marker!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

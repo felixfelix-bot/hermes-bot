@@ -60,6 +60,7 @@ try:
         predict_exhaustion,
         predict_all,
         _get_burn_history,
+        _load_tuning,
         LOOKBACK_HOURS,
         MIN_DATA_POINTS,
     )
@@ -87,7 +88,9 @@ else:
     _IMPORT_ERR = None
 
 DB_PATH = os.path.expanduser("~/.hermes/bot/zai_usage.db")
-KEYS = ("ours", "friend")
+# 'ours' removed 2026-08-15: key deactivated at z.ai, zero usage rows ever since.
+# Scoring it only produced "insufficient_data" noise. Re-add if the key returns.
+KEYS = ("friend",)
 WARMUP = 3  # discard first N steps before scoring (filter needs to lock on)
 
 # ── convergence verdict thresholds ───────────────────────────────────────────
@@ -156,7 +159,25 @@ def backtest_key(key: str, history: list[dict]) -> dict:
             "note": f"need >= {WARMUP + 2} hourly buckets, have {len(history)}",
         }
 
-    kf = KalmanPredictor(process_noise=1.0, measurement_noise=50.0)
+    # Mirror burn_predictor._train_kalman parameter selection EXACTLY:
+    # per-key tuning-file override, else ADAPTIVE R from this series' variance
+    # (floor 1e6). The old hardcoded R=50 tested a filter production never
+    # ran — it made coverage 0% and velocity meaningless (diagnosed 2026-08-15).
+    try:
+        from burn_predictor import _load_tuning as _bp_load_tuning
+        tuning = _bp_load_tuning()
+    except Exception:
+        tuning = {}
+    override_r = tuning.get("measurement_noise", {}).get(key)
+    override_q = tuning.get("process_noise", {}).get(key, 1.0)
+    if override_r is not None:
+        R, Q = float(override_r), float(override_q)
+    else:
+        vols = [float(h.get("tokens", 0)) for h in history]
+        mean_v = sum(vols) / len(vols)
+        variance = sum((v - mean_v) ** 2 for v in vols) / max(len(vols) - 1, 1)
+        R, Q = max(variance, 1e6), 1.0
+    kf = KalmanPredictor(process_noise=Q, measurement_noise=R)
 
     # EMA of true hourly volume for a smoothed ground-truth velocity.
     true_vel_ema = None

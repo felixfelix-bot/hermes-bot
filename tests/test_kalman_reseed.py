@@ -88,6 +88,15 @@ class StepReseedTests(unittest.TestCase):
         self.assertEqual(kf.velocity, 0.0)
         self.assertAlmostEqual(kf.uncertainty, R_NOISE ** 0.5, delta=1e-6)
 
+    def test_step_threshold_must_be_positive(self):
+        """k <= 0 would re-seed on every nonzero innovation — reject it."""
+        with self.assertRaises(ValueError):
+            bp.KalmanPredictor(process_noise=1.0, measurement_noise=R_NOISE,
+                               step_threshold=0.0)
+        with self.assertRaises(ValueError):
+            bp.KalmanPredictor(process_noise=1.0, measurement_noise=R_NOISE,
+                               step_threshold=-1.0)
+
 
 @unittest.skipUnless(bp._HAS_NUMPY, "numpy not available")
 class PredictAllSkipTests(unittest.TestCase):

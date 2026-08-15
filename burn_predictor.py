@@ -74,6 +74,10 @@ class KalmanPredictor:
     The filter tracks both how fast we're burning AND whether the burn rate
     is accelerating or decelerating. This lets us project forward linearly
     instead of assuming a constant rate.
+
+    NOTE: instances are NOT thread-safe for concurrent update()/predict()
+    calls (the state mutation is unsynchronized); callers predict per key
+    from a single thread, as zai_proxy's prediction path does.
     """
 
     def __init__(self, process_noise: float = 1.0, measurement_noise: float = 50.0,
@@ -91,6 +95,11 @@ class KalmanPredictor:
         """
         if not _HAS_NUMPY:
             raise RuntimeError("numpy required for KalmanPredictor")
+        if step_threshold <= 0:
+            # k<=0 would re-seed on every nonzero innovation (gate=0),
+            # degenerating the filter into a last-observation echo.
+            raise ValueError(
+                f"step_threshold must be > 0 (or inf), got {step_threshold}")
         # State: [volume, velocity]
         self.x = np.array([[0.0], [0.0]])
         # State transition: next_vol = cur_vol + velocity; next_vel = velocity

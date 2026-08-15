@@ -12,6 +12,7 @@ in the Hermes venv via faster-whisper).
 """
 from __future__ import annotations
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -19,6 +20,8 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -71,11 +74,32 @@ class KalmanPredictor:
     The filter tracks both how fast we're burning AND whether the burn rate
     is accelerating or decelerating. This lets us project forward linearly
     instead of assuming a constant rate.
+
+    NOTE: instances are NOT thread-safe for concurrent update()/predict()
+    calls (the state mutation is unsynchronized); callers predict per key
+    from a single thread, as zai_proxy's prediction path does.
     """
 
-    def __init__(self, process_noise: float = 1.0, measurement_noise: float = 50.0):
+    def __init__(self, process_noise: float = 1.0, measurement_noise: float = 50.0,
+                 step_threshold: float = 4.0):
+        """
+        Args:
+            process_noise: process-noise variance Q (how erratic the system is).
+            measurement_noise: measurement-noise variance R (how noisy
+                observations are). Note this is a VARIANCE (σ²), not σ.
+            step_threshold: re-seed gate width k, in innovation standard
+                deviations. A measurement whose innovation exceeds
+                k*sqrt(S) is treated as a regime step: the filter re-seeds
+                at the new level instead of riding it with small gains.
+                Raise it (or set inf) to disable re-seeding.
+        """
         if not _HAS_NUMPY:
             raise RuntimeError("numpy required for KalmanPredictor")
+        if step_threshold <= 0:
+            # k<=0 would re-seed on every nonzero innovation (gate=0),
+            # degenerating the filter into a last-observation echo.
+            raise ValueError(
+                f"step_threshold must be > 0 (or inf), got {step_threshold}")
         # State: [volume, velocity]
         self.x = np.array([[0.0], [0.0]])
         # State transition: next_vol = cur_vol + velocity; next_vel = velocity
@@ -90,10 +114,25 @@ class KalmanPredictor:
                            [0.0, process_noise]])
         # Measurement noise (how noisy are observations)
         self.R = np.array([[measurement_noise]])
+        # Step-detection gate width (innovation std devs); inf disables
+        self.step_threshold = step_threshold
+        # Counter of re-seed events (reset per filter instance) — lets the
+        # health harness / logs report regime steps the filter absorbed.
+        self.n_reseeds = 0
         self._initialized = False
 
     def update(self, measurement: float) -> None:
-        """Incorporate a new hourly token measurement."""
+        """Incorporate a new hourly token measurement.
+
+        Step detection / auto re-seed: after the innovation y and its
+        covariance S are computed, if |y| > step_threshold * sqrt(S) the
+        measurement is treated as a regime step (e.g. a fleet change
+        multiplying the burn rate 40x overnight). Instead of grinding
+        through many low-gain corrections to catch up, the filter re-seeds
+        at the new level: x = [z, 0], P = eye(2)*R, velocity reset to 0.
+        n_reseeds is incremented and the event logged at WARNING. The
+        measurement is consumed as the seed, so update() returns here.
+        """
         z = np.array([[float(measurement)]])
         if not self._initialized:
             self.x[0, 0] = float(measurement)
@@ -103,6 +142,21 @@ class KalmanPredictor:
         y = z - self.H @ self.x
         # Innovation covariance
         S = self.H @ self.P @ self.H.T + self.R
+        # Step detection: |innovation| beyond k std devs means the level
+        # jumped further than model + noise can explain -> re-seed.
+        innovation = float(y[0, 0])
+        gate = self.step_threshold * float(np.sqrt(S[0, 0]))
+        if abs(innovation) > gate:
+            self.P = np.eye(2) * self.R[0, 0]
+            self.x = np.array([[float(measurement)], [0.0]])
+            self.n_reseeds += 1
+            _log.warning(
+                "KalmanPredictor re-seed #%d: innovation %.0f > %.1f*sqrt(S)=%.0f"
+                " — state re-seeded at %.0f tokens/h, velocity reset",
+                self.n_reseeds, innovation, self.step_threshold, gate,
+                float(measurement),
+            )
+            return
         # Kalman gain
         K = self.P @ self.H.T @ np.linalg.inv(S)
         # State update
@@ -360,13 +414,23 @@ def predict_exhaustion(key_name: str) -> list[dict]:
 
 
 def predict_all() -> dict:
-    """Get predictions for both keys."""
-    return {
-        "ours": predict_exhaustion("ours"),
-        "friend": predict_exhaustion("friend"),
+    """Get predictions for all keys that actually burn tokens.
+
+    Keys with ZERO burn-history rows (dead/deactivated keys — e.g. 'ours'
+    since 2026-08-15) are skipped entirely: with no data there is nothing
+    to project, and emitting per-window insufficient_data dicts was pure
+    noise for consumers. Keys with sparse-but-nonzero history still emit
+    their predict_exhaustion output unchanged.
+    """
+    out: dict = {
         "timestamp": _utc_now(),
         "method": "kalman" if _HAS_NUMPY else "none",
     }
+    for key_name in ("ours", "friend"):
+        if not _get_burn_history(key_name):
+            continue  # zero-history key: skip, no insufficient_data noise
+        out[key_name] = predict_exhaustion(key_name)
+    return out
 
 
 # ── Multi-Resource Prediction API ──────────────────────────────────────────────

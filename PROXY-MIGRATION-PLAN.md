@@ -79,5 +79,9 @@ The `reverse-tunnel-to-remote.service` on the laptop was hijacking port 9099 loc
 - `best_key()` retained and marked LEGACY in its docstring with its four live
   callers listed — it predates the price-argmin (RoutingAdvisor/optimizer)
   selection path but remains the fallback whenever the advisor is off or fails.
+  Caller inventory (all in zai_proxy.py): `_best_key_adapter()` (RoutingAdvisor
+  fallback), the request-path advisor fallback (`chosen = best_key()` when the
+  advisor returns nothing), the original cascade (advisor flag OFF), and the
+  `/tier` endpoint handler.
 - Regressions pinned by `tests/test_dead_code_cleanup.py` (absence guards +
   collateral-survivor guards + import-surface proof).

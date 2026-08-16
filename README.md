@@ -18,9 +18,30 @@ clone this repo and follow the setup guide to restore all functionality.
 2. Install Hermes Agent (`curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`)
 3. Copy scripts to `~/.hermes/profiles/manager/scripts/`
 4. Set up crons from `config/cron-manifest.json`
+
 5. Source secrets from `nostr-glasses/secrets/.env`
 6. Clone kanbanstr fork: `git clone https://github.com/net4sats/kanbanstr`
 
 ## Mirror Policy
 When stateful files on the local machine change (scripts, configs, plans),
 the same changes MUST be committed to this repo. This ensures full replication.
+
+## Provenance — manager-deployed gate/proxy scripts (2026-08-16)
+
+`rate_limit_gate.py` and `zai_proxy.py` are MANAGER-DEPLOYED from
+hermes-scripts origin/master (github.com/felixfelix-bot/hermes-scripts).
+Do NOT restore/checkout/stash-apply old committed copies of these files
+during bot-dir syncs — that silently reverts the live cron gate to a
+pre-T3.1 version that cannot see z.ai timeout/502 bursts (regression
+observed twice: 2026-08-15 20:14 IST and 2026-08-16 04:31 IST).
+
+Rules:
+- Deploy a new version by committing to hermes-scripts master FIRST,
+  then copying into this dir. Both copies must stay byte-identical.
+- Watchdog cron `rate-limit-gate-drift-guard` (*/5m, no-agent) hashes
+  the live file against hermes-scripts origin/master, auto-heals drift,
+  saves forensic copies to `~/.hermes/drift-guard/forensic/`, and
+  alerts on drift.
+- Deliberate deploy of an uncommitted version: pause that cron or use
+  `python3 ~/.hermes/scripts/rate_limit_gate_drift_guard.py --check-only`,
+  and finish the hermes-scripts commit within the pause window.

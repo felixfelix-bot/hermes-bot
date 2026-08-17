@@ -69,9 +69,13 @@ pressure traffic, never block it. The hook sits AFTER the global spend
 cap, so it cannot bypass the runaway-loop circuit breaker.
 
 Enabling / disabling (both hot — no proxy restart needed, the policy
-cache re-reads on mtime change):
-- Enable: `echo '{"mode": "enforce"}' > ~/.hermes/bot/pressure_policy.json`
-- Revert to shadow: `echo '{"mode": "shadow"}' > ~/.hermes/bot/pressure_policy.json`
+cache re-reads on mtime change). Always use the tuner's merge writer —
+it is atomic and PRESERVES the calibrated bands + tuner metadata. A
+bare `echo '{"mode": ...}' >` replace works as an emergency fallback
+but silently reverts the FSM to default bands (60/75 instead of the
+tuner-calibrated 56/92) and drops the calibration record:
+- Enable: `cd ~/.hermes/bot && python3 -c 'import adaptive_model_tuner as amt; amt.write_pressure_policy({"mode": "enforce"})'`
+- Revert to shadow: same command with `{"mode": "shadow"}`
 - Kill switch (all modes): `touch ~/.hermes/bot/.pressure_routing_disabled`
   (+ `systemctl --user restart zai-proxy.service` for belt-and-braces)
 

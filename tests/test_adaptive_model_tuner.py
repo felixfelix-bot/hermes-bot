@@ -267,6 +267,32 @@ class TestPressureTrackerIntegration(unittest.TestCase):
             pol = tracker._policy()
             self.assertAlmostEqual(pol["escalate_amber_pct"], bands["escalate_amber_pct"])
 
+    def test_set_mode_preserves_tuner_bands(self):
+        # S2c enable path (t_4af977e4): flipping mode via the merge
+        # writer must keep the tuner's calibrated bands — the enable
+        # flip and the weekly tuner cron share this one file.
+        with tempfile.TemporaryDirectory() as td:
+            bot = Path(td)
+            bands = amt.compute_fsm_band_policy(TYPICAL)
+            amt.write_pressure_policy(bands, bot / "pressure_policy.json")
+            amt.write_pressure_policy({"mode": "enforce"},
+                                      bot / "pressure_policy.json")
+            tracker = self._tracker(bot)
+            self.assertEqual(tracker.mode(), "enforce")
+            self.assertTrue(tracker.enabled())
+            pol = tracker._policy()
+            self.assertAlmostEqual(pol["escalate_amber_pct"], bands["escalate_amber_pct"])
+            self.assertAlmostEqual(pol["escalate_red_pct"], bands["escalate_red_pct"])
+            self.assertAlmostEqual(pol["deescalate_amber_pct"], bands["deescalate_amber_pct"])
+            self.assertAlmostEqual(pol["deescalate_green_pct"], bands["deescalate_green_pct"])
+            # hot flip back to shadow is equally non-destructive (exercises
+            # the mtime cache invalidation on the production rollback path)
+            amt.write_pressure_policy({"mode": "shadow"},
+                                      bot / "pressure_policy.json")
+            self.assertEqual(tracker.mode(), "shadow")
+            self.assertAlmostEqual(tracker._policy()["escalate_red_pct"],
+                                   bands["escalate_red_pct"])
+
 
 class TestSamplesFromDb(unittest.TestCase):
     def test_get_used_pct_samples_filters(self):

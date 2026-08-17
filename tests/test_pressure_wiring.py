@@ -211,5 +211,145 @@ class TestColdReviewFixWiring(unittest.TestCase):
                 limit=expected)
 
 
+class TestEnforceHook(unittest.TestCase):
+    """S2c (t_b82e5665): enforce-mode application of the FSM decision.
+
+    Handler._pressure_enforce(decision, body, t0) must route ONLY
+    enforce-mode Ollama-downgrade decisions to ollama_cloud; everything
+    else (shadow mode, off mode, friend-path / interactive / last-resort
+    reasons, Ollama failure, dead tracker) falls through unharmed.
+    """
+
+    def _handler(self, ollama_ok=True):
+        h = MagicMock()
+        h._pressure_enforce = z.Handler._pressure_enforce.__get__(h, z.Handler)
+        h._try_ollama_cloud = MagicMock(return_value=ollama_ok)
+        return h
+
+    @staticmethod
+    def _decision(reason, state="RED", interactive=False,
+                  serve: str | None = "glm-5.2", provider="ollama_cloud"):
+        return pf.Decision(
+            requested_model="glm-5.3", would_serve_model=serve,
+            would_provider=provider, state=state,
+            interactive=interactive, reason=reason)
+
+    @staticmethod
+    def _tracker(mode):
+        t = MagicMock()
+        t.mode.return_value = mode
+        return t
+
+    def _with_tracker(self, tracker):
+        orig = z._pressure_tracker
+        z._pressure_tracker = tracker
+        self.addCleanup(lambda: setattr(z, "_pressure_tracker", orig))
+
+    def test_shadow_mode_does_not_enforce(self):
+        self._with_tracker(self._tracker("shadow"))
+        h = self._handler()
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama"), b"{}", 0.0)
+        self.assertFalse(out)
+        h._try_ollama_cloud.assert_not_called()
+
+    def test_off_mode_does_not_enforce(self):
+        self._with_tracker(self._tracker("off"))
+        h = self._handler()
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama"), b"{}", 0.0)
+        self.assertFalse(out)
+        h._try_ollama_cloud.assert_not_called()
+
+    def test_enforce_routes_ollama_downgrade(self):
+        self._with_tracker(self._tracker("enforce"))
+        h = self._handler()
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama", state="RED"), b"{}", 0.0)
+        self.assertTrue(out)
+        h._try_ollama_cloud.assert_called_once()
+        args, kwargs = h._try_ollama_cloud.call_args
+        self.assertEqual(args[0], b"{}")            # untouched body
+        self.assertEqual(args[1], "glm-5.2")        # downgraded model
+        self.assertEqual(kwargs.get("reason"), "pressure_enforce_red")
+
+    def test_enforce_routes_ollama_extra_reason(self):
+        self._with_tracker(self._tracker("enforce"))
+        h = self._handler()
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama_extra", state="AMBER"),
+            b"{}", 0.0)
+        self.assertTrue(out)
+        self.assertEqual(
+            h._try_ollama_cloud.call_args.kwargs.get("reason"),
+            "pressure_enforce_amber")
+
+    def test_enforce_ignores_interactive_and_friend_paths(self):
+        self._with_tracker(self._tracker("enforce"))
+        for reason in ("interactive_rationed", "interactive_kept",
+                       "bg_kept", "bg_quota_neutral", "bg_last_resort",
+                       "not_glm_53_passthrough"):
+            h = self._handler()
+            out = h._pressure_enforce(self._decision(reason), b"{}", 0.0)
+            self.assertFalse(out, reason)
+            h._try_ollama_cloud.assert_not_called()
+
+    def test_enforce_falls_through_when_ollama_fails(self):
+        self._with_tracker(self._tracker("enforce"))
+        h = self._handler(ollama_ok=False)
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama"), b"{}", 0.0)
+        self.assertFalse(out)  # caller continues down the normal cascade
+        h._try_ollama_cloud.assert_called_once()
+
+    def test_enforce_none_decision_is_noop(self):
+        self._with_tracker(self._tracker("enforce"))
+        h = self._handler()
+        self.assertFalse(h._pressure_enforce(None, b"{}", 0.0))
+        h._try_ollama_cloud.assert_not_called()
+
+    def test_enforce_never_raises_dead_tracker(self):
+        t = MagicMock()
+        t.mode.side_effect = RuntimeError("boom")
+        self._with_tracker(t)
+        h = self._handler()
+        self.assertFalse(h._pressure_enforce(
+            self._decision("bg_downgraded_ollama"), b"{}", 0.0))
+        h._try_ollama_cloud.assert_not_called()
+
+    def test_enforce_defaults_missing_serve_model(self):
+        self._with_tracker(self._tracker("enforce"))
+        h = self._handler()
+        out = h._pressure_enforce(
+            self._decision("bg_downgraded_ollama", serve=None), b"{}", 0.0)
+        self.assertTrue(out)
+        self.assertEqual(h._try_ollama_cloud.call_args.args[1], "glm-5.2")
+
+
+class TestEnforceWiring(unittest.TestCase):
+    """_proxy must call the enforce hook AFTER the spend cap and BEFORE
+    the Ollama-only short-circuit; _try_ollama_cloud keeps back-compat
+    default reasons when called without reason=."""
+
+    def test_proxy_calls_enforce_hook_in_order(self):
+        import inspect
+        src = inspect.getsource(z.Handler._proxy)
+        i_shadow = src.index("_pressure_shadow(")
+        i_cap = src.index("_check_global_spend_cap()")
+        i_enforce = src.index("self._pressure_enforce(")
+        i_ollama_only = src.index("_OLLAMA_ONLY_MODELS")
+        self.assertLess(i_shadow, i_enforce)
+        self.assertLess(i_cap, i_enforce)
+        self.assertLess(i_enforce, i_ollama_only)
+
+    def test_try_ollama_cloud_reason_param_defaults_to_legacy(self):
+        import inspect
+        src = inspect.getsource(z.Handler._try_ollama_cloud)
+        self.assertIn("reason: str | None = None", src)
+        self.assertIn("peak_hour_ollama_primary", src)  # legacy default kept
+        self.assertIn("pressure_enforce_", inspect.getsource(
+            z.Handler._pressure_enforce))
+
+
 if __name__ == "__main__":
     unittest.main()

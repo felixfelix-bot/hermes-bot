@@ -59,7 +59,7 @@ cron does NOT watch zai_proxy.py (only rate_limit_gate.py).
 
 `Handler._pressure_enforce` applies the FSM decision when the tracker
 runs `mode=enforce`. Scope is deliberately narrow: only the two Ollama
-downgrade rows of the decision matrix (`bg_downgraded_olloma`,
+downgrade rows of the decision matrix (`bg_downgraded_ollama`,
 `bg_downgraded_ollama_extra` — AMBER/RED background glm-5.3 traffic) are
 rerouted to ollama_cloud glm-5.2 (flat-rate; protects the friend key).
 Interactive, friend-path, last-resort and non-5.3 decisions are never

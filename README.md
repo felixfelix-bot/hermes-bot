@@ -55,6 +55,68 @@ NOTE: the FSM bridge loads at proxy start. After deploying changes to
 `zai_proxy.py`, restart the proxy process to activate. The drift-guard
 cron does NOT watch zai_proxy.py (only rate_limit_gate.py).
 
+### S2c — live enforcement (t_b82e5665)
+
+`Handler._pressure_enforce` applies the FSM decision when the tracker
+runs `mode=enforce`. Scope is deliberately narrow: only the two Ollama
+downgrade rows of the decision matrix (`bg_downgraded_olloma`,
+`bg_downgraded_ollama_extra` — AMBER/RED background glm-5.3 traffic) are
+rerouted to ollama_cloud glm-5.2 (flat-rate; protects the friend key).
+Interactive, friend-path, last-resort and non-5.3 decisions are never
+touched. If ollama_cloud refuses/fails, the request falls through to the
+normal cascade (bg_last_resort semantics) — enforcement can redirect
+pressure traffic, never block it. The hook sits AFTER the global spend
+cap, so it cannot bypass the runaway-loop circuit breaker.
+
+Enabling / disabling (both hot — no proxy restart needed, the policy
+cache re-reads on mtime change):
+- Enable: `echo '{"mode": "enforce"}' > ~/.hermes/bot/pressure_policy.json`
+- Revert to shadow: `echo '{"mode": "shadow"}' > ~/.hermes/bot/pressure_policy.json`
+- Kill switch (all modes): `touch ~/.hermes/bot/.pressure_routing_disabled`
+  (+ `systemctl --user restart zai-proxy.service` for belt-and-braces)
+
+Enforcement events are visible as `pressure_enforce_<band>` rows in the
+`key_decisions` table (via the `_try_ollama_cloud` reason override);
+enforced responses carry `X-Provider: ollama_cloud` and show up as
+glm-5.2/ollama_cloud in `api_calls`. `GET /pressure` shows
+`mode: enforce` and the live band.
+
+Deployment precondition: >=24h of shadow decisions in `pressure_decisions`
+with sane band transitions before flipping to enforce.
+
+### S3a — adaptive tuner revival (t_12f0a395)
+
+`adaptive_model_tuner.py` (weekly cron `0 3 * * 0`, `no_agent`, output
+`~/.hermes/profiles/manager/cron/output/f1809b0f26b1/`) now calibrates the
+pressure FSM bands, not just the legacy tier thresholds:
+
+- `pressure_policy.json` — `escalate_amber_pct` / `escalate_red_pct` /
+  `deescalate_amber_pct` / `deescalate_green_pct` from percentiles of the
+  friend-key 5h-window `used_pct_observed` history in `kalman_samples`
+  (top 15% of observations → AMBER, top 5% → RED). Guardrails:
+  amber ∈ [30,75], red ∈ [amber+10, 95], de-escalate mirrors the compiled
+  defaults' symmetry (`deesc_amber == esc_amber`, `deesc_green == esc_amber-15`).
+  First calibration (2026-08-17, 305 samples): AMBER ≥ 56%, RED ≥ 92%.
+  Predictive thresholds, dwell, floor-raiser etc. are left at FSM defaults —
+  the tuner owns only the four used_pct bands.
+- Merge-write semantics: foreign keys already in `pressure_policy.json`
+  (e.g. `mode: enforce`) are PRESERVED — the weekly cron can never
+  silently re-enable or disable routing. Writes are atomic
+  (tempfile + rename); the proxy's mtime-cache picks up a new file
+  without restart. Fewer than 30 samples → policy write skipped, FSM
+  keeps defaults.
+- `model_tier_thresholds.json` — legacy output unchanged (router is
+  currently unwired: `zai_proxy._select_model_tier` is None), kept for
+  compat.
+- `model_tier_router.MODEL_MAP` updated to the current generation:
+  reasoning=glm-5.3, standard=glm-5.2, economy=glm-4.5-flash.
+
+Run manually: `python3 adaptive_model_tuner.py [--stats | --dry-run]`.
+Tests: `python3 -m pytest tests/test_adaptive_model_tuner.py -q` (34 tests;
+includes a PressureTracker round-trip asserting the FSM's range-safety
+accepts the tuner's bands and that a pre-existing `mode=off` survives a
+tuner rewrite).
+
 
 ## Provenance — manager-deployed gate/proxy scripts (2026-08-16)
 

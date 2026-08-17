@@ -44,7 +44,10 @@ New stateful artifacts (all in this dir):
   disable all pressure computation instantly; delete to re-enable.
 
 Observability: `GET /pressure` on the proxy port returns the current band,
-mode, kill-switch status, and last 20 shadow decisions. Silent model
+mode, kill-switch status, and last shadow decisions (`?limit=N`, default 20,
+clamped to [1,100]). Policy JSON threshold overrides are range-checked —
+dwell < 60s is clamped and inverted threshold orderings (a flap machine)
+fall back to defaults. Silent model
 rewrites now emit `X-Served-Model` / `X-Downgrade-Reason` response headers
 (rewrite behavior itself unchanged).
 

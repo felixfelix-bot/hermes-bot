@@ -340,6 +340,45 @@ except Exception as _rqe:
     print(f"[routstr] balance bridge DISABLED — {_rqe}", flush=True)
     _routstr_quota_entry_fn = None
 
+# ── Pressure FSM bridge (S2b two-layer pressure routing, t_4dfaf0d5) ────────
+# Layer-2 request-time half of DESIGN-two-layer-pressure-routing.md:
+# GREEN/AMBER/RED band FSM over friend-key quota + Kalman exhaust
+# predictions. SHADOW MODE ONLY — computes and logs the decision it
+# WOULD make (pressure_decisions table); never reroutes a live request.
+# Kill switches: touch ~/.hermes/bot/.pressure_routing_disabled OR set
+# pressure_policy.json {"mode":"off"}. Revert-safe: None → all hooks
+# no-op. Enforce mode is a later stage (S2c+) and behaves as shadow here.
+_pressure_tracker = None
+try:
+    from pressure_fsm import PressureTracker as _PressureTrackerCls
+    _pressure_tracker = _PressureTrackerCls()
+    print(f"[pressure] FSM bridge loaded — shadow mode "
+          f"(state: {_pressure_tracker.mode()}, kill switch: "
+          f"{_pressure_tracker.flag_path})", flush=True)
+except Exception as _pre:
+    print(f"[pressure] FSM bridge DISABLED — {_pre}", flush=True)
+    _pressure_tracker = None
+
+
+def _pressure_shadow(model: str | None, session_id: str | None,
+                     ollama_regime: str | None = None) -> object | None:
+    """Shadow-only pressure decision (t_4dfaf0d5). NEVER raises.
+
+    Reads the Ollama regime from the live quota status when the caller
+    doesn't supply one. Returns a pressure_fsm.Decision or None
+    (tracker missing / kill switch active / any internal error).
+    """
+    if _pressure_tracker is None or not model:
+        return None
+    try:
+        regime = ollama_regime
+        if regime is None:
+            regime = _get_ollama_quota_status().get("regime")
+        return _pressure_tracker.shadow_decision(
+            model, session_id=session_id, ollama_regime=regime)
+    except Exception:
+        return None  # shadow hooks must never break request handling
+
 # ── ProfitTracker (consumer-mode savings ledger, MRE Phase 2.3) ─────────────
 # Records every external-failover routing decision + savings vs the next-best
 # alternative into the routing_profit table. Fire-and-forget daemon writer;
@@ -3141,6 +3180,44 @@ def _attempt_retry(e, attempt, name, t0, key_order):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _pressure_headers(self, original_model: str | None,
+                          served_model: str | None,
+                          model_tier_info: dict | None) -> list[tuple[str, str]]:
+        """Observability headers for the silent model rewrite (S2b, t_4dfaf0d5).
+
+        Emitted ONLY when the rewrite actually changed the model — the
+        rewrite behavior itself is untouched (shadow-first). Headers:
+          X-Served-Model:    the model actually served
+          X-Downgrade-Reason: tier reason + pressure shadow note (if any)
+        Pure function of its args + self._pressure_decision; NEVER raises.
+        """
+        try:
+            if not original_model or not served_model \
+                    or served_model == original_model:
+                return []
+            parts = []
+            if model_tier_info and model_tier_info.get("reason"):
+                parts.append(str(model_tier_info["reason"])[:100])
+            else:
+                parts.append("tier_rewrite")
+            pd = getattr(self, "_pressure_decision", None)
+            if pd is not None and getattr(pd, "reason", None):
+                parts.append(f"shadow:{pd.reason}")
+            return [("X-Served-Model", str(served_model)),
+                    ("X-Downgrade-Reason", "; ".join(parts)[:200])]
+        except Exception:
+            return []
+
+    def _pressure_tracker_snapshot(self, limit: int = 20) -> dict:
+        """Snapshot for GET /pressure (S2b, t_4dfaf0d5). NEVER raises."""
+        if _pressure_tracker is None:
+            return {"enabled": False, "mode": "unavailable",
+                    "hint": "pressure_fsm module not loaded"}
+        try:
+            return _pressure_tracker.snapshot(limit=limit)
+        except Exception as e:
+            return {"enabled": False, "mode": "error", "error": str(e)}
+
     def _try_ollama_cloud(self, body: bytes, model: str | None,
                            response_buffer: bytearray, t0: float) -> bool:
         """Forward request to Ollama Cloud API (primary provider, not failover).
@@ -3537,6 +3614,13 @@ class Handler(BaseHTTPRequestHandler):
         # session, threaded into every _log_api_call below. Loopback trust
         # boundary — same handling as X-Model-Tier (proxy is localhost-only).
         self._session_id = (self.headers.get("X-Hermes-Session", "") or "").strip() or None
+
+        # ── Pressure FSM shadow hook (S2b, t_4dfaf0d5) ────────────────────
+        # Compute + log the pressure decision this request WOULD get.
+        # READ-ONLY: `body`, `chosen` and every routing step below are
+        # untouched — enforce mode is S2c+. Never raises (helper swallows).
+        self._pressure_decision = _pressure_shadow(
+            original_model, self._session_id)
 
         # Step 1b: Global spend cap — circuit breaker for runaway loops
         # Use global sum across ALL tiers (not just "unknown") to prevent a
@@ -3935,6 +4019,11 @@ class Handler(BaseHTTPRequestHandler):
                             for h, v in resp.headers.items():
                                 if h.lower() not in ("transfer-encoding", "connection"):
                                     self.send_header(h, v)
+                            # S2b (t_4dfaf0d5): surface the silent rewrite —
+                            # shadow observability, rewrite behavior unchanged.
+                            for _ph, _pv in self._pressure_headers(
+                                    original_model, model, model_tier_info):
+                                self.send_header(_ph, _pv)
                             if is_truncated:
                                 self.send_header("X-Response-Truncated", "true")
                             self.end_headers()
@@ -4187,6 +4276,24 @@ class Handler(BaseHTTPRequestHandler):
             data["ollama_cloud"] = _snapshot_quota().get("ollama_cloud", {})
             payload = json.dumps(data, indent=2).encode()
             self.close_connection = True   # honor the Connection: close header below
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/pressure":
+            # Pressure FSM observability (S2b, t_4dfaf0d5) — band state,
+            # mode, kill-switch status and last shadow decisions.
+            self.close_connection = True
+            try:
+                payload = json.dumps(
+                    self._pressure_tracker_snapshot(limit=20),
+                    indent=2).encode()
+            except Exception as e:
+                payload = json.dumps(
+                    {"error": str(e), "hint": "pressure FSM snapshot failed"}
+                ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

@@ -154,5 +154,49 @@ class TestGetPressureEndpoint(unittest.TestCase):
         self.assertIn(b"error", written)
 
 
+class TestColdReviewFixWiring(unittest.TestCase):
+    """Wiring fixes from cold review pass 1: friend_locked passthrough,
+    /pressure?query support."""
+
+    def test_pressure_shadow_passes_friend_locked(self):
+        """The hook must forward the proxy's lock verdict, not default it."""
+        calls = {}
+
+        def fake_shadow(model, session_id=None, ollama_regime=None,
+                        friend_locked=False):
+            calls["friend_locked"] = friend_locked
+            return None
+
+        orig_t, orig_qc, orig_lock = (z._pressure_tracker, None,
+                                      z.is_key_locked)
+        try:
+            z._pressure_tracker = type("T", (), {"shadow_decision":
+                                                 staticmethod(fake_shadow)})()
+            # (a) empty quota cache -> not locked
+            z.quota_cache = {}
+            z._pressure_shadow("glm-5.3", None)
+            self.assertFalse(calls["friend_locked"])
+            # (b) friend locked by a window -> forwarded True
+            z.quota_cache = {"friend": ([{"name": "5-hour",
+                                          "used_pct": 99}], 0.0)}
+            z.is_key_locked = lambda k, w: (True, "5-hour", 99, 60) \
+                if k == "friend" else (False, None, 0, 0)
+            z._pressure_shadow("glm-5.3", None)
+            self.assertTrue(calls["friend_locked"])
+        finally:
+            z._pressure_tracker = orig_t
+            z.is_key_locked = orig_lock
+
+    def test_do_GET_pressure_accepts_query_string(self):
+        h = MagicMock()
+        h.path = "/pressure?limit=5"
+        h.do_GET = z.Handler.do_GET.__get__(h, z.Handler)
+        h._pressure_tracker_snapshot = MagicMock(
+            return_value={"enabled": True, "state": "GREEN"})
+        h.do_GET()
+        h.send_response.assert_called_once_with(200)
+        h._pressure_tracker_snapshot.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

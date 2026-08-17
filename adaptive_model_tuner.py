@@ -43,6 +43,7 @@ Usage:
 
 from __future__ import annotations
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -90,9 +91,15 @@ FSM_MIN_SAMPLES = 30
 
 def get_hours_left_samples(db_path: Path, key: str = "friend",
                             window: str = "5-hour") -> list[float]:
-    """Get exhausts_in_hours samples from Kalman data for a specific key+window."""
+    """Get exhausts_in_hours samples from Kalman data for a specific key+window.
+
+    Non-finite values (sqlite stores 9e999 as REAL inf) are dropped so they
+    cannot poison percentiles or JSON output. Errors are logged, not silent —
+    the weekly cron output must show why calibration data is missing.
+    """
     if not db_path.exists():
         return []
+    conn = None
     try:
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -102,10 +109,17 @@ def get_hours_left_samples(db_path: Path, key: str = "friend",
                ORDER BY ts DESC LIMIT 1000""",
             (key, window)
         ).fetchall()
-        conn.close()
-        return [r[0] for r in rows if r[0] is not None]
-    except Exception:
+        return [float(r[0]) for r in rows if math.isfinite(float(r[0]))]
+    except Exception as exc:
+        print(f"WARN: get_hours_left_samples failed ({exc!r}) — treating as no data",
+              file=sys.stderr)
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_used_pct_samples(db_path: Path, key: str = "friend",
@@ -119,6 +133,7 @@ def get_used_pct_samples(db_path: Path, key: str = "friend",
     db_path = Path(db_path)
     if not db_path.exists():
         return []
+    conn = None
     try:
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -128,10 +143,17 @@ def get_used_pct_samples(db_path: Path, key: str = "friend",
                ORDER BY ts DESC LIMIT ?""",
             (key, window, int(limit))
         ).fetchall()
-        conn.close()
-        return [float(r[0]) for r in rows if r[0] is not None]
-    except Exception:
+        return [float(r[0]) for r in rows if math.isfinite(float(r[0]))]
+    except Exception as exc:
+        print(f"WARN: get_used_pct_samples failed ({exc!r}) — treating as no data",
+              file=sys.stderr)
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
@@ -223,6 +245,8 @@ def write_pressure_policy(bands: dict, path: Path | None = None) -> dict:
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(merged, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())  # survive power-loss mid-write (cold review)
         os.replace(tmp, str(path))
     except Exception:
         try:

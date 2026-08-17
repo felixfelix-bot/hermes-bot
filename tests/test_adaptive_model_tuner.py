@@ -453,6 +453,26 @@ class TestTunerCliCoverage(unittest.TestCase):
             self.assertEqual(amt.get_used_pct_samples(db), [])
             self.assertEqual(amt.get_hours_left_samples(db), [])
 
+    def test_nonfinite_samples_excluded(self):
+        # sqlite happily stores 9e999 as REAL inf; NaN-normalizing rows would
+        # poison sorted() + json.dumps (NaN → invalid JSON). Cold-review minor.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            db = make_db(td, used=[10.0] * 40, exhaust=[10.0] * 40)
+            conn = sqlite3.connect(str(db))
+            conn.execute(
+                "INSERT INTO kalman_samples (ts, key, window, used_pct_observed,"
+                " exhausts_in_hours) VALUES (?, ?, ?, ?, ?)",
+                (1_800_000_000.0, "friend", "5-hour", 9e999, 9e999))
+            conn.commit()
+            conn.close()
+            used = amt.get_used_pct_samples(db)
+            self.assertNotIn(float("inf"), used)
+            self.assertEqual(len(used), 40)
+            hours = amt.get_hours_left_samples(db)
+            self.assertNotIn(float("inf"), hours)
+            self.assertEqual(len(hours), 40)
+
     def test_stats_mode_writes_nothing(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

@@ -26,6 +26,33 @@ clone this repo and follow the setup guide to restore all functionality.
 When stateful files on the local machine change (scripts, configs, plans),
 the same changes MUST be committed to this repo. This ensures full replication.
 
+## Pressure FSM — two-layer pressure routing, stage S2b (t_4dfaf0d5)
+
+`zai_proxy.py` now carries a shadow-mode pressure routing layer
+(`pressure_fsm.py`, design: merchant-routing-engine
+`DESIGN-two-layer-pressure-routing.md`). Shadow mode computes and logs the
+routing decision it WOULD make; it never reroutes a live request.
+
+New stateful artifacts (all in this dir):
+- `pressure_state.json` — FSM band state (GREEN/AMBER/RED, dwell timer,
+  floor-raiser). Written by the tracker; safe to delete (resets to GREEN).
+- `pressure_decisions` table in `zai_usage.db` — one row per glm-5.3
+  POST: band, interactive flag, would-serve model/provider, reason.
+- `pressure_policy.json` (OPTIONAL) — policy overrides, e.g.
+  `{"mode": "off"}`. Absent file = defaults (shadow mode).
+- `.pressure_routing_disabled` — kill switch flag file. `touch` it to
+  disable all pressure computation instantly; delete to re-enable.
+
+Observability: `GET /pressure` on the proxy port returns the current band,
+mode, kill-switch status, and last 20 shadow decisions. Silent model
+rewrites now emit `X-Served-Model` / `X-Downgrade-Reason` response headers
+(rewrite behavior itself unchanged).
+
+NOTE: the FSM bridge loads at proxy start. After deploying changes to
+`zai_proxy.py`, restart the proxy process to activate. The drift-guard
+cron does NOT watch zai_proxy.py (only rate_limit_gate.py).
+
+
 ## Provenance — manager-deployed gate/proxy scripts (2026-08-16)
 
 `rate_limit_gate.py` and `zai_proxy.py` are MANAGER-DEPLOYED from

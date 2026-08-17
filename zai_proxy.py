@@ -1170,13 +1170,14 @@ try:
         return kf
 
     _shadow_optimizer = _RoutingOptimizer(peak_hours_utc=(6, 10), peak_mult=3.0)
-    # zai_ours — flat-rate subscription, high tier, cheapest off-peak, peak window
-    _shadow_optimizer.add_provider(
-        "zai_ours", _shadow_pk(0.068), _ShadowConsumptionKalman(),
-        quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,
-        peak_hours_utc=(6, 10), peak_mult=3.0,
-    )
-    # zai_friend — derived +21% premium over ours (ADR-005), high tier
+    # S3b (t_872743b5, 2026-08-17): zai_ours REMOVED from the shadow set —
+    # the 'ours' z.ai key was disabled Aug 15 and retired permanently per
+    # Felix (friend-only policy, never re-add). It was never health-gated
+    # in this tap, so it kept winning the shadow comparison and polluting
+    # routing_shadow_decisions with un-actionable 'ours' proposals
+    # (~4.8k disagreeing rows/24h). Live key handling is untouched.
+    # zai_friend — derived +21% premium over the historical ours rate
+    # (ADR-005: ours 0.068 → friend 0.068 * 1.21), high tier
     _shadow_optimizer.add_provider(
         "zai_friend", _shadow_pk(0.068 * 1.21), _ShadowConsumptionKalman(),
         quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,

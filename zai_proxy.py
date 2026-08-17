@@ -365,7 +365,9 @@ def _pressure_shadow(model: str | None, session_id: str | None,
     """Shadow-only pressure decision (t_4dfaf0d5). NEVER raises.
 
     Reads the Ollama regime from the live quota status when the caller
-    doesn't supply one. Returns a pressure_fsm.Decision or None
+    doesn't supply one, and forwards the proxy's current friend-key lock
+    verdict (LOCK_THRESHOLDS) so decisions never overstate capacity
+    (cold review pass 1). Returns a pressure_fsm.Decision or None
     (tracker missing / kill switch active / any internal error).
     """
     if _pressure_tracker is None or not model:
@@ -374,8 +376,15 @@ def _pressure_shadow(model: str | None, session_id: str | None,
         regime = ollama_regime
         if regime is None:
             regime = _get_ollama_quota_status().get("regime")
+        friend_locked = False
+        try:
+            windows = quota_cache.get("friend", ([], 0.0))[0]
+            friend_locked = bool(is_key_locked("friend", windows)[0])
+        except Exception:
+            pass  # no cache yet / helper missing -> unlocked default
         return _pressure_tracker.shadow_decision(
-            model, session_id=session_id, ollama_regime=regime)
+            model, session_id=session_id, ollama_regime=regime,
+            friend_locked=friend_locked)
     except Exception:
         return None  # shadow hooks must never break request handling
 
@@ -4282,7 +4291,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
-        elif self.path == "/pressure":
+        elif self.path == "/pressure" or self.path.startswith("/pressure?"):
             # Pressure FSM observability (S2b, t_4dfaf0d5) — band state,
             # mode, kill-switch status and last shadow decisions.
             self.close_connection = True

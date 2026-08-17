@@ -336,9 +336,15 @@ class TestInteractiveClassifier(unittest.TestCase):
         self.assertFalse(self.fsm.classify_interactive("never-seen"))
 
     def test_classifier_never_raises_on_missing_table(self):
+        """DB error -> protected (interactive=True), NOT background.
+
+        (Cold review pass 1: the old default was background=False, which
+        would have downgraded interactive sessions in enforce mode —
+        a D10 invariant breach.)
+        """
         env2 = TrackerEnv()
         try:
-            self.assertFalse(env2.tracker().classify_interactive("sess-E"))
+            self.assertTrue(env2.tracker().classify_interactive("sess-E"))
         finally:
             env2.cleanup()
 
@@ -615,6 +621,131 @@ class TestShadowLogging(unittest.TestCase):
         self.assertIn("last_decisions", snap)
         self.assertEqual(len(snap["last_decisions"]), 1)
         self.assertEqual(snap["last_decisions"][0]["reason"], "bg_kept")
+
+
+class ColdReviewFixTests(unittest.TestCase):
+    """Hardening fixes from the cold review (GLM pass 1, t_4dfaf0d5).
+
+    Each test maps to a review issue: policy type validation, same-tick
+    predictive-escalation cancellation, classifier error direction,
+    hot-path connection count/timeout, state-file caching, retention.
+    """
+
+    def setUp(self):
+        self.env = TrackerEnv()
+        self.conn = self.env.seed_db()
+
+    def tearDown(self):
+        self.conn.close()
+        self.env.cleanup()
+
+    # ── minor 2: policy type validation ─────────────────────────────
+    def test_policy_wrong_types_fall_back_to_defaults(self):
+        self.env.policy_path.write_text(json.dumps(
+            {"dwell_seconds": "abc", "escalate_amber_pct": None,
+             "mode": 123}))
+        fsm = self.env.tracker()
+        self.assertEqual(fsm.mode(), "shadow")  # invalid mode -> default
+        # update() must not raise, and dwell must be the default 600s:
+        # escalate to AMBER at t0, try to de-escalate at t0+599 (still
+        # within default dwell) with used below the de-escalation bar.
+        fsm.update(_inputs(used_pct_5h=70.0))
+        self.env.now[0] += 599
+        snap = fsm.update(_inputs(used_pct_5h=10.0))
+        self.assertEqual(snap["state"], "AMBER")  # dwell (default) held it
+
+    # ── minor 1: predictive escalation must not be cancelled ────────
+    def test_predictive_red_survives_no_data_same_tick(self):
+        # Persisted GREEN, dwell long elapsed, no observed used_pct but
+        # Kalman says exhaust within 0.5h -> RED must STICK (the old code
+        # immediately de-escalated it to AMBER because no-data == low).
+        self.env.state_path.write_text(json.dumps(
+            {"state": "GREEN", "since": self.env.now[0] - 99999}))
+        fsm = self.env.tracker()
+        snap = fsm.update(_inputs(used_pct_5h=None, will_exhaust=True,
+                                  exhausts_in_hours=0.5, uncertainty=0.0))
+        self.assertEqual(snap["state"], "RED")
+
+    def test_no_data_without_prediction_still_deescalates(self):
+        # G2 unchanged: no data + no prediction == low pressure after dwell.
+        self.env.state_path.write_text(json.dumps(
+            {"state": "RED", "since": self.env.now[0] - 99999}))
+        fsm = self.env.tracker()
+        snap = fsm.update(_inputs(used_pct_5h=None, will_exhaust=False))
+        self.assertEqual(snap["state"], "AMBER")
+
+    # ── minor 4: classifier error direction ─────────────────────────
+    def test_classifier_db_error_defaults_interactive(self):
+        """DB failure must protect the session (interactive), not expose it.
+
+        Shadow mode only mislogs; in enforce mode (S2c) the old default
+        would have downgraded a live interactive session (D10 breach).
+        """
+        env = TrackerEnv()
+        try:
+            env.db_path.write_text("not a sqlite file")
+            fsm = env.tracker()
+            self.assertTrue(fsm.classify_interactive("some-session"))
+        finally:
+            env.cleanup()
+
+    def test_first_request_of_session_still_background(self):
+        """Successful query, no prior row -> background (D4, unchanged)."""
+        fsm = self.env.tracker()
+        self.assertFalse(fsm.classify_interactive("never-seen"))
+
+    # ── major: hot path budget ──────────────────────────────────────
+    def test_shadow_decision_uses_one_connection(self):
+        """gather + classify + log must share ONE sqlite connection."""
+        fsm = self.env.tracker()
+        with patch("pressure_fsm.sqlite3.connect",
+                   wraps=sqlite3.connect) as conn_mock:
+            fsm.shadow_decision("glm-5.3", session_id="sx",
+                                ollama_regime="included")
+        self.assertLessEqual(conn_mock.call_count, 1,
+                             f"hot path opened {conn_mock.call_count} conns")
+
+    def test_connect_timeout_is_request_safe(self):
+        """sqlite busy timeout must be short (<= 1s), never 5s."""
+        fsm = self.env.tracker()
+        with patch("pressure_fsm.sqlite3.connect",
+                   wraps=sqlite3.connect) as conn_mock:
+            fsm.shadow_decision("glm-5.3", session_id="sx",
+                                ollama_regime="included")
+        for call in conn_mock.call_args_list:
+            timeout = call.kwargs.get("timeout", 5)
+            self.assertLessEqual(timeout, 1.0)
+
+    # ── minor 3: state cached in memory, written atomically ─────────
+    def test_state_not_reread_from_disk_per_request(self):
+        fsm = self.env.tracker()
+        fsm.update(_inputs(used_pct_5h=70.0))          # -> AMBER, persisted
+        self.env.state_path.unlink()                    # simulate loss
+        self.env.now[0] += 100                          # within dwell (<600s)
+        snap = fsm.update(_inputs(used_pct_5h=10.0))    # low input
+        # In-memory band must survive disk loss; a disk-reread impl
+        # would reset to GREEN (fresh since) and lose the AMBER band.
+        self.assertEqual(snap["state"], "AMBER")
+
+    # ── retention: pressure_decisions must not grow unbounded ───────
+    def test_old_pressure_decisions_are_pruned(self):
+        fsm = self.env.tracker()
+        # First call creates the table (log_decision) + a current row.
+        fsm.shadow_decision("glm-5.3", session_id=None,
+                            ollama_regime="included")
+        old = self.env.now[0] - 40 * 86400
+        self.conn.execute(
+            "INSERT INTO pressure_decisions (ts, state, requested_model,"
+            " would_serve_model, would_provider, interactive, reason)"
+            " VALUES (?, 'RED', 'glm-5.3', 'glm-5.3', 'friend', 0, 'x')",
+            (old,))
+        self.conn.commit()
+        self.env.now[0] += 3600 * 2  # past the prune interval
+        fsm.shadow_decision("glm-5.3", session_id=None,
+                            ollama_regime="included")
+        ts_min = self.conn.execute(
+            "SELECT MIN(ts) FROM pressure_decisions").fetchone()[0]
+        self.assertGreater(ts_min, old)
 
 
 if __name__ == "__main__":

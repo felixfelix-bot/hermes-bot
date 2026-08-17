@@ -32,3 +32,4 @@ venv/
 zai_usage.db
 api_burn.db
 model_cache.db
+zai_usage.db*

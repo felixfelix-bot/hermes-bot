@@ -3228,12 +3228,17 @@ class Handler(BaseHTTPRequestHandler):
             return {"enabled": False, "mode": "error", "error": str(e)}
 
     def _try_ollama_cloud(self, body: bytes, model: str | None,
-                           response_buffer: bytearray, t0: float) -> bool:
+                           response_buffer: bytearray, t0: float,
+                           reason: str | None = None) -> bool:
         """Forward request to Ollama Cloud API (primary provider, not failover).
 
         Ollama Cloud is a $20/mo flat-rate subscription with no per-token cost.
         During z.ai peak hours (UTC 6-10), z.ai burns 3x quota — Ollama has no
         peak pricing, making it the preferred provider during peak.
+
+        reason: optional override for the key-decision log (used by the S2c
+        pressure enforce hook); None keeps the historical peak/exhausted
+        reasons so existing call sites are unchanged.
 
         Returns True on success (response already sent),
         False on failure (caller should try next provider).
@@ -3301,7 +3306,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Log key decision so dashboard shows the switch to ollama_cloud
                 _log_key_decision(
                     chosen_key="ollama_cloud",
-                    reason="peak_hour_ollama_primary" if _is_peak_hour() else "zai_both_keys_exhausted_ollama_fallback",
+                    reason=reason or ("peak_hour_ollama_primary" if _is_peak_hour() else "zai_both_keys_exhausted_ollama_fallback"),
                 )
                 return True
 
@@ -3326,6 +3331,44 @@ class Handler(BaseHTTPRequestHandler):
                           "(price → +inf until Monday reset)", flush=True)
             return False
         except Exception:
+            return False
+
+    def _pressure_enforce(self, decision, body: bytes, t0: float) -> bool:
+        """S2c (t_b82e5665): apply an enforce-mode pressure decision.
+
+        Acts ONLY when the tracker runs mode=enforce AND the decision is
+        an Ollama downgrade (reason bg_downgraded_ollama[_extra] — the
+        AMBER/RED background-glm-5.3 rows of the decision matrix): serve
+        glm-5.2 via ollama_cloud (flat-rate, protects the friend key).
+        Interactive, friend-path and last-resort decisions return False
+        untouched; a failed Ollama attempt also returns False so the
+        normal cascade serves the request (bg_last_resort semantics —
+        enforcement can redirect pressure traffic, never block it).
+        Never raises.
+        """
+        try:
+            if (decision is None
+                    or _pressure_tracker is None
+                    or not _pressure_tracker.enabled()
+                    or _pressure_tracker.mode() != "enforce"):
+                return False
+            if decision.reason not in ("bg_downgraded_ollama",
+                                       "bg_downgraded_ollama_extra"):
+                return False
+            served_model = decision.would_serve_model or "glm-5.2"
+            response_buffer = bytearray()
+            served = self._try_ollama_cloud(
+                body, served_model, response_buffer, t0,
+                reason=f"pressure_enforce_{decision.state.lower()}")
+            if served:
+                return True
+            print(f"[pressure] enforce: ollama_cloud unavailable — "
+                  f"falling back to normal cascade ({decision.reason})",
+                  flush=True)
+            return False
+        except Exception as e:
+            print(f"[pressure] enforce error ({type(e).__name__}: {e}) — "
+                  f"normal cascade", flush=True)
             return False
 
     def _try_telnyx(self, body: bytes, model: str | None,
@@ -3647,6 +3690,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(err)))
             self.end_headers()
             self.wfile.write(err)
+            return
+
+        # ── Pressure FSM enforce hook (S2c, t_b82e5665) ────────────────
+        # Apply the S2b decision when the tracker runs mode=enforce:
+        # AMBER/RED background glm-5.3 → ollama_cloud glm-5.2 (flat-rate,
+        # friend-key protection). Shadow mode, non-Ollama decisions and
+        # Ollama failures all fall through to the normal cascade below.
+        # Ordered AFTER the global spend cap so enforcement can never
+        # bypass the runaway-loop circuit breaker.
+        if self._pressure_enforce(self._pressure_decision, body, t0):
             return
 
         # Step 1c: Ollama-only models — route directly to Ollama Cloud

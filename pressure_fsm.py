@@ -166,6 +166,23 @@ class PressureTracker:
                         pass                  # wrong type -> keep default
         except Exception:
             pass  # missing/corrupt policy -> defaults (mode=shadow)
+        # Range safety (cold review pass 2): dwell can't disable anti-flap,
+        # and the hysteresis ordering must hold — inverted thresholds are a
+        # flap machine, so an invalid numeric set falls back to defaults.
+        # Designed defaults 45 < 60 <= 60 < 75 (desc_amber == esc_amber is
+        # the designed band: escalate >=60, RED->AMBER at <=60 + dwell).
+        try:
+            if pol["dwell_seconds"] < 60:
+                pol["dwell_seconds"] = 60.0
+            ordered = (pol["deescalate_green_pct"] < pol["deescalate_amber_pct"]
+                       <= pol["escalate_amber_pct"] < pol["escalate_red_pct"])
+            if not ordered:
+                for k in ("deescalate_green_pct", "deescalate_amber_pct",
+                          "escalate_amber_pct", "escalate_red_pct",
+                          "predictive_amber_hours", "predictive_red_hours"):
+                    pol[k] = DEFAULT_POLICY[k]
+        except (KeyError, TypeError):
+            pass
         self._policy_cache, self._policy_stamp = pol, stamp
         return pol
 
@@ -551,12 +568,16 @@ class PressureTracker:
                 conn.close()
         except Exception:
             pass
+        try:
+            since = float(state.get("since", now))
+        except (TypeError, ValueError):
+            since = now  # half-corrupt state file -> age 0, /pressure stays up
         return {
             "enabled": self.enabled(),
             "mode": self.mode(),
             "state": state.get("state"),
             "since": state.get("since"),
-            "state_age_s": max(0, int(now - float(state.get("since", now)))),
+            "state_age_s": max(0, int(now - since)),
             "updated_at": state.get("updated_at"),
             "capacity": state.get("capacity"),
             "last_decisions": decisions,

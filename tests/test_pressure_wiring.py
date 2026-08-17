@@ -197,6 +197,19 @@ class TestColdReviewFixWiring(unittest.TestCase):
         h.send_response.assert_called_once_with(200)
         h._pressure_tracker_snapshot.assert_called_once()
 
+    def test_do_GET_pressure_limit_param_is_passed_and_clamped(self):
+        """Kimi review 2: ?limit= must reach the snapshot, clamped to [1,100]."""
+        for q, expected in [("?limit=5", 5), ("?limit=9999", 100),
+                            ("?limit=0", 20), ("?limit=abc", 20),
+                            ("?other=x", 20)]:
+            h = MagicMock()
+            h.path = "/pressure" + q
+            h.do_GET = z.Handler.do_GET.__get__(h, z.Handler)
+            h._pressure_tracker_snapshot = MagicMock(return_value={})
+            h.do_GET()
+            h._pressure_tracker_snapshot.assert_called_once_with(
+                limit=expected)
+
 
 if __name__ == "__main__":
     unittest.main()

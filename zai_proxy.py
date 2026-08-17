@@ -4294,10 +4294,19 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/pressure" or self.path.startswith("/pressure?"):
             # Pressure FSM observability (S2b, t_4dfaf0d5) — band state,
             # mode, kill-switch status and last shadow decisions.
+            # ?limit=N clamps to [1,100]; anything invalid -> 20.
             self.close_connection = True
+            limit = 20
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                _q = parse_qs(urlsplit(self.path).query)
+                _n = int(_q.get("limit", [""])[0])
+                limit = 20 if _n < 1 else (100 if _n > 100 else _n)
+            except Exception:
+                pass
             try:
                 payload = json.dumps(
-                    self._pressure_tracker_snapshot(limit=20),
+                    self._pressure_tracker_snapshot(limit=limit),
                     indent=2).encode()
             except Exception as e:
                 payload = json.dumps(

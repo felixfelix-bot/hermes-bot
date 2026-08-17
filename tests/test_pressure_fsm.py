@@ -747,6 +747,34 @@ class ColdReviewFixTests(unittest.TestCase):
             "SELECT MIN(ts) FROM pressure_decisions").fetchone()[0]
         self.assertGreater(ts_min, old)
 
+    # ── review pass-2 minors ─────────────────────────────────────────
+    def test_snapshot_survives_non_numeric_since(self):
+        """Kimi review 2: half-corrupt state file must not break /pressure."""
+        fsm = self.env.tracker()
+        self.env.state_path.write_text('{"state": "GREEN", "since": "abc"}')
+        fsm._state_cache = None  # force disk re-read
+        snap = fsm.snapshot()
+        self.assertIn(snap["state"], ("GREEN", "AMBER", "RED"))
+        self.assertIsInstance(snap["state_age_s"], int)
+
+    def test_policy_clamps_negative_dwell(self):
+        """dwell_seconds=-5 must not disable anti-flap."""
+        self.env.policy_path.write_text(json.dumps({
+            "dwell_seconds": -5}))
+        fsm = self.env.tracker()
+        pol = fsm._policy()
+        self.assertGreaterEqual(pol["dwell_seconds"], 60)
+
+    def test_policy_rejects_inverted_thresholds(self):
+        """escalate_amber below deescalate_green (flap machine) -> defaults restored."""
+        self.env.policy_path.write_text(json.dumps({
+            "escalate_amber_pct": 50, "deescalate_green_pct": 55}))
+        fsm = self.env.tracker()
+        pol = fsm._policy()
+        self.assertGreater(pol["escalate_amber_pct"], pol["deescalate_green_pct"])
+        self.assertGreater(pol["escalate_red_pct"], pol["escalate_amber_pct"])
+        self.assertGreater(pol["deescalate_amber_pct"], pol["deescalate_green_pct"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,13 @@
+{
+  "escalate_amber_pct": 56.0,
+  "escalate_red_pct": 92.0,
+  "deescalate_amber_pct": 56.0,
+  "deescalate_green_pct": 41.0,
+  "source": "adaptive_percentile_fsm",
+  "updated_at": 1786989346.1793783,
+  "samples_used": 305,
+  "amber_share": 0.15,
+  "red_share": 0.05,
+  "p_amber_used_pct_raw": 56.0,
+  "p_red_used_pct_raw": 92.0
+}

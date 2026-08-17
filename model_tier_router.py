@@ -8,13 +8,21 @@ Computes the appropriate model tier based on:
 - Task urgency (urgent/standard/background)
 - Client X-Model-Tier header override
 
-Imported by zai_proxy.py — zero agent/worker changes needed.
+Intended for import by zai_proxy.py — currently NOT wired (see NOTE below).
 
 THRESHOLD RULES (computed from historic Kalman data, stored as percentiles):
-  - exhausts_in_hours > p90 → reasoning (glm-5.2), ~10% of time
-  - p10 < exhausts_in_hours ≤ p90 → standard (glm-4.5), ~80% of time
+  - exhausts_in_hours > p90 → reasoning (glm-5.3), ~10% of time
+  - p10 < exhausts_in_hours ≤ p90 → standard (glm-5.2), ~80% of time
   - exhausts_in_hours ≤ p10 → economy (glm-4.5-flash), ~10% of time
   - Peak hours (06-10 UTC): always economy, regardless of thresholds
+
+NOTE (S3a, t_12f0a395): this module is currently ORPHANED — nothing
+imports it (zai_proxy's `_select_model_tier` hook is None, and
+threshold_tracker.py's lazy import of compute_thresholds_from_history
+targets a function that does not exist here; that fallback path is dead).
+Kept up to date (MODEL_MAP glm-5.3 generation) so future wiring starts
+from a correct map. Thresholds file contract is fed by
+adaptive_model_tuner.py (legacy output).
 """
 from __future__ import annotations
 import json
@@ -31,8 +39,8 @@ TIER_VALUES = {TIER_ECONOMY: 0, TIER_STANDARD: 1, TIER_REASONING: 2}
 TIER_NAMES_REVERSE = {v: k for k, v in TIER_VALUES.items()}
 
 MODEL_MAP = {
-    TIER_REASONING: "glm-5.2",
-    TIER_STANDARD:  "glm-4.5",
+    TIER_REASONING: "glm-5.3",
+    TIER_STANDARD:  "glm-5.2",
     TIER_ECONOMY:   "glm-4.5-flash",
 }
 

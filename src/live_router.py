@@ -42,6 +42,11 @@ from typing import Any
 _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
+# Also expose src/ itself so bare sibling imports (from X import ...) resolve
+# when this module is imported as part of the src package (proxy context).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from src.price_kalman import MIN_EFFECTIVE_PRICE, PriceKalman
 from src.consumption_kalman import ConsumptionKalman
@@ -65,6 +70,9 @@ from src.pricing_engine import (
     DEEPINFRA_CREDIT_PRESSURE_ONSET,
     DEEPINFRA_CREDIT_PRESSURE_ASYMPTOTE,
     DEEPINFRA_STARTING_BALANCE,
+    TELNYX_CREDIT_PRESSURE_ONSET,
+    TELNYX_CREDIT_PRESSURE_ASYMPTOTE,
+    TELNYX_STARTING_BALANCE,
 )
 from src.quota_window_extractor import _KNOWN_WINDOW_NAMES, _ERROR_SENTINEL_PCT
 from src.cpvo_calculator import CPVOCalculator
@@ -77,6 +85,7 @@ from src.real_price_tracker import (
     get_all_trailing_rates_per_model,
     SEED_RATES as _RPT_SEED_RATES,
     LAST_RESORT_RATES as _RPT_LAST_RESORT_RATES,
+    LAST_RESORT_RATES_PER_MODEL as _RPT_LAST_RESORT_RATES_PER_MODEL,
 )
 
 __all__ = ["LiveRouter"]
@@ -121,6 +130,7 @@ _QUOTA_PRESSURE_ENABLED: bool = (
 # PPQ:         credit-depletion fraction (from /credits/balance).
 # OpenRouter:  credit-depletion (self-tracked from SUM(cost_usd) in DB).
 # DeepInfra:   credit-depletion (self-tracked from SUM(cost_usd) in DB).
+# Telnyx:      credit-depletion (self-tracked from SUM(cost_usd) in DB).
 #
 # FELIX FINAL DECISION (Aug 5 19:00): asymptote=1.5 on ALL endpoints (squeeze
 # cheap keys as long as possible). Onsets stagger: z.ai=0.60, ollama=0.70,
@@ -136,6 +146,9 @@ _OPENROUTER_CREDIT_PRESSURE_ENABLED: bool = (
 )
 _DEEPINFRA_CREDIT_PRESSURE_ENABLED: bool = (
     os.environ.get("DEEPINFRA_CREDIT_PRESSURE_ENABLED", "false").lower() in ("1", "true", "yes")
+)
+_TELNYX_CREDIT_PRESSURE_ENABLED: bool = (
+    os.environ.get("TELNYX_CREDIT_PRESSURE_ENABLED", "false").lower() in ("1", "true", "yes")
 )
 
 # ── RP-5: Proactive GLM-5.2 throttling ──────────────────────────────────────
@@ -155,8 +168,9 @@ _DEEPINFRA_CREDIT_PRESSURE_ENABLED: bool = (
 #   >= _BLOCK_THRESHOLD (1.0):     BLOCK — ollama_cloud excluded entirely for
 #                                  non-exclusive models (breaker tripped)
 #
-# Exclusive models (kimi-*, gpt-oss, etc.) ALWAYS bypass throttling — they
-# short-circuit to ollama_cloud in _OLLAMA_EXCLUSIVE_MODELS above.
+# Exclusive models (kimi-k2.7-code, gpt-oss, etc.) ALWAYS bypass throttling —
+# they short-circuit to ollama_cloud in _OLLAMA_EXCLUSIVE_MODELS above.
+# (kimi-k3:cloud was removed — Telnyx now serves kimi-k3, so it failovers.)
 _THROTTLE_ENABLED: bool = (
     os.environ.get("OLLAMA_THROTTLE_ENABLED", "false").lower() in ("1", "true", "yes")
 )
@@ -177,9 +191,12 @@ _THROTTLE_PRICE_MULT: float = float(
 # These models are ONLY served by ollama_cloud — no other provider has them.
 # They MUST always route to ollama_cloud regardless of price or quota regime.
 # PPQ/OpenRouter/DeepInfra do not serve kimi or gpt-oss models.
+# NOTE: kimi-k3:cloud was removed from this set (TELNYX-2.4) because Telnyx
+# now serves kimi-k3 (confirmed by TELNYX-6.2 live integration test, bee55ce).
+# This allows the router to failover kimi-k3 requests to telnyx when Ollama
+# quota is exhausted, instead of returning (None, None).
 _OLLAMA_EXCLUSIVE_MODELS: frozenset[str] = frozenset({
     "kimi-k2.7-code",
-    "kimi-k3:cloud",
     "gpt-oss:120b",
     "gemma4:31b",
     "qwen3.5:397b",
@@ -325,13 +342,18 @@ def _resolve_model_rate_source(
 
     Same strict fallback chain as :func:`_resolve_model_rate`, but also returns
     a *source* tag so the shadow logger (PM-T6) can record whether a provider's
-    price was a direct model measurement, the provider ``_default`` seed, or the
-    conservative floor. Chain (docs/plan-per-model-pricing.md §3.6 / §5.4):
+    price was a direct model measurement, the provider ``_default`` seed, a
+    per-model last-resort estimate, or the conservative floor. Chain
+    (docs/plan-per-model-pricing.md §3.6 / §5.4):
 
       1. **Per-model measured rate** — ``rates[provider][model]`` → ``"measured"``
-      2. **Provider-level ``_default``** — ``rates[provider]["_default"]``
+      2. **Per-model last-resort estimate** —
+         :data:`LAST_RESORT_RATES_PER_MODEL[provider][model]`
+         (positive) → ``"last_resort"`` (cold-start per-model estimate from
+         known list prices, e.g. telnyx/kimi-k3 at $2.70/M)
+      3. **Provider-level ``_default``** — ``rates[provider]["_default"]``
          (positive) → ``"seed"`` (the flat per-provider blend / cold-start seed)
-      3. **Conservative fallback** — :data:`_UNKNOWN_MODEL_FALLBACK` ($1.0/M)
+      4. **Conservative fallback** — :data:`_UNKNOWN_MODEL_FALLBACK` ($1.0/M)
          → ``"fallback"``
 
     Pure function: no I/O, no side effects. Wired into the failover path by T3
@@ -340,6 +362,18 @@ def _resolve_model_rate_source(
     prov_rates = rates.get(provider, {})
     if model and model in prov_rates:
         return float(prov_rates[model]), "measured"
+    # ── TELNYX-4.3: per-model last-resort estimates ──────────────────────
+    # When the provider has no measured per-model data yet (cold-start) but
+    # we have a hardcoded per-model last-resort rate (e.g. telnyx/kimi-k3 at
+    # $2.70/M from TELNYX-4.2), use it before falling back to the blended
+    # _default. This ensures kimi-k3 on telnyx is priced at $2.70/M (real
+    # per-model cost) instead of $5.40/M (blended), so the optimizer can
+    # correctly compare it against other providers' kimi-k3 rates.
+    if model:
+        lr_per_model = _RPT_LAST_RESORT_RATES_PER_MODEL.get(provider, {})
+        lr_model_rate = lr_per_model.get(model)
+        if lr_model_rate is not None and lr_model_rate > 0:
+            return float(lr_model_rate), "last_resort"
     default = prov_rates.get("_default")
     if default is not None and default > 0:
         return float(default), "seed"
@@ -356,16 +390,20 @@ def _resolve_model_rate(
     Chain (docs/plan-per-model-pricing.md §3.6 / §5.4):
 
       1. **Per-model measured rate** — ``rates[provider][model]``
-      2. **Provider-level ``_default``** — ``rates[provider]["_default"]``
+      2. **Per-model last-resort estimate** —
+         :data:`LAST_RESORT_RATES_PER_MODEL[provider][model]`
+         (cold-start per-model estimate, e.g. telnyx/kimi-k3 at $2.70/M)
+      3. **Provider-level ``_default``** — ``rates[provider]["_default"]``
          (the current flat per-provider behavior, just less precise)
-      3. **Conservative fallback** — :data:`_UNKNOWN_MODEL_FALLBACK` ($1.0/M)
+      4. **Conservative fallback** — :data:`_UNKNOWN_MODEL_FALLBACK` ($1.0/M)
 
-    Step 3 fires when the provider is unknown (absent from ``rates``) or its
+    Step 4 fires when the provider is unknown (absent from ``rates``) or its
     ``_default`` is missing/non-positive. The expensive floor means the
     optimizer never under-prices an unmeasured model — the exact failure that
     caused the kimi-k3 485× cost blindspot (an expensive model priced at the
-    cheap provider blend). When ``model`` is ``None`` step 1 is skipped and the
-    provider ``_default`` is returned, preserving the legacy per-provider path.
+    cheap provider blend). When ``model`` is ``None`` step 1-2 are skipped and
+    the provider ``_default`` is returned, preserving the legacy per-provider
+    path.
 
     Pure function: no I/O, no side effects — trivially unit-testable (the T2
     gate). Wired into the failover path by T3; delegates to
@@ -383,6 +421,7 @@ _QUOTA_TOTALS: dict[str, float] = {
     "ppq":          float("inf"),  # pay-per-token, no hard quota
     "openrouter":   float("inf"),
     "deepinfra":    float("inf"),  # pay-per-token, no hard quota
+    "telnyx":       float("inf"),  # credit-based, no hard quota
 }
 
 # z.ai peak hours (UTC) — Ollama/PPQ/OpenRouter/DeepInfra have no peak
@@ -634,7 +673,7 @@ def _compute_credit_pressure(
 
 
 # All providers that are NOT z.ai — these are the failover candidates
-_EXTERNAL_PROVIDERS = ("ollama_cloud", "ppq", "openrouter", "deepinfra")
+_EXTERNAL_PROVIDERS = ("ollama_cloud", "ppq", "openrouter", "deepinfra", "telnyx")
 
 # ── CPVO cache (Phase 2.5.4) ─────────────────────────────────────────────────
 # Effective-rate lookups query the telemetry DB; cache them so a hot failover
@@ -947,9 +986,10 @@ class LiveRouter:
                 ``"coding"``, ``"reasoning"``, ``"chat"``, ``"simple"``.
                 Defaults to ``"coding"``.
             model: The model name being requested (EUv2-4). When this is
-                an Ollama-only model (kimi-k3:cloud, kimi-k2.7-code,
-                gpt-oss:120b, gemma4:31b, qwen3.5:397b), the router
+                an Ollama-only model (kimi-k2.7-code, gpt-oss:120b,
+                gemma4:31b, qwen3.5:397b), the router
                 always returns ollama_cloud regardless of quota regime.
+                kimi-k3:cloud is no longer exclusive — Telnyx serves it.
                 When it is a non-exclusive model (e.g. glm-5.2) and the
                 regime is "extra", the router reroutes to a cheaper
                 per-token provider.
@@ -979,18 +1019,41 @@ class LiveRouter:
         peak: bool = False,
         failure_counts: dict[str, int] | None = None,
         pace_windows: dict[str, list[tuple[float, float, float, float, float]]] | None = None,
-    ) -> str | None:
-        """Choose the primary provider (Phase 4 — not yet active).
+    ) -> tuple[str | None, str | None]:
+        """Choose the primary provider using the LiveRouter pricing engine.
 
-        Currently a stub. Returns None (no decision). Will be implemented
-        in Phase 4 when the LiveRouter takes over primary routing from
-        the production proxy's key-rotation logic.
+        Delegates to the same :meth:`_do_select_failover` logic that powers
+        the failover path — the optimizer considers ALL providers (z.ai keys,
+        ollama_cloud, DeepInfra, PPQ, OpenRouter, Telnyx) and picks the
+        cheapest healthy one with up-to-date Kalman prices.
+
+        Unlike the failover path (which is only consulted when both z.ai keys
+        are 429-exhausted), :meth:`select_primary` can return a z.ai key, an
+        external provider, or None (no viable provider). When used as the
+        primary routing decision it replaces ``best_key()`` for the canary
+        percentage of requests.
+
+        Returns:
+            ``(chosen_provider, chosen_model)`` — a provider name and the
+            model that provider should serve, or ``(None, None)`` if no
+            provider is viable. ``chosen_provider`` is guaranteed ``str``
+            when not ``None`` (not a nested tuple — safe for direct use in
+            routing dispatch).
+
+        Never raises — wraps everything in try/except. Any error returns
+        ``(None, None)`` so the canary fallback (``best_key()``) takes over.
         """
         try:
-            # Phase 4 stub — not yet implemented
-            return None
+            with self._lock:
+                (pick, pick_model), _ = self._do_select_failover(
+                    quota_state, health_state, peak,
+                    failure_counts, pace_windows, "coding", model,
+                )
+                if pick:
+                    return (pick, pick_model)
+                return (None, None)
         except Exception:
-            return None
+            return (None, None)
 
     def record_request(
         self,
@@ -1198,9 +1261,10 @@ class LiveRouter:
         self._last_quota_pressure = quota_pressure
 
         # ── RP-5: Ollama-exclusive model short-circuit ──────────────────
-        # If the requested model is Ollama-exclusive (kimi, gpt-oss, etc.),
-        # it MUST route to ollama_cloud regardless of regime. No other
-        # provider serves these models.
+        # If the requested model is Ollama-exclusive (kimi-k2.7-code,
+        # gpt-oss, etc.), it MUST route to ollama_cloud regardless of
+        # regime. No other provider serves these models.
+        # (kimi-k3:cloud removed — Telnyx now serves kimi-k3.)
         if model is not None and model in _OLLAMA_EXCLUSIVE_MODELS:
             # Check if ollama_cloud is healthy and has quota
             oc_healthy = health_state.get("ollama_cloud", True)
@@ -1340,9 +1404,16 @@ class LiveRouter:
             if model and _PER_MODEL_PRICING_ENABLED:
                 _prov_rates = self._base_rates_per_model.get(name, {})
                 _prov_default = _prov_rates.get("_default")
+                # ── TELNYX-4.3: also check per-model last-resort estimates ──
+                # A provider is "served" if it has a measured per-model rate,
+                # a positive _default, OR a per-model last-resort entry
+                # (e.g. telnyx serves kimi-k3 at $2.70/M even before we have
+                # measured data).
+                _lr_per_model = _RPT_LAST_RESORT_RATES_PER_MODEL.get(name, {})
                 _model_served = (
                     model in _prov_rates
                     or (_prov_default is not None and _prov_default > 0)
+                    or (model in _lr_per_model and _lr_per_model[model] > 0)
                 )
                 if not _model_served:
                     # Provider can't serve this model → unreachable for it.
@@ -1365,8 +1436,9 @@ class LiveRouter:
                     # ollama_cloud as unreachable via the breaker (mirrors the
                     # exhausted-regime path) so the optimizer filters it cleanly
                     # instead of carrying +inf through the PriceKalman arithmetic.
-                    # Exclusive models (kimi-k3, …) already short-circuited to
-                    # ollama_cloud above and never reach this branch.
+                    # Exclusive models (kimi-k2.7-code, …) already
+                    # short-circuited to ollama_cloud above and never
+                    # reach this branch.
                     healthy = False
                 else:
                     base_rate = base_rate * quota_pressure
@@ -1435,6 +1507,23 @@ class LiveRouter:
                 elif di_pressure != 1.0:
                     base_rate = base_rate * di_pressure
 
+            # ── Universal pressure: Telnyx (self-tracked, credit-based) ────
+            # Same credit-depletion curve as OpenRouter/DeepInfra.
+            # onset=0.80, asymptote=1.5, hard_limit=True. At exhausted
+            # balance → +inf → breaker tripped (no credits = no service).
+            if name == "telnyx" and _TELNYX_CREDIT_PRESSURE_ENABLED:
+                tx_pressure = _compute_credit_pressure(
+                    self._db_path, "telnyx",
+                    TELNYX_STARTING_BALANCE,
+                    TELNYX_CREDIT_PRESSURE_ONSET,
+                    TELNYX_CREDIT_PRESSURE_ASYMPTOTE,
+                )
+                self._last_credit_pressures[name] = tx_pressure
+                if math.isinf(tx_pressure):
+                    healthy = False
+                elif tx_pressure != 1.0:
+                    base_rate = base_rate * tx_pressure
+
             # ── RP-5: Proactive throttle / block (legacy — pressure OFF only) ─
             # When continuous pressure is ON this block is skipped entirely:
             # the pressure factor already raises the price smoothly.
@@ -1455,6 +1544,7 @@ class LiveRouter:
                 or (name == "ppq" and _PPQ_QUOTA_PRESSURE_ENABLED)
                 or (name == "openrouter" and _OPENROUTER_CREDIT_PRESSURE_ENABLED)
                 or (name == "deepinfra" and _DEEPINFRA_CREDIT_PRESSURE_ENABLED)
+                or (name == "telnyx" and _TELNYX_CREDIT_PRESSURE_ENABLED)
             )
             prov_quota_total = (
                 None if prov_has_pressure

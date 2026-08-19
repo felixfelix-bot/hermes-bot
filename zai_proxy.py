@@ -2675,12 +2675,15 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     """
     try:
         tier = _spend_tier(key_name)
-        # Use manager cap for: ollama_cloud, friend (used for manager-tier work),
-        # deepinfra (preferred external failover), telnyx/ppq/openrouter (paid
-        # external failover). Default: worker cap.
-        if tier in ("ollama_cloud", "friend", "deepinfra", "telnyx", "ppq", "openrouter", "routstr"):
+        # Use manager cap for: ours (z.ai subscription — serves manager-tier
+        # models like glm-5.2/glm-5.3), ollama_cloud, friend (courtesy key for
+        # manager-tier work), deepinfra (preferred external failover),
+        # telnyx/ppq/openrouter (paid external failover).
+        # Default: worker cap for unknown/unrecognised keys.
+        if tier in ("ours", "ollama_cloud", "friend", "deepinfra",
+                    "telnyx", "ppq", "openrouter", "routstr"):
             cap = _SPEND_CAP_MANAGER  # Manager-tier work, generous allowance
-        else:  # ours or unknown
+        else:  # unknown or unrecognised keys
             cap = _SPEND_CAP_WORKER    # Default worker cap
         
         today = _date.today().isoformat()
@@ -4697,7 +4700,13 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as _ppq_e:
                     data["ppq_policy"] = {"error": str(_ppq_e)}
                 for tier, spend, calls, tokens in rows:
-                    cap = _SPEND_CAP_MANAGER if tier == "manager" else _SPEND_CAP_WORKER
+                    # Map key-based tier names to the correct cap for display.
+                    # "ours" is the z.ai subscription — serves manager models
+                    # (glm-5.2/glm-5.3) so gets manager cap.
+                    _MANAGER_DISPLAY_TIERS = {"ours", "ollama_cloud", "friend",
+                                              "deepinfra", "telnyx", "ppq",
+                                              "openrouter", "routstr"}
+                    cap = _SPEND_CAP_MANAGER if tier in _MANAGER_DISPLAY_TIERS else _SPEND_CAP_WORKER
                     data["tiers"][tier] = {
                         "spend_usd": round(spend, 4),
                         "cap_usd": cap,

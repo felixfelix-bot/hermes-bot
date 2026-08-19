@@ -148,6 +148,7 @@ __all__ = [
     "get_zai_per_model_rates",
     # ── Tunables / constants ────────────────────────────────────────────────────
     "LAST_RESORT_RATES",
+    "LAST_RESORT_RATES_PER_MODEL",
     "DEFAULT_DB_PATH",
     "CACHE_TTL_SECONDS",
     "MIN_CALLS_FOR_RATE",
@@ -199,6 +200,16 @@ LAST_RESORT_RATES: dict[str, float] = {
     "ppq":                0.14,     # known list price
     "openrouter":         0.135,    # known list price
     "deepinfra":          1.30,     # known list price
+}
+
+#: Per-model last-resort rates ($/M). Keyed by provider, then model name.
+#: Used when the router asks for a specific model's rate but the provider-level
+#: :data:`LAST_RESORT_RATES` entry is too coarse (e.g. Telnyx has a flat-rate
+#: subscription that hides per-model cost spread).
+LAST_RESORT_RATES_PER_MODEL: dict[str, dict[str, float]] = {
+    "telnyx": {
+        "glm-5.3": 13.50,   # z.ai GLM-5.3 — premium tier (same subscription)
+    },
 }
 
 # ── Trailing-rate configuration (T6) ─────────────────────────────────────────

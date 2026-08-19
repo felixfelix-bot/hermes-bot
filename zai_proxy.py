@@ -266,7 +266,7 @@ _LIVE_ROUTER = None
 _LIVE_ROUTING_FLAG = os.path.expanduser("~/.hermes/bot/.enable_live_routing")
 try:
     from src.live_router import LiveRouter as _LiveRouterCls
-    _LIVE_ROUTER = _LiveRouterCls(
+    _LIVE_ROUTER = _LiveRouterCls.get_instance(
         db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"),
         converged_rates=_converged_rates,
     )
@@ -1167,6 +1167,51 @@ def _snapshot_health() -> dict:
         pass
     return h
 
+
+def _snapshot_failures() -> dict[str, int]:
+    """Build failure_counts dict from _zai_key_health for LiveRouter.
+
+    Extracts ``consecutive_failures`` per key so the router can apply
+    graduated health pricing (failed keys are penalised).  Keys with
+    no failures or no health entry are excluded (zero-fill happens
+    inside LiveRouter's pricing engine).
+    """
+    f = {}
+    try:
+        for name, health in _zai_key_health.items():
+            fc = health.get("consecutive_failures", 0)
+            if fc > 0:
+                f[name] = fc
+    except Exception:
+        pass
+    return f
+
+
+def _tier_to_task_type(tier_hint: str) -> str:
+    """Map an X-Model-Tier header value to a LiveRouter task_type string.
+
+    Tier values from the client (flash/air/mid/heavy) map to task
+    difficulty categories the router uses for model selection:
+
+        * heavy     → ``\"coding\"``    (most capable, highest cost ceiling)
+        * mid       → ``\"reasoning\"`` (balanced, mid-cost)
+        * air/flash → ``\"simple\"``    (cheapest viable tier)
+        * absent/unknown → ``\"coding\"`` (default — no downgrade assumed)
+
+    The router only uses task_type for per-model pricing and model
+    mapping (model_mapping.get_model).  z.ai-exclusive models like
+    glm-5.3 (heavy) still get substituted to glm-5.2 on failover
+    providers regardless of this mapping.
+    """
+    if tier_hint in ("heavy", "high"):
+        return "coding"
+    elif tier_hint in ("mid", "medium"):
+        return "reasoning"
+    elif tier_hint in ("air", "flash", "low"):
+        return "simple"
+    return "coding"
+
+
 # ── proactive burn-rate prediction (Phase 3) ─────────────────────────────────
 # Import the burn predictor.  Wrapped so a broken burn_predictor.py never crashes
 # the proxy — if the import fails, proactive switching is silently disabled and
@@ -1718,7 +1763,9 @@ def _log_live_decision(*, provider, model=None, fallback=None,
         pass
 
 
-def _consult_live_router():
+def _consult_live_router(*, model: str | None = None,
+                          task_type: str = "coding",
+                          failure_counts: dict[str, int] | None = None):
     """Consult LiveRouter for a failover pick. Returns
     ``(provider, model, fallback, fallback_model)`` or ``(None, None, None,
     None)`` when disabled / unavailable / no viable pick. Never raises — any
@@ -1742,11 +1789,16 @@ def _consult_live_router():
         _pw = None
         with lock:
             _pw = dict(_pace_windows) if _pace_windows else None
+        if failure_counts is None:
+            failure_counts = _snapshot_failures()
         (pick, pick_model), (fb, fb_model) = _LIVE_ROUTER.select_failover(
             quota_state=_snapshot_quota(),
             health_state=_snapshot_health(),
             peak=_is_peak_hour(),
             pace_windows=_pw,
+            failure_counts=failure_counts,
+            task_type=task_type,
+            model=model,
         )
         if not pick:
             return (None, None, None, None)
@@ -3777,7 +3829,10 @@ class Handler(BaseHTTPRequestHandler):
             # Step 1d: Peak-hour routing — consult LiveRouter first (P3.4-fix),
             # then fall through to peak-hour Ollama pre-check.
             if peak:
-                _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+                _pick, _pick_model, _fb, _fb_model = _consult_live_router(
+                    model=original_model,
+                    task_type=_tier_to_task_type(tier_hint),
+                )
                 if _pick:
                     _log_key_decision(
                         chosen_key=_pick,
@@ -3881,7 +3936,10 @@ class Handler(BaseHTTPRequestHandler):
         # then fall through to Ollama Cloud / PPQ hardcoded chain.
         if chosen is None:
             # LiveRouter consultation (kill switch checked inside)
-            _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+            _pick, _pick_model, _fb, _fb_model = _consult_live_router(
+                model=original_model,
+                task_type=_tier_to_task_type(tier_hint),
+            )
             if _pick:
                 _log_key_decision(
                     chosen_key=_pick,
@@ -4163,7 +4221,10 @@ class Handler(BaseHTTPRequestHandler):
             # and route its pick before the hardcoded ollama->external chain.
             # Kill switch + safe fallthrough live inside _consult_live_router;
             # on any failure / no pick we fall through to the chain below.
-            _pick, _pick_model, _fb, _fb_model = _consult_live_router()
+            _pick, _pick_model, _fb, _fb_model = _consult_live_router(
+                model=original_model,
+                task_type=_tier_to_task_type(tier_hint),
+            )
             if _pick:
                 _log_key_decision(
                     chosen_key=_pick,

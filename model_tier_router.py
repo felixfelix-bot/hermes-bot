@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Quota-aware model tier routing — dynamic percentile-based thresholds.
+"""DEPRECATED (2026-08-19, t_f033219a): This module is orphaned — nothing
+imports it. Model selection is now profile-level (each Hermes profile sets
+its own model in config.yaml; the proxy passes through). The /tier endpoint
+in zai_proxy.py returns {tier: "disabled"} when this module is absent.
+Kept for historical reference only — do NOT wire this back into the proxy.
+
+Quota-aware model tier routing — dynamic percentile-based thresholds.
 
 Computes the appropriate model tier based on:
 - Dynamic thresholds: p10/p90 of Kalman exhausts_in_hours (auto-adjusted weekly)

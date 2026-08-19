@@ -4390,8 +4390,11 @@ class Handler(BaseHTTPRequestHandler):
                 if _select_model_tier is not None:
                     info = _select_model_tier(chosen, None, urgency)
                 else:
-                    info = {"tier": "unknown", "model": "glm-5.2",
-                            "reason": "model_tier_router unavailable"}
+                    # Tier router is disabled — model selection is profile-level
+                    # (each profile sets its own model in config.yaml). The proxy
+                    # passes through whatever model the profile requests.
+                    info = {"tier": "disabled", "model": "profile-level",
+                            "reason": "model selection is profile-level, proxy passes through"}
                 info["active_key"] = chosen
                 info["quota_pct"] = {n: _max_pct(v[0]) for n, v in quota_cache.items()}
             except Exception as e:

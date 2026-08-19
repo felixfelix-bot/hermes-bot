@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Recompute model tier thresholds from historic Kalman data.
+"""DEPRECATED (2026-08-19, t_f033219a): This script is orphaned — no cron
+job runs it (confirmed absent from ~/.hermes/cron/jobs.json and all profile
+cron dirs). The thresholds it computes are not read by any active code path.
+Kept for historical reference only — do NOT schedule or run this script.
+
+Recompute model tier thresholds from historic Kalman data.
 
 Computes p10 and p90 percentiles of exhausts_in_hours for each key's
 binding window (friend=5-hour, ours=weekly). These thresholds define

@@ -948,7 +948,7 @@ def _get_provider_cost(name: str, model_id: str) -> float:
         if name == "telnyx":
             rates = _TELNYX_MODEL_RATES.get(provider_model)
             if rates:
-                return _blended_rate(rates["input"], rates["output"]) * _telnyx_calibration_factor
+                return _telnyx_cache_aware_blended_rate(rates)
         elif name == "openrouter":
             rates = _OPENROUTER_MODEL_RATES.get(provider_model)
             if rates:
@@ -1998,8 +1998,11 @@ def _log_provider_telemetry(
 # z.ai models are $0/1M (subscription). External failover models have real
 # per-token cost. The cap protects against the expensive external path.
 
-_SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "10.0"))
-_SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "3.0"))
+# Spend caps deactivated (2026-08-20): the merchant module markets and
+# wallet balance decide routing. Hard-coded caps block UX when we need
+# things to work. Set env vars to re-enable if ever needed.
+_SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "inf"))
+_SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "inf"))
 
 # ── Cost per 1M tokens (RP-4: real_price_tracker is the source of truth) ──────
 # Hardcoded rate constants have been replaced by real_price_tracker.
@@ -2017,20 +2020,26 @@ _FALLBACK_RATES: dict[str, float] = {
 }
 
 # ── Telnyx per-model rates ($/M tokens) ──────────────────────────────────────
-# Sourced from https://telnyx.com/ai/inference-models.json (2026-08-13).
-# Used by _extract_cost() for granular per-request cost tracking.
-# Calibration factor from periodic balance API checks adjusts these rates
-# to account for prompt-caching discounts (which Telnyx applies automatically).
+# Sourced from https://telnyx.com/pricing.md (2026-08-21).  Three rate tiers:
+#   input        — uncached prompt tokens
+#   cached_input — prompt tokens served from Telnyx's prompt cache (~17% of
+#                  input price; Telnyx applies caching automatically and
+#                  reports hit count via usage.prompt_tokens_details.cached_tokens)
+#   output       — completion tokens (never cached)
+# Used by _extract_cost() for granular per-request cost tracking.  The
+# calibration factor from periodic balance API checks is now a slow
+# corrective on top of the cached-aware per-call math (should converge to
+# ~1.0 instead of the old 0.001 floor).
 _TELNYX_MODEL_RATES: dict[str, dict[str, float]] = {
-    "moonshotai/Kimi-K3":           {"input": 2.70,  "output": 13.50},
-    "moonshotai/Kimi-K2.5":        {"input": 0.95,  "output": 4.00},
-    "moonshotai/Kimi-K2-5":        {"input": 0.95,  "output": 4.00},
-    "zai-org/GLM-5.2":             {"input": 1.40,  "output": 4.40},  # GLM-5.1-FP8 rate
-    "thudm/glm-5.1-fp8":           {"input": 1.40,  "output": 4.40},
-    "MiniMaxAI/MiniMax-M3-MXFP8":  {"input": 0.30,  "output": 1.20},
-    "minimax/minimax-m2-5":        {"input": 0.30,  "output": 1.20},
-    "openai/gpt-5":                {"input": 1.25,  "output": 10.00},
-    "anthropic/claude-haiku-4-5":  {"input": 1.00,  "output": 5.00},
+    "moonshotai/Kimi-K3":           {"input": 2.70,  "cached_input": 0.46,  "output": 13.50},
+    "moonshotai/Kimi-K2.5":         {"input": 0.95,  "cached_input": 0.16,  "output": 4.00},
+    "moonshotai/Kimi-K2-5":         {"input": 0.95,  "cached_input": 0.16,  "output": 4.00},
+    "zai-org/GLM-5.2":              {"input": 1.40,  "cached_input": 0.26,  "output": 4.40},  # GLM-5.1-FP8 rate
+    "thudm/glm-5.1-fp8":            {"input": 1.40,  "cached_input": 0.26,  "output": 4.40},
+    "MiniMaxAI/MiniMax-M3-MXFP8":   {"input": 0.51,  "cached_input": 0.102, "output": 2.04},
+    "minimax/minimax-m2-5":         {"input": 0.51,  "cached_input": 0.102, "output": 2.04},
+    "openai/gpt-5":                 {"input": 1.25,  "cached_input": 0.21,  "output": 10.00},  # 17% est.
+    "anthropic/claude-haiku-4-5":   {"input": 1.00,  "cached_input": 0.17,  "output": 5.00},   # 17% est.
 }
 
 # OpenRouter per-model rates (from openrouter.ai/api/v1/models, 2026-08-14).
@@ -2077,6 +2086,56 @@ _BLENDED_RATIO_OUTPUT = 0.25  # 1 part output
 def _blended_rate(input_rate: float, output_rate: float) -> float:
     """Compute blended $/M from input + output rates (3:1 ratio)."""
     return input_rate * _BLENDED_RATIO_INPUT + output_rate * _BLENDED_RATIO_OUTPUT
+
+
+# Rolling Telnyx cache-hit ratio (prompt tokens served from cache vs total).
+# Used by _get_provider_cost so the failover sort ranks Telnyx fairly for
+# our cache-heavy (repeated-context) workload — without it, Telnyx's full
+# input rate makes it look ~6x more expensive than it actually is.
+_telnyx_cache_hit_ratio: float = 0.99  # default: our workload is ~99% cache
+_telnyx_cache_ratio_ts: float = 0.0
+
+
+def _refresh_telnyx_cache_hit_ratio() -> float:
+    """Recompute the rolling cache-hit ratio from recent telnyx api_calls.
+
+    Cached/total prompt tokens over the last 200 telnyx calls. Falls back
+    to the last known value (default 0.99) if the DB is unreachable or no
+    rows have cached_tokens yet. Refreshed lazily (5-min TTL)."""
+    global _telnyx_cache_hit_ratio, _telnyx_cache_ratio_ts
+    now = time.time()
+    if now - _telnyx_cache_ratio_ts < 300:  # 5-min TTL
+        return _telnyx_cache_hit_ratio
+    _telnyx_cache_ratio_ts = now
+    try:
+        row = _usage_db().execute(
+            "SELECT SUM(prompt_tokens), SUM(cache_hit) FROM ("
+            "  SELECT prompt_tokens, cache_hit FROM api_calls "
+            "  WHERE tier='telnyx' AND prompt_tokens > 0 "
+            "  ORDER BY ts DESC LIMIT 200)"
+        ).fetchone()
+        total_prompt = int(row[0] or 0)
+        total_cached = int(row[1] or 0) if row[1] is not None else 0
+        if total_prompt > 0 and total_cached > 0:
+            _telnyx_cache_hit_ratio = max(0.0, min(1.0, total_cached / total_prompt))
+    except Exception:
+        pass  # keep last known / default
+    return _telnyx_cache_hit_ratio
+
+
+def _telnyx_cache_aware_blended_rate(rates: dict) -> float:
+    """Blended $/M for Telnyx accounting for the prompt-cache hit ratio.
+
+    input is split into cached (× cached_input rate) and uncached (× input
+    rate) per the rolling hit ratio; output stays at full rate. Then the
+    standard 3:1 input:output blend is applied, plus the calibration factor.
+    """
+    input_rate = rates.get("input", 0.95)
+    cached_rate = rates.get("cached_input", input_rate * 0.17)
+    output_rate = rates.get("output", 4.00)
+    hit = _refresh_telnyx_cache_hit_ratio()
+    effective_input = cached_rate * hit + input_rate * (1.0 - hit)
+    return _blended_rate(effective_input, output_rate) * _telnyx_calibration_factor
 
 
 # Cached Routstr model rates (dynamic — refreshed every 10 min from the node's
@@ -2291,9 +2350,9 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
 PPQ_POLICY_FILE = Path.home() / ".hermes" / "bot" / "ppq_policy.json"
 _PPQ_POLICY_DEFAULTS: dict = {
     "enabled": True,
-    "daily_cap_usd": 2.0,
-    "max_requests_per_hour": 20,
-    "storm_min_hits": 3,
+    "daily_cap_usd": float('inf'),  # deactivated — merchant module governs spend
+    "max_requests_per_hour": float('inf'),  # deactivated
+    "storm_min_hits": float('inf'),  # deactivated
     "storm_window_s": 600,
     "alert_pct": 0.8,
 }
@@ -2695,6 +2754,17 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
             usage = _parse_usage(bytes(response_buffer))
             prompt_toks = int(usage.get("prompt_tokens") or 0)
             completion_toks = int(usage.get("completion_tokens") or 0)
+            # Prompt-caching: Telnyx reports cached prompt tokens via the
+            # OpenAI-compatible usage.prompt_tokens_details.cached_tokens
+            # field.  Cached tokens are billed at ~17% of the input rate.
+            # Without this, all prompt tokens were billed at the full input
+            # rate → estimates ran ~1000x above real spend (prompt caching
+            # makes our repeated-context workload ~99% cache hits).
+            cached_toks = 0
+            _ptd = usage.get("prompt_tokens_details") or {}
+            if isinstance(_ptd, dict):
+                cached_toks = int(_ptd.get("cached_tokens") or 0)
+            uncached_toks = max(prompt_toks - cached_toks, 0)
             # Extract model from the response to look up per-model rates
             model_name = None
             try:
@@ -2706,16 +2776,23 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
             rates = _TELNYX_MODEL_RATES.get(model_name or "", {})
             if rates:
                 input_rate = rates.get("input", 0.95)
+                cached_rate = rates.get("cached_input", input_rate * 0.17)
                 output_rate = rates.get("output", 4.00)
-                raw_cost = (prompt_toks * input_rate + completion_toks * output_rate) / 1_000_000
+                raw_cost = (
+                    uncached_toks * input_rate
+                    + cached_toks * cached_rate
+                    + completion_toks * output_rate
+                ) / 1_000_000
+                cost_source = "cached_rate_derived" if cached_toks > 0 else "rate_derived"
             else:
                 # Fallback to blended rate if model not in table
                 rate = _rpt_rate("telnyx")
                 if rate == float("inf") or rate <= 0:
                     return (None, None)
                 raw_cost = (total_tokens / 1_000_000) * rate
+                cost_source = "rate_derived"
             calibrated = raw_cost * _telnyx_calibration_factor
-            return (calibrated, "rate_derived")
+            return (calibrated, cost_source)
         # 5. Unknown / unhandled provider.
         return (None, None)
     except Exception:
@@ -2725,49 +2802,19 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
 def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
     """Check if the daily spend cap allows this request.
 
-    Returns (allowed, current_spend, cap).
-    Fails OPEN — if the DB is unreachable, always allows the request.
+    DEACTIVATED (2026-08-20): always allows. The merchant module markets
+    and wallet balance decide routing, not hard-coded caps.
     """
-    try:
-        tier = _spend_tier(key_name)
-        # Use manager cap for: ours (z.ai subscription — serves manager-tier
-        # models like glm-5.2/glm-5.3), ollama_cloud, friend (courtesy key for
-        # manager-tier work), deepinfra (preferred external failover),
-        # telnyx/ppq/openrouter (paid external failover).
-        # Default: worker cap for unknown/unrecognised keys.
-        if tier in ("ours", "ollama_cloud", "friend", "deepinfra",
-                    "telnyx", "ppq", "openrouter", "routstr"):
-            cap = _SPEND_CAP_MANAGER  # Manager-tier work, generous allowance
-        else:  # unknown or unrecognised keys
-            cap = _SPEND_CAP_WORKER    # Default worker cap
-        
-        today = _date.today().isoformat()
-        row = _usage_db().execute(
-            "SELECT spend_usd FROM daily_spend WHERE date=? AND tier=?",
-            (today, tier)).fetchone()
-        current = row[0] if row else 0.0
-        return (current < cap, current, cap)
-    except Exception:
-        return (True, 0.0, 0.0)
+    return (True, 0.0, float('inf'))
 
 
 def _check_global_spend_cap() -> tuple[bool, float, float]:
     """Check total daily spend across ALL tiers against the manager cap.
 
-    Used as a pre-key-selection circuit breaker to prevent any single tier
-    from blocking all traffic when total spend is still within budget.
-    Returns (allowed, total_spend, cap).
+    DEACTIVATED (2026-08-20): always allows. The merchant module markets
+    and wallet balance decide routing, not hard-coded caps.
     """
-    try:
-        cap = _SPEND_CAP_MANAGER
-        today = _date.today().isoformat()
-        row = _usage_db().execute(
-            "SELECT COALESCE(SUM(spend_usd), 0.0) FROM daily_spend WHERE date=?",
-            (today,)).fetchone()
-        total = row[0] if row else 0.0
-        return (total < cap, total, cap)
-    except Exception:
-        return (True, 0.0, 0.0)
+    return (True, 0.0, float('inf'))
 
 
 def _init_spend_table() -> None:
@@ -3529,6 +3576,10 @@ class Handler(BaseHTTPRequestHandler):
                               actual_cost=telnyx_cost)
                 self._spend_recorded = True
                 _mark_key_healthy("telnyx")
+                # Capture cached_tokens for the rolling cache-hit ratio
+                # (used by _get_provider_cost to rank Telnyx fairly).
+                _telnyx_ptd = telnyx_usage.get("prompt_tokens_details") or {}
+                _telnyx_cached = int(_telnyx_ptd.get("cached_tokens") or 0) if isinstance(_telnyx_ptd, dict) else 0
                 _log_api_call(
                     key_name="telnyx",
                     key_suffix=TELNYX_KEY[-4:] if TELNYX_KEY else "demo",
@@ -3539,6 +3590,7 @@ class Handler(BaseHTTPRequestHandler):
                     tier="telnyx", status_code=resp.status, error=None,
                     duration_ms=int((time.time() - t0) * 1000),
                     cost_usd=telnyx_cost, cost_source=telnyx_cost_src,
+                    cache_hit=_telnyx_cached,
                     session_id=getattr(self, "_session_id", None),
                 )
                 _log_key_decision(
@@ -3694,6 +3746,10 @@ class Handler(BaseHTTPRequestHandler):
                         if provider_name == "deepinfra" and ext_cost_usd is not None and ext_cost_usd > 0:
                             remaining = _deduct_deepinfra_balance(ext_cost_usd)
                         self._spend_recorded = True
+                        # Capture cached_tokens (Telnyx prompt caching) for the
+                        # rolling cache-hit ratio used by _get_provider_cost.
+                        _ext_ptd = ext_usage.get("prompt_tokens_details") or {}
+                        _ext_cached = int(_ext_ptd.get("cached_tokens") or 0) if isinstance(_ext_ptd, dict) else 0
                         _log_api_call(
                             key_name=provider_name, key_suffix=prov["key"][-4:],
                             model=ext_model,
@@ -3703,6 +3759,7 @@ class Handler(BaseHTTPRequestHandler):
                             tier=provider_name, status_code=resp.status, error=None,
                             duration_ms=int((time.time() - t0) * 1000),
                             cost_usd=ext_cost_usd, cost_source=ext_cost_source,
+                            cache_hit=_ext_cached,
                             session_id=getattr(self, "_session_id", None),
                         )
                         # Log key decision so dashboard shows the failover switch

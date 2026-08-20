@@ -2889,6 +2889,18 @@ def _calibrate_telnyx_rates():
     _telnyx_calibration_factor to correct for prompt-caching discounts and
     any rate discrepancies.
 
+    Two windows are used:
+      * first run after startup: TELNYX_STARTING_BALANCE vs the CURRENT
+        balance, against the SUM of ALL telnyx costs ever recorded in
+        api_calls (both sides cover the same history — a 10-minute
+        estimated window against a multi-day balance delta produced
+        garbage factors and the calibration never converged)
+      * steady state: 10-minute balance delta vs 10-minute estimated spend
+
+    The factor floor is 0.001 because Telnyx prompt caching can make the
+    effective price 3 orders of magnitude below list (measured 2026-08-20:
+    $5.02 real vs $5,925 estimated since Aug 12 ≈ 0.00085).
+
     The calibration factor is applied to all future _extract_cost() results
     for telnyx until the next calibration. This gives accurate spend tracking
     without adding latency to individual requests.
@@ -2901,28 +2913,46 @@ def _calibrate_telnyx_rates():
         real_balance = _get_telnyx_balance()
         if real_balance is None:
             return
-        # Get the last calibration timestamp (or 10 min ago if first run)
-        last_ts = getattr(_calibrate_telnyx_rates, "_last_ts", time.time() - 600)
+        first_run = not hasattr(_calibrate_telnyx_rates, "_last_ts")
+        # Get the last calibration timestamp
+        last_ts = getattr(_calibrate_telnyx_rates, "_last_ts", None)
         now = time.time()
-        # Sum estimated costs for telnyx since last calibration
+        # Sum estimated costs for telnyx since last calibration. First run
+        # after startup sums the ENTIRE history so the estimated window
+        # matches the balance window (starting balance → now).
         try:
-            row = _usage_db().execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
-                "WHERE key_name = 'telnyx' AND ts >= ?",
-                (last_ts,)).fetchone()
+            if first_run:
+                row = _usage_db().execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                    "WHERE key_name = 'telnyx'").fetchone()
+            else:
+                row = _usage_db().execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                    "WHERE key_name = 'telnyx' AND ts >= ?",
+                    (last_ts,)).fetchone()
             estimated_spend = row[0] if row else 0.0
         except Exception:
             estimated_spend = 0.0
         # Get the balance at last calibration (or starting balance if first run)
         last_balance = getattr(_calibrate_telnyx_rates, "_last_balance", TELNYX_STARTING_BALANCE)
         real_spend = last_balance - real_balance
+        if real_spend < 0:
+            # Balance went UP — topped up (or refund). Rebasing the
+            # baseline is the only sane move; skip factor update.
+            _calibrate_telnyx_rates._last_ts = now
+            _calibrate_telnyx_rates._last_balance = real_balance
+            return
         # Calculate calibration factor
         if estimated_spend > 0 and real_spend > 0:
             factor = real_spend / estimated_spend
-            # Clamp to reasonable range (0.1x to 10x) to avoid wild swings
-            _telnyx_calibration_factor = max(0.1, min(10.0, factor))
-            print(f"[telnyx] calibration: real_spend=${real_spend:.4f} "
-                  f"estimated=${estimated_spend:.4f} factor={_telnyx_calibration_factor:.3f} "
+            # Clamp to a reasonable range (0.001x to 10x). The low floor
+            # matters: prompt caching makes the effective price ~1000x
+            # below list rates; the old 0.1x floor kept estimates ~1185x
+            # too high (never converged).
+            _telnyx_calibration_factor = max(0.001, min(10.0, factor))
+            print(f"[telnyx] calibration{'(first-run, full history)' if first_run else ''}: "
+                  f"real_spend=${real_spend:.4f} "
+                  f"estimated=${estimated_spend:.4f} factor={_telnyx_calibration_factor:.6f} "
                   f"balance=${real_balance:.2f}", flush=True)
         # Store state for next calibration
         _calibrate_telnyx_rates._last_ts = now

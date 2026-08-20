@@ -411,7 +411,16 @@ def attribute_window(since: float, min_tokens: int = 0):
 def write_rows(since: float, rows: list[dict]) -> None:
     conn = sqlite3.connect(ATTR_DB)
     conn.executescript(ATTR_SCHEMA)
-    conn.execute("DELETE FROM attribution WHERE window_since = ?", (since,))
+    # Retention fix (2026-08-20): each run rebuilds the FULL window from
+    # zai_usage.db, so any older window is obsolete. `since` is a fresh
+    # unique float every run — the old exact-match DELETE was a no-op and
+    # overlapping windows accumulated forever (34 MB after 2 runs; any
+    # whole-table report double-counted the overlap exactly 2x).
+    conn.execute("DELETE FROM attribution WHERE window_since <= ?", (since,))
+    conn.commit()
+    # Reclaim space dropped by the retention purge (DB was 34 MB after
+    # two overlapping windows). VACUUM must run outside a transaction.
+    conn.execute("VACUUM")
     now = time.time()
     conn.executemany(
         """

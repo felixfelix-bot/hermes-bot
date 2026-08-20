@@ -522,10 +522,13 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
         "glm-5.2":                    "zai-org/GLM-5.2",
     },
+    # Telnyx is Kimi-only by operator decision (2026-08-20): glm-5.2 ran
+    # ~$12/M blended here vs ~$0.26-1.30/M on deepinfra/ppq/openrouter.
+    # The generic failover guard below skips Telnyx for any model missing
+    # from this map (verbatim-name passthrough would otherwise still hit it).
     "telnyx": {
         "kimi-k3":         "moonshotai/Kimi-K3",
         "kimi-k2.5":       "moonshotai/Kimi-K2.5",
-        "glm-5.2":         "zai-org/GLM-5.2",
         "gpt-5":           "openai/gpt-5",
         "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
         "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",
@@ -3560,6 +3563,12 @@ class Handler(BaseHTTPRequestHandler):
             if not prov.get("key"):
                 continue
             if not _is_provider_funded(name):
+                continue
+            # Telnyx Kimi-only guard (2026-08-20): skip Telnyx in generic
+            # failover when the model has no explicit telnyx translation.
+            # Prevents glm-5.2-class traffic (MANAGER_FALLBACK_MODEL) from
+            # reaching the ~$12/M per-token route.
+            if name == "telnyx" and ext_model not in _PROVIDER_MODEL_NAMES.get("telnyx", {}):
                 continue
             # D6: PPQ good-use policy — daily cap / hourly cap / retry-storm
             # gate, enforced before PPQ can even join the candidate list.

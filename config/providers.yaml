@@ -103,10 +103,14 @@ strategy:
   # task_type ∈ {coding, reasoning, chat, simple}.
   # src/model_mapping.py reads this; falls back to hardcoded MODEL_MAP when
   # a cell is missing.
+  # ── GLM-5.3 upgrade (2026-08-21) ──────────────────────────────────────────
+  # coding+reasoning bumped to glm-5.3: same token price as 5.2 but better
+  # agentic/tool-use benchmarks. ollama_cloud stays glm-5.2 (no 5.3 on ollama);
+  # proxy has built-in 5.3→5.2 downgrade for ollama fallback.
   model_map:
     zai:
-      coding: "glm-5.2"
-      reasoning: "glm-4.5"
+      coding: "glm-5.3"
+      reasoning: "glm-5.3"
       chat: "glm-4.5-air"
       simple: "glm-4.5-flash"
     deepinfra:

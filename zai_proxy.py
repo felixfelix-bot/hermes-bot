@@ -1469,7 +1469,8 @@ def _usage_db() -> sqlite3.Connection:
             duration_ms INTEGER,
             cost_usd REAL DEFAULT NULL,
             cost_source TEXT DEFAULT NULL,
-            session_id TEXT DEFAULT NULL
+            session_id TEXT DEFAULT NULL,
+            task_type TEXT DEFAULT NULL
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS key_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1495,6 +1496,16 @@ def _usage_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_calls_session_ts "
             "ON api_calls(session_id, ts)")
+        # ── CG-5 task-type attribution (cost-gate-reform-v2 §CG-5) ─────────
+        # Same idempotent-ALTER pattern as session_id above: legacy DBs get
+        # the nullable task_type column added on connect; fresh DBs get it
+        # via the CREATE TABLE above. NO backfill — historical rows keep
+        # task_type NULL by design (the value was never known, and CG-5
+        # never guesses; see docs/task-type-logging.md).
+        try:
+            conn.execute("ALTER TABLE api_calls ADD COLUMN task_type TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already migrated
         conn.execute("CREATE INDEX IF NOT EXISTS idx_key_decisions_ts ON key_decisions(ts)")
         conn.execute("""CREATE TABLE IF NOT EXISTS model_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1645,11 +1656,50 @@ def _extract_model(body: bytes):
     return None
 
 
+def _extract_task_type(body: bytes):
+    """Best-effort extraction of the `task_type` field from a request body.
+
+    CG-5 (cost-gate-reform-v2 §CG-5): only plain string values count —
+    anything else (numbers, null, lists, objects) is treated as unset.
+    Whitespace-only values are unset. NEVER guessed, NEVER coerced.
+    """
+    if not body:
+        return None
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            tt = obj.get("task_type")
+            if isinstance(tt, str):
+                return tt.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_task_type(headers, body: bytes):
+    """Resolve the CG-5 task type for a request: X-Task-Type header wins.
+
+    Precedence: ``X-Task-Type`` request header (stripped; empty/whitespace
+    counts as absent) over the body ``task_type`` field. Returns None when
+    neither is set — unknown/unset is logged as NULL, never guessed.
+    Loopback trust boundary — same handling as X-Hermes-Session.
+    """
+    try:
+        header_val = (headers.get("X-Task-Type", "") or "") if headers is not None else ""
+        tt = header_val.strip()
+        if tt:
+            return tt
+    except Exception:
+        pass  # headers object misbehaving — fall through to body
+    return _extract_task_type(body)
+
+
 def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   prompt_tokens=0, completion_tokens=0, total_tokens=0,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
                   status_code=None, error=None, duration_ms=None,
-                  cost_usd=None, cost_source=None, session_id=None):
+                  cost_usd=None, cost_source=None, session_id=None,
+                  task_type=None):
     """Log one API call event. Swallows all errors — logging must never break a request.
 
     cost_usd / cost_source (RP-2): the real $ cost of this call and how it was
@@ -1660,41 +1710,59 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
     the X-Hermes-Session request header. NULL when the client doesn't send it
     (pre-upgrade agents, curl probes) — those rows stay unattributed and are
     covered by the time-window fallback join.
+
+    task_type (CG-5, cost-gate-reform-v2 §CG-5): the caller-declared task
+    type, from the X-Task-Type header (wins) or the body task_type field.
+    NULL when unset/unknown — NEVER guessed. Threaded into EVERY logging
+    site (z.ai primary, ollama_cloud, telnyx, external failover hops).
     """
     try:
         _usage_db().execute(
             "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
             "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-            "status_code, error, duration_ms, cost_usd, cost_source, session_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status_code, error, duration_ms, cost_usd, cost_source, session_id, "
+            "task_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
              total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-             duration_ms, cost_usd, cost_source, session_id))
+             duration_ms, cost_usd, cost_source, session_id, task_type))
     except Exception:
-        # Fallback 1: session_id column absent (DB predates the §1.4
-        # migration) but cost columns present — retry without session_id.
+        # Fallback 1: task_type column absent (DB predates the CG-5
+        # migration) — retry without task_type (it is nullable telemetry;
+        # losing it is acceptable, losing the row is not).
         try:
             _usage_db().execute(
                 "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
                 "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-                "status_code, error, duration_ms, cost_usd, cost_source) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status_code, error, duration_ms, cost_usd, cost_source, session_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
                  total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-                 duration_ms, cost_usd, cost_source))
+                 duration_ms, cost_usd, cost_source, session_id))
         except Exception:
-            # Fallback 2: cost_usd/cost_source columns absent too (pre-RP-1
-            # DB) — retry with the base columns so we don't lose the row.
+            # Fallback 2: session_id column absent (DB predates the §1.4
+            # migration) but cost columns present — retry without it.
             try:
                 _usage_db().execute(
                     "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
                     "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
-                    "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "status_code, error, duration_ms, cost_usd, cost_source) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
                      total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-                     duration_ms))
+                     duration_ms, cost_usd, cost_source))
             except Exception:
-                pass
+                # Fallback 3: cost_usd/cost_source columns absent too (pre-RP-1
+                # DB) — retry with the base columns so we don't lose the row.
+                try:
+                    _usage_db().execute(
+                        "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
+                        "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
+                        "status_code, error, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
+                         total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
+                         duration_ms))
+                except Exception:
+                    pass
 
 
 def _log_key_decision(*, chosen_key, reason, ours_pct=0, friend_pct=0,
@@ -2764,6 +2832,15 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
             _ptd = usage.get("prompt_tokens_details") or {}
             if isinstance(_ptd, dict):
                 cached_toks = int(_ptd.get("cached_tokens") or 0)
+            # Fallback: if the response didn't report cached_tokens (Telnyx
+            # SSE often omits prompt_tokens_details), estimate from the
+            # rolling cache-hit ratio.  Without this, ALL prompt tokens get
+            # billed at the full input rate, inflating cost ~6× and making
+            # the calibration factor fight a losing battle.
+            if cached_toks == 0 and prompt_toks > 0:
+                hit = _refresh_telnyx_cache_hit_ratio()
+                if hit > 0:
+                    cached_toks = int(prompt_toks * hit)
             uncached_toks = max(prompt_toks - cached_toks, 0)
             # Extract model from the response to look up per-model rates
             model_name = None
@@ -2937,16 +3014,26 @@ def _calibrate_telnyx_rates():
     any rate discrepancies.
 
     Two windows are used:
-      * first run after startup: TELNYX_STARTING_BALANCE vs the CURRENT
-        balance, against the SUM of ALL telnyx costs ever recorded in
-        api_calls (both sides cover the same history — a 10-minute
-        estimated window against a multi-day balance delta produced
-        garbage factors and the calibration never converged)
+      * first run after startup: snapshot the current balance and SKIP the
+        factor update.  Historically the first run summed ALL historical
+        cost_usd against (STARTING_BALANCE - current_balance), but the
+        historical cost_usd rows were themselves computed with a stale
+        factor, so the denominator was garbage and the factor either
+        spiked to the ceiling (inflating future costs 10×) or floored
+        (under-reporting).  A clean 10-minute window starts on the next
+        tick.
       * steady state: 10-minute balance delta vs 10-minute estimated spend
 
     The factor floor is 0.001 because Telnyx prompt caching can make the
     effective price 3 orders of magnitude below list (measured 2026-08-20:
     $5.02 real vs $5,925 estimated since Aug 12 ≈ 0.00085).
+
+    The factor CEILING is 1.0 — the calibration can only DISCOUNT the
+    rate-derived estimate, never inflate it.  A ceiling above 1.0 creates a
+    runaway feedback loop: a bad denominator (garbage historical cost_usd)
+    pushes the factor up, which inflates future cost_usd, which raises the
+    next denominator further.  This is what produced the 2026-08-20
+    $377.14 "burn" on an account whose total balance only dropped $6.08.
 
     The calibration factor is applied to all future _extract_cost() results
     for telnyx until the next calibration. This gives accurate spend tracking
@@ -2964,19 +3051,24 @@ def _calibrate_telnyx_rates():
         # Get the last calibration timestamp
         last_ts = getattr(_calibrate_telnyx_rates, "_last_ts", None)
         now = time.time()
-        # Sum estimated costs for telnyx since last calibration. First run
-        # after startup sums the ENTIRE history so the estimated window
-        # matches the balance window (starting balance → now).
+        # First run after startup: snapshot the current balance and skip
+        # the factor update.  Summing ALL historical cost_usd (which was
+        # computed with a stale/broken factor) against the lifetime balance
+        # delta produces a garbage denominator and the factor either spikes
+        # or floors.  A clean 10-minute window starts on the next tick.
+        if first_run:
+            _calibrate_telnyx_rates._last_ts = now
+            _calibrate_telnyx_rates._last_balance = real_balance
+            print(f"[telnyx] calibration(first-run): snapshot balance=${real_balance:.2f}, "
+                  f"factor stays at {_telnyx_calibration_factor:.6f} (clean window starts next tick)",
+                  flush=True)
+            return
+        # Sum estimated costs for telnyx since last calibration.
         try:
-            if first_run:
-                row = _usage_db().execute(
-                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
-                    "WHERE key_name = 'telnyx'").fetchone()
-            else:
-                row = _usage_db().execute(
-                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
-                    "WHERE key_name = 'telnyx' AND ts >= ?",
-                    (last_ts,)).fetchone()
+            row = _usage_db().execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                "WHERE key_name = 'telnyx' AND ts >= ?",
+                (last_ts,)).fetchone()
             estimated_spend = row[0] if row else 0.0
         except Exception:
             estimated_spend = 0.0
@@ -2992,12 +3084,16 @@ def _calibrate_telnyx_rates():
         # Calculate calibration factor
         if estimated_spend > 0 and real_spend > 0:
             factor = real_spend / estimated_spend
-            # Clamp to a reasonable range (0.001x to 10x). The low floor
-            # matters: prompt caching makes the effective price ~1000x
-            # below list rates; the old 0.1x floor kept estimates ~1185x
-            # too high (never converged).
-            _telnyx_calibration_factor = max(0.001, min(10.0, factor))
-            print(f"[telnyx] calibration{'(first-run, full history)' if first_run else ''}: "
+            # Clamp to [0.001, 1.0] — the factor can only DISCOUNT the
+            # rate-derived estimate, never inflate it.  The ceiling was
+            # 10.0 historically, which let a bad denominator (e.g. cached
+            # garbage cost_usd rows from a prior broken factor) push the
+            # factor to 10.0 and inflate future estimates 10×, creating a
+            # runaway feedback loop (2026-08-20: $377.14 "burn" on a $6.08
+            # account).  Prompt caching makes the true price up to ~1000×
+            # below list rates, so the 0.001 floor is still needed.
+            _telnyx_calibration_factor = max(0.001, min(1.0, factor))
+            print(f"[telnyx] calibration: "
                   f"real_spend=${real_spend:.4f} "
                   f"estimated=${estimated_spend:.4f} factor={_telnyx_calibration_factor:.6f} "
                   f"balance=${real_balance:.2f}", flush=True)
@@ -3437,6 +3533,7 @@ class Handler(BaseHTTPRequestHandler):
                     duration_ms=int((time.time() - t0) * 1000),
                     cost_usd=_oc_cost, cost_source=_oc_cost_src,
                     session_id=getattr(self, "_session_id", None),
+                    task_type=getattr(self, "_task_type", None),
                 )
                 # Log key decision so dashboard shows the switch to ollama_cloud
                 _log_key_decision(
@@ -3592,6 +3689,7 @@ class Handler(BaseHTTPRequestHandler):
                     cost_usd=telnyx_cost, cost_source=telnyx_cost_src,
                     cache_hit=_telnyx_cached,
                     session_id=getattr(self, "_session_id", None),
+                    task_type=getattr(self, "_task_type", None),
                 )
                 _log_key_decision(
                     chosen_key="telnyx",
@@ -3761,6 +3859,7 @@ class Handler(BaseHTTPRequestHandler):
                             cost_usd=ext_cost_usd, cost_source=ext_cost_source,
                             cache_hit=_ext_cached,
                             session_id=getattr(self, "_session_id", None),
+                            task_type=getattr(self, "_task_type", None),
                         )
                         # Log key decision so dashboard shows the failover switch
                         _log_key_decision(
@@ -3817,6 +3916,14 @@ class Handler(BaseHTTPRequestHandler):
         # session, threaded into every _log_api_call below. Loopback trust
         # boundary — same handling as X-Model-Tier (proxy is localhost-only).
         self._session_id = (self.headers.get("X-Hermes-Session", "") or "").strip() or None
+
+        # CG-5 task-type attribution (cost-gate-reform-v2 §CG-5): the
+        # caller-DECLARED task type — X-Task-Type header wins over the body
+        # task_type field; unset/unknown -> None (never guessed; NULL in
+        # api_calls). Threaded into every _log_api_call below, including
+        # ollama_cloud / telnyx / external failover hops. Read-only with
+        # respect to the body — the forwarded request is untouched.
+        self._task_type = _resolve_task_type(self.headers, body)
 
         # ── Pressure FSM shadow hook (S2b, t_4dfaf0d5) ────────────────────
         # Compute + log the pressure decision this request WOULD get.
@@ -4370,6 +4477,7 @@ class Handler(BaseHTTPRequestHandler):
                 duration_ms=int((time.time() - t0) * 1000),
                 cost_usd=_zai_cost, cost_source=_zai_cost_src,
                 session_id=getattr(self, "_session_id", None),
+                task_type=getattr(self, "_task_type", None),
             )
             if not getattr(self, '_spend_recorded', False):
                 _record_spend(key_used, model, _zai_tokens)
@@ -4801,18 +4909,30 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
         elif self.path == "/v1/models" or self.path == "/models":
             # Model listing — return stub so Hermes doesn't 404 → fall back to PPQ
+            # Includes sats_pricing fields so the Routstr SDK accepts these
+            # models into its price-ranked provider list (the SDK silently
+            # drops models without sats_pricing). Values are near-zero because
+            # zai_proxy is free locally (flat-rate subscriptions upstream).
             self.close_connection = True
             now = int(time.time())
+            _sp = {
+                "prompt": 0.000001, "completion": 0.000001, "request": 1,
+                "image": 0, "web_search": 0, "internal_reasoning": 0,
+                "max_completion_cost": 2, "max_prompt_cost": 2, "max_cost": 3,
+            }
+            def _m(mid, owner):
+                return {"id": mid, "object": "model", "created": now,
+                        "owned_by": owner, "sats_pricing": dict(_sp)}
             models_data = {
                 "object": "list",
                 "data": [
-                    {"id": "glm-5.3", "object": "model", "created": now, "owned_by": "zai"},
-                    {"id": "glm-5.2", "object": "model", "created": now, "owned_by": "zai"},
-                    {"id": "glm-4.5-flash", "object": "model", "created": now, "owned_by": "zai"},
-                    {"id": "glm-4.5-air", "object": "model", "created": now, "owned_by": "zai"},
-                    {"id": "kimi-k2.7-code", "object": "model", "created": now, "owned_by": "ollama"},
-                    {"id": "kimi-k3:cloud", "object": "model", "created": now, "owned_by": "ollama"},
-                    {"id": "kimi-k3", "object": "model", "created": now, "owned_by": "telnyx"},
+                    _m("glm-5.3", "zai"),
+                    _m("glm-5.2", "zai"),
+                    _m("glm-4.5-flash", "zai"),
+                    _m("glm-4.5-air", "zai"),
+                    _m("kimi-k2.7-code", "ollama"),
+                    _m("kimi-k3:cloud", "ollama"),
+                    _m("kimi-k3", "telnyx"),
                 ]
             }
             payload = json.dumps(models_data).encode()

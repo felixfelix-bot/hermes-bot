@@ -20,10 +20,28 @@ in config so the next session starts with the correct window size.
 
 | File | Purpose |
 |------|---------|
-| `dynamic_context_length_governor.py` | Main governor script |
+| `dynamic_context_length_governor.py` | Main governor script (multi-profile) |
 | `model_context_registry.json` | Model → max context length mapping |
 | `dynamic_context_state.json` | Last detection result and state |
-| `test_dynamic_context_length_governor.py` | Test suite (36 tests, 90% coverage) |
+| `test_dynamic_context_length_governor.py` | Test suite |
+
+## Multi-Profile Support
+
+The governor iterates over ALL profiles in `~/.hermes/profiles/*/` and
+applies the same context-length logic to each one. Profiles are discovered
+dynamically via `discover_profiles()` — any subdirectory of
+`~/.hermes/profiles/` containing a `config.yaml` is eligible.
+
+- **Discovery**: `discover_profiles()` scans `~/.hermes/profiles/` for
+  directories with `config.yaml`, returns sorted list of profile names.
+- **Per-profile processing**: `process_profile(name)` runs the full
+  detection → lookup → apply chain for a single profile.
+- **Skipped profiles**: Directories without `config.yaml` are logged and
+  skipped. Profiles where the detected model is `None` or the context
+  length matches current config are no-ops.
+- **Backward compat**: `main(profiles=None)` discovers all profiles
+  automatically. `main(profiles=["manager"])` processes a single profile
+  (useful for testing and backward compatibility).
 
 ## How It Works
 
@@ -56,8 +74,8 @@ safety margin when the advertised context window is too aggressive.
 
 ### Config Update
 
-Applies via `hermes config set model.context_length <value>`, which:
-- Updates `~/.hermes/profiles/manager/config.yaml`
+Applies via `hermes --profile <name> config set model.context_length <value>`, which:
+- Updates `~/.hermes/profiles/<name>/config.yaml` for each discovered profile
 - Takes effect at the **next session start** (not mid-session)
 - Is a no-op if the value matches the current config
 

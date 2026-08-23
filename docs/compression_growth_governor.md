@@ -53,11 +53,35 @@ zai_usage.db ───────────────► measure_growth_rat
 4. **Chained after cost governor** — runs in the same 15-minute cron slot
    but after the cost governor, composing (not clobbering) its output.
 
+5. **Multi-profile** — iterates over ALL profiles in `~/.hermes/profiles/`.
+   The growth rate is measured **globally** from `zai_usage.db` (which does
+   not track per-profile sessions); the threshold computation is per-profile
+   because each profile can have a different `context_length`. Profiles are
+   discovered via `discover_profiles()` and logged individually.
+
+## Multi-Profile Support
+
+The governor now manages ALL profiles, not just `manager`:
+
+- **Discovery**: `discover_profiles()` returns all profile directories under
+  `~/.hermes/profiles/` that contain `config.yaml`.
+- **Per-profile threshold**: Each profile's `context_length` and current
+  `compression.threshold` are read from its own `config.yaml`. The growth
+  rate (Kalman estimate) is shared globally, but the computed threshold
+  differs per profile because `MIN_THRESHOLD = 64000 / context_length`
+  depends on each profile's context length.
+- **Application**: `apply_threshold(new_value, config_path, profile_name)`
+  calls `hermes --profile <name> config set compression.threshold <value>`
+  for each profile individually.
+- **Audit**: `_write_audit()` records the profile name in the audit JSON.
+- **Skipped profiles**: Profiles without `config.yaml` are logged to stderr
+  and included in the output as skipped entries.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `compression_growth_governor.py` | Main governor: Kalman filter, control law, CLI application |
+| `compression_growth_governor.py` | Main governor: Kalman filter, control law, multi-profile CLI |
 | `compression_growth_state.json` | Persisted Kalman state (auto-created on first run) |
 | `compression_growth_override.json` | Audit record of threshold decisions |
 | `compression_growth_health.py` | Health check / status report |

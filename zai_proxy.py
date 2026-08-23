@@ -343,6 +343,38 @@ except Exception as _rqe:
     print(f"[routstr] balance bridge DISABLED — {_rqe}", flush=True)
     _routstr_quota_entry_fn = None
 
+# ── NeuralWatt credit-balance bridge (NW-BALANCE) ───────────────────────────
+# quota_state['neuralwatt'] was hardcoded {used_pct:0.0, remaining:inf} —
+# spend tracking was invisible to the pricing engine. The $258-in-one-day
+# incident burned ~3,300 glm-5.2 calls through neuralwatt with no guardrail
+# in place because the proxy literally saw "infinity remaining".
+#
+# NeuralWatt has NO balance API. The bridge imports
+# `neuralwatt_quota_entry` from src.balance_collectors, which self-tracks
+# spend by summing cost_usd from api_calls WHERE tier='neuralwatt' in
+# zai_usage.db (where zai_proxy writes every request), subtracts from
+# NEURALWATT_STARTING_BALANCE (default $100), and exposes a daily-cap
+# guardrail (NEURALWATT_DAILY_CAP, default $10/day).
+#
+# When daily spend exceeds the cap, the entry surfaces is_daily_cap_exceeded=True
+# and we mark the key unhealthy so the router drops neuralwatt from rotation
+# until UTC midnight (when daily_spend resets). Revert-safe: any failure → the
+# old optimistic {used_pct:0.0, remaining:inf} so routing never breaks.
+# REVERT: delete this block + restore the one-line hardcode
+# `snap["neuralwatt"] = {"used_pct": 0.0, "remaining": float("inf")}` in
+# _snapshot_quota(), and `h["neuralwatt"] = True` in _snapshot_health().
+_neuralwatt_quota_entry_fn = None
+try:
+    from src.balance_collectors import neuralwatt_quota_entry as _neuralwatt_quota_entry_fn
+    print("[neuralwatt] balance bridge loaded — quota_state['neuralwatt'] reads self-tracked spend",
+          flush=True)
+except Exception as _nwe:
+    print(f"[neuralwatt] balance bridge DISABLED — {_nwe}", flush=True)
+    _neuralwatt_quota_entry_fn = None
+
+# Optional: mirror key_health gate so the daily-cap call can flag exhaustion.
+_NEURALWATT_DAILY_CAP_DEFAULT = 10.0  # USD/day — synced with balance_collectors
+
 # ── Pressure FSM bridge (S2b two-layer pressure routing, t_4dfaf0d5) ────────
 # Layer-2 request-time half of DESIGN-two-layer-pressure-routing.md:
 # GREEN/AMBER/RED band FSM over friend-key quota + Kalman exhaust
@@ -1278,6 +1310,48 @@ def _routstr_quota_snapshot() -> dict:
         return {"used_pct": 0.0, "remaining": float("inf")}
 
 
+def _neuralwatt_quota_snapshot() -> dict:
+    """quota_state['neuralwatt'] from the self-tracked balance (NW-BALANCE).
+
+    Mirrors _ppq_quota_snapshot / _routstr_quota_snapshot: delegates to the
+    extracted ``neuralwatt_quota_entry`` (reads the newest 'neuralwatt' row
+    from provider_balances in api_burn.db, written by the
+    balance_collectors --provider neuralwatt cron).
+
+    The collector itself queries zai_usage.db:api_calls WHERE tier='neuralwatt'
+    for cumulative + today's spend, subtracts from NEURALWATT_STARTING_BALANCE
+    (default $100), and surfaces a NEURALWATT_DAILY_CAP guardrail (default
+    $10/day). When ``is_daily_cap_exceeded`` is True on the returned entry,
+    we bump ``used_pct`` to 100.0 so the routing layer treats neuralwatt as
+    exhausted for the rest of the UTC calendar day (capped spend resets at
+    midnight). is_exhausted (cumulative running out) is preserved as-is.
+
+    Cold-start contract (matches the proxy's current hardcoded fallback):
+      * bridge import disabled, OR no fresh row →
+        ``{used_pct:0.0, remaining:inf}`` (current optimistic behavior).
+      * fresh row → forwards the collector's dict, but if the daily cap is
+        exceeded we override used_pct=100 so routing drops neuralwatt today.
+
+    Never raises.
+    """
+    if _neuralwatt_quota_entry_fn is None:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+    try:
+        entry = _neuralwatt_quota_entry_fn()
+        if not isinstance(entry, dict):
+            return {"used_pct": 0.0, "remaining": float("inf")}
+        # Daily-cap enforcement: when today's spend exceeds the cap, signal
+        # exhaustion to the router by clamping used_pct to 100.0. This is the
+        # primary runaway-burn guardrail (prevents another $258-in-one-day).
+        if entry.get("is_daily_cap_exceeded"):
+            entry = dict(entry)  # copy so we don't mutate the collector's dict
+            entry["used_pct"] = 100.0
+            entry["regime"] = "daily-capped"
+        return entry
+    except Exception:
+        return {"used_pct": 0.0, "remaining": float("inf")}
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -1322,11 +1396,11 @@ def _snapshot_quota() -> dict:
             "total": float("inf"),
             "regime": "included",
         }
-        snap["neuralwatt"] = {
-            "used_pct": 0.0,
-            "remaining": float("inf"),
-            "total": float("inf"),
-        }
+        # NW-BALANCE: real self-tracked spend from zai_usage.db via the
+        # neuralwatt_quota_entry bridge. Falls back to "{used_pct:0.0,
+        # remaining:inf}" when the bridge is disabled / no fresh row (current
+        # pre-bridge behavior) so routing never breaks.
+        snap["neuralwatt"] = _neuralwatt_quota_snapshot()
         snap["ppq"] = _ppq_quota_snapshot()  # P3-PPQ: real credit balance
         snap["openrouter"] = _openrouter_quota_entry_snapshot()  # T1T3: real credit balance
         snap["telnyx"] = _telnyx_quota_snapshot()  # TELNYX-3.2: real balance
@@ -1345,7 +1419,23 @@ def _snapshot_health() -> dict:
         h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
         h["ollama_cloud_2"] = _is_key_healthy("ollama_cloud_2")
         h["opencode_go"] = _is_key_healthy("opencode_go")
-        h["neuralwatt"] = True  # per-token, always healthy unless 401/403
+        # NW-BALANCE: neuralwatt is per-token (no 401/403 health gating), so
+        # baseline is healthy. The only thing that flips it unhealthy is the
+        # daily-spend cap from neuralwatt_quota_entry — when today's spend
+        # exceeds NEURALWATT_DAILY_CAP (default $10/day) we mark the key
+        # unhealthy so the router drops neuralwatt until UTC midnight. This
+        # is the runaway-burn guardrail (prevents another $258-in-one-day).
+        if _neuralwatt_quota_entry_fn is not None:
+            try:
+                nw_entry = _neuralwatt_quota_entry_fn()
+                h["neuralwatt"] = not bool(
+                    isinstance(nw_entry, dict)
+                    and nw_entry.get("is_daily_cap_exceeded")
+                )
+            except Exception:
+                h["neuralwatt"] = True  # bridge hiccup → don't kill routing
+        else:
+            h["neuralwatt"] = True  # bridge disabled → per-token, always healthy unless 401/403
         h["ppq"] = _is_key_healthy("ppq")
         h["openrouter"] = True
         h["telnyx"] = _is_key_healthy("telnyx")
@@ -1479,9 +1569,9 @@ try:
         "opencode_go", _shadow_pk(0.40), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
-    # neuralwatt — per-token, standard tier (deepseek-v4-flash $0.14/M + prompt caching)
+    # neuralwatt — per-token, standard tier (glm-5.2 primary model ~$2.21/M blended)
     _shadow_optimizer.add_provider(
-        "neuralwatt", _shadow_pk(0.21), _ShadowConsumptionKalman(),
+        "neuralwatt", _shadow_pk(2.21), _ShadowConsumptionKalman(),
         quota_remaining=float("inf"), model_tier="standard", quota_total=float("inf"),
     )
     # ppq_external — per-token, low tier, most expensive, last resort
@@ -2299,7 +2389,7 @@ _FALLBACK_RATES: dict[str, float] = {
     "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
     "ollama_cloud_2": _FALLBACK_OLLAMA_CLOUD_BASE,
     "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
-    "neuralwatt":   0.21,     # deepseek-v4-flash blended
+    "neuralwatt":   2.21,     # glm-5.2 blended (primary model, conservative seed)
     "friend":       0.015,    # z.ai $300/yr amortized seed
     "ours":         0.03,     # z.ai $960/yr amortized seed
     "deepinfra":    1.30,
@@ -2352,15 +2442,30 @@ _MODEL_ID_TO_PROVIDER_ID: dict[str, dict[str, str]] = {
         "telnyx": "zai-org/GLM-5.2",
         "openrouter": "z-ai/glm-5.2",
         "ppq": "z-ai/glm-5.2",
+        "neuralwatt": "glm-5.2",
+    },
+    "glm-5.3": {
+        "neuralwatt": "glm-5.3",
     },
     "kimi-k3": {
         "telnyx": "moonshotai/Kimi-K3",
         "openrouter": "moonshotai/kimi-k3",
         "ppq": "moonshotai/kimi-k3",
+        "neuralwatt": "kimi-k3",
     },
     "deepseek/deepseek-v4-flash": {
         "openrouter": "deepseek/deepseek-v4-flash",
         "ppq": "deepseek/deepseek-v4-flash",
+        "neuralwatt": "deepseek-v4-flash",
+    },
+    "deepseek-v4-flash": {
+        "neuralwatt": "deepseek-v4-flash",
+    },
+    "deepseek-v4-pro": {
+        "neuralwatt": "deepseek-v4-pro",
+    },
+    "gemma-4-31b": {
+        "neuralwatt": "gemma-4-31b",
     },
 }
 
@@ -2648,18 +2753,35 @@ def _get_ollama_cloud_cost_per_1m() -> float:
     return _rpt_rate("ollama_cloud")
 
 
-def _estimate_cost_usd(key_name: str | None, total_tokens: int) -> float:
+def _estimate_cost_usd(key_name: str | None, total_tokens: int,
+                       model: str | None = None,
+                       prompt_tokens: int | None = None,
+                       completion_tokens: int | None = None) -> float:
     """Estimate USD cost for a request based on key type. Returns 0.0 for unknown/free keys.
 
     RP-4: Rates are sourced from real_price_tracker.get_rate_with_fallback()
     which uses real measured cost_usd data from the DB, falling back to
     LAST_RESORT_RATES estimates. For ollama_cloud, applies dynamic pricing
     based on the current quota regime (included/extra/exhausted).
+    For NeuralWatt, uses per-model rates from NEURALWATT_RATES when the
+    model and token breakdown are available, instead of the flat provider
+    rate ($0.21/M) that severely undercounts glm-5.2 (~$2.21/M blended).
     """
     if not key_name or total_tokens <= 0:
         return 0.0
     if key_name == "ollama_cloud":
         cost_per_1m = _get_ollama_cloud_cost_per_1m()
+    elif key_name == "neuralwatt" and model:
+        # Try exact match, then stripped prefix (deepseek/deepseek-v4-flash → deepseek-v4-flash)
+        rates = NEURALWATT_RATES.get(model) or NEURALWATT_RATES.get(model.split("/")[-1])
+        if rates and prompt_tokens is not None and completion_tokens is not None:
+            input_rate = rates.get("input", 0.14)
+            output_rate = rates.get("output", 0.28)
+            return (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
+        elif rates:
+            return _blended_rate(rates["input"], rates["output"]) * total_tokens / 1_000_000
+        # No model match → fall through to flat provider rate
+        cost_per_1m = _rpt_rate(key_name)
     else:
         cost_per_1m = _rpt_rate(key_name)
     if cost_per_1m == float("inf"):
@@ -2668,7 +2790,9 @@ def _estimate_cost_usd(key_name: str | None, total_tokens: int) -> float:
 
 
 def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
-                  actual_cost: float | None = None) -> None:
+                  actual_cost: float | None = None,
+                  prompt_tokens: int | None = None,
+                  completion_tokens: int | None = None) -> None:
     """Record spend for today. Called from the finally block of every request.
 
     When actual_cost is provided (e.g., from DeepInfra's estimated_cost field),
@@ -2677,7 +2801,9 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
     """
     try:
         tier = _spend_tier(key_name)
-        cost = actual_cost if actual_cost is not None else _estimate_cost_usd(key_name, total_tokens)
+        cost = actual_cost if actual_cost is not None else _estimate_cost_usd(
+            key_name, total_tokens, model=model,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
         today = _date.today().isoformat()
         _usage_db().execute(
             "INSERT INTO daily_spend (date, tier, spend_usd, call_count, token_count) "
@@ -3165,6 +3291,44 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 cost_source = "rate_derived"
             calibrated = raw_cost * _telnyx_calibration_factor
             return (calibrated, cost_source)
+        # 4b. NeuralWatt — per-model rate-derived cost from NEURALWATT_RATES.
+        # NeuralWatt does not return a cost field in the response body, so
+        # _extract_cost_module won't find it. Compute from per-model rates
+        # × actual token breakdown for accurate cost_usd logging.
+        if provider == "neuralwatt":
+            usage = _parse_usage(bytes(response_buffer))
+            prompt_toks = int(usage.get("prompt_tokens") or 0)
+            completion_toks = int(usage.get("completion_tokens") or 0)
+            cached_toks = 0
+            _ptd = usage.get("prompt_tokens_details") or {}
+            if isinstance(_ptd, dict):
+                cached_toks = int(_ptd.get("cached_tokens") or 0)
+            uncached_toks = max(prompt_toks - cached_toks, 0)
+            model_name = None
+            try:
+                _obj = json.loads(bytes(response_buffer))
+                if isinstance(_obj, dict):
+                    model_name = _obj.get("model")
+            except Exception:
+                pass
+            rates = NEURALWATT_RATES.get(model_name or "")
+            if rates:
+                input_rate = rates.get("input", 0.14)
+                cached_rate = rates.get("cached_input", input_rate * 0.17)
+                output_rate = rates.get("output", 0.28)
+                raw_cost = (
+                    uncached_toks * input_rate
+                    + cached_toks * cached_rate
+                    + completion_toks * output_rate
+                ) / 1_000_000
+                cost_source = "cached_rate_derived" if cached_toks > 0 else "rate_derived"
+                return (raw_cost, cost_source)
+            # Fallback: blended rate for the provider (still better than NULL)
+            rate = _rpt_rate("neuralwatt")
+            if rate == float("inf") or rate <= 0:
+                return (None, None)
+            raw_cost = (total_tokens / 1_000_000) * rate
+            return (raw_cost, "rate_derived")
         # 5. Unknown / unhandled provider.
         return (None, None)
     except Exception:
@@ -4394,7 +4558,9 @@ class Handler(BaseHTTPRequestHandler):
                         # Use extracted cost for spend tracking (falls back to
                         # _estimate_cost_usd inside _record_spend when None).
                         _record_spend(provider_name, ext_model, ext_tokens,
-                                      actual_cost=ext_cost_usd)
+                                      actual_cost=ext_cost_usd,
+                                      prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                                      completion_tokens=int(ext_usage.get("completion_tokens") or 0))
                         if _LIVE_ROUTER is not None:
                             try:
                                 _LIVE_ROUTER.record_request(provider=provider_name, tokens=ext_tokens)

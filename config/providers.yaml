@@ -143,9 +143,8 @@ strategy:
     low: low
 
   # Fallback model when all z.ai keys exhausted
-  # Updated 2026-08-23: deepseek-v4-flash removed from z.ai; glm-4.5-flash is
-  # available, cheap, and sufficient for fallback dispatch.
-  fallback_model: "glm-4.5-flash"
+  # Routed through Neuralwatt (z.ai doesn't serve DeepSeek models)
+  fallback_model: "deepseek/deepseek-v4-flash"
 
   # ── Model mapping: (provider, task_type) → model_name ────────────────────
   # provider is the *service* name: zai (covers ours/friend/manager/worker),

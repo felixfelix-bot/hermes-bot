@@ -32,20 +32,20 @@ SESSION_COMPRESSION_THRESHOLD = 2
 
 CANDIDATES = [
     {
-        "model": "kimi-k3",
+        "model": "deepseek/deepseek-v4-flash",
         "input_rate": 0.14,
         "cached_rate": 0.03,
         "output_rate": 0.28,
-        "context_length": 262_144,
-        "bench_score": 85,
+        "context_length": 1_048_576,
+        "bench_score": 80,
         "role": "default",
     },
     {
-        "model": "glm-4.5-flash",
-        "input_rate": 0.09,
+        "model": "deepseek/gemma-4-31b",
+        "input_rate": 0.14,
         "cached_rate": 0.01,
-        "output_rate": 0.19,
-        "context_length": 131_072,
+        "output_rate": 0.42,
+        "context_length": 262_144,
         "bench_score": 72,
         "role": "repeat_cached",
     },

@@ -563,9 +563,12 @@ _TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud", "kimi-k3"}
 # don't exist on z.ai).  The proxy sends them straight to Telnyx's API.
 _TELNYX_DIRECT_MODELS = {"kimi-k3"}
 
-# Provider priority for failover sort (lower = tried first).
-# Telnyx preferred over PPQ/OpenRouter for Kimi K3 (prompt caching support).
-_PROVIDER_PRIORITY = {"deepinfra": 0, "telnyx": 1, "ppq": 2, "openrouter": 3, "neuralwatt": 4, "opencode_go": 5}
+# Provider failover sort: cost is primary (cheapest first). When costs tie,
+# providers with fewer recent failures are tried first (from _provider_health).
+# The old static _PROVIDER_PRIORITY dict was removed — the Kalman-adjusted
+# cost from _get_provider_cost() + failure_count from _provider_health now
+# fully determine ordering. LiveRouter (Kalman-based) runs as the primary
+# routing system; this only affects the fallback path.
 
 # Per-provider model name translation.
 # PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
@@ -614,6 +617,7 @@ _PROVIDER_MODEL_NAMES = {
         "kimi-k3":                    "kimi-k3",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
+        "deepseek/gemma-4-31b":        "gemma-4-31b",
     },
 }
 
@@ -622,6 +626,7 @@ _PROVIDER_MODEL_NAMES = {
 NEURALWATT_RATES: dict[str, dict[str, float]] = {
     "deepseek-v4-flash":     {"input": 0.14, "cached_input": 0.03, "output": 0.28},
     "deepseek-v4-pro":       {"input": 1.00, "cached_input": 0.10, "output": 3.00},
+    "gemma-4-31b":            {"input": 0.14, "cached_input": 0.01, "output": 0.42},
     "glm-5.2":               {"input": 1.45, "cached_input": 0.14, "output": 4.50},
     "kimi-k3":               {"input": 1.45, "cached_input": 0.14, "output": 4.50},  # same tier as glm
 }
@@ -4270,8 +4275,8 @@ class Handler(BaseHTTPRequestHandler):
             cost = _get_provider_cost(name, ext_model)
             candidates.append((cost, name, prov))
 
-        # Sort cheapest first; ties broken by _PROVIDER_PRIORITY (lower = tried first)
-        candidates.sort(key=lambda c: (c[0], _PROVIDER_PRIORITY.get(c[1], 99)))
+        # Sort cheapest first; ties broken by failure_count (fewer = tried first)
+        candidates.sort(key=lambda c: (c[0], _provider_health.get(c[1], {}).get("failure_count", 0)))
 
         # Honour a LiveRouter-chosen provider (P3.4 Fix 1): if `preferred` is
         # funded + keyed, move it to the front so it is tried FIRST; the rest

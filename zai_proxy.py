@@ -3194,9 +3194,14 @@ _init_spend_table()
 #   TIME_LIMIT   unit=5 (month),  number=N → N-month tool-call window (720 h each)
 _UNIT_META = {
     # (type, unit) → (label_for_single, hours_per_unit)
+    # z.ai renamed TOKENS_LIMIT → CREDIT_LIMIT (observed 2026-08-23).
+    # Both types use the same unit codes, so we map them identically.
     ("TOKENS_LIMIT", 3): ("hour",   1),
     ("TOKENS_LIMIT", 6): ("weekly", 168),
     ("TIME_LIMIT",   5): ("monthly", 720),
+    ("CREDIT_LIMIT", 3): ("hour",   1),
+    ("CREDIT_LIMIT", 6): ("weekly", 168),
+    ("CREDIT_LIMIT", 5): ("monthly", 720),
 }
 
 
@@ -3220,7 +3225,7 @@ def _parse_limit_entry(entry: dict) -> dict | None:
     window_hours = number * hours_per_unit
 
     # Friendly names for the common single-unit windows
-    if entry_type == "TOKENS_LIMIT" and unit == 3 and number == 5:
+    if entry_type in ("TOKENS_LIMIT", "CREDIT_LIMIT") and unit == 3 and number == 5:
         name = "5-hour"
     elif number == 1:
         name = label if label not in ("hour",) else f"{number}-hour"
@@ -5727,6 +5732,16 @@ def _build_kalman_pricing_json() -> dict:
         effective = base * cost_mult * peak_mult * scarcity_mult * health_mult * pace_mult
 
         available = healthy and not locked
+
+        # Safety: if all windows are "unknown" (sentinel from _fetch_quota_windows
+        # when the API returned no parseable limits), we have NO real quota data.
+        # Treat the key as unavailable — do NOT publish "available" on false 0%.
+        if wins and all(w.get("name") == "unknown" for w in wins):
+            available = False
+            locked = True
+            lwin = "unknown_quota_data"
+            zai_providers[f"zai_{key}"]["_quota_data_unavailable"] = True
+
         zai_providers[f"zai_{key}"] = {
             "base_rate_usd_per_m": round(base, 6),
             "effective_price_usd_per_m": round(effective, 6),

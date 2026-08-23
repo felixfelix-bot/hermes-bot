@@ -730,7 +730,15 @@ def _mark_funded(name: str) -> None:
 # Spec: 2s→4s→8s→16s→32s→60s (capped). A single 429 blocks a key for only 2s so
 # the other key / external failover covers traffic immediately; repeated 429s
 # escalate up to the 60s cap.
+# Extended for high failure counts: after 6 consecutive exhaustions, the key is
+# clearly quota-exhausted (not transient). Backoff escalates to 5min (11-20
+# failures) then 15min (21+) to stop retry storms on keys that take hours to
+# reset. This prevents the ollama_cloud_2 scenario (79 consecutive 60s retries).
 _BACKOFF_SEQUENCE = (2, 4, 8, 16, 32, 60)
+_BACKOFF_HIGH_THRESHOLD = 6     # failures beyond _BACKOFF_SEQUENCE length
+_BACKOFF_HIGH_SECONDS = 300     # 5 min for failures 7-20
+_BACKOFF_VERY_HIGH_THRESHOLD = 20  # failures beyond this → 15 min
+_BACKOFF_VERY_HIGH_SECONDS = 900   # 15 min for 21+ failures
 
 # Dead key (401/403) — auth failure, likely revoked/cancelled. Flat 1h: a dead
 # key will not recover by retrying quickly, so park it for an hour.
@@ -834,9 +842,15 @@ def _is_manually_disabled(name: str) -> bool:
 
 def _backoff_for_failure(failure_count: int) -> float:
     """Exponential backoff (seconds) for the Nth consecutive *exhaustion* failure
-    (1-indexed): returns 2,4,8,16,32 then 60 for all subsequent failures."""
+    (1-indexed): returns 2,4,8,16,32,60 for failures 1-6, then 300 (5min) for
+    failures 7-20, then 900 (15min) for 21+. This prevents retry storms on
+    quota-exhausted keys that take hours to reset."""
     if failure_count <= 0:
         return 0.0
+    if failure_count > _BACKOFF_VERY_HIGH_THRESHOLD:
+        return float(_BACKOFF_VERY_HIGH_SECONDS)
+    if failure_count > _BACKOFF_HIGH_THRESHOLD:
+        return float(_BACKOFF_HIGH_SECONDS)
     idx = min(failure_count - 1, len(_BACKOFF_SEQUENCE) - 1)
     return float(_BACKOFF_SEQUENCE[idx])
 
@@ -3817,6 +3831,11 @@ class Handler(BaseHTTPRequestHandler):
                 _record_spend(key_name, ollama_model, ollama_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy(key_name)
+                if _LIVE_ROUTER is not None:
+                    try:
+                        _LIVE_ROUTER.record_request(provider=key_name, tokens=ollama_tokens)
+                    except Exception:
+                        pass
                 # RP-2: extract real cost (estimated from regime rate × tokens)
                 _oc_cost, _oc_cost_src = _extract_cost(
                     key_name, bytes(response_buffer), ollama_tokens)
@@ -3937,6 +3956,11 @@ class Handler(BaseHTTPRequestHandler):
                 _record_spend("opencode_go", og_model, og_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy("opencode_go")
+                if _LIVE_ROUTER is not None:
+                    try:
+                        _LIVE_ROUTER.record_request(provider="opencode_go", tokens=og_tokens)
+                    except Exception:
+                        pass
                 # Flat-rate subscription → marginal $0 cost (like ollama_cloud included)
                 _og_cost, _og_cost_src = _extract_cost(
                     "opencode_go", bytes(response_buffer), og_tokens)
@@ -3962,7 +3986,16 @@ class Handler(BaseHTTPRequestHandler):
             if he.code == 429:
                 _mark_key_exhausted("opencode_go")
             elif he.code in (401, 403):
-                _mark_key_failure("opencode_go", "dead")
+                # Don't immediately mark "dead" on first 401 — the key may be
+                # valid but the endpoint returned a transient auth error.
+                # Use "exhausted" backoff (shorter) instead of "dead" (1h).
+                # After _KEY_DEAD_THRESHOLD consecutive 401s, _mark_key_failure
+                # will escalate to KEY_DEAD via the threshold logic.
+                _og_failures = _zai_key_health.get("opencode_go", {}).get("consecutive_failures", 0)
+                if OPENCODE_GO_KEY and _og_failures < _KEY_DEAD_THRESHOLD:
+                    _mark_key_failure("opencode_go", "exhausted")
+                else:
+                    _mark_key_failure("opencode_go", "dead")
             return False
         except Exception:
             return False
@@ -4075,6 +4108,11 @@ class Handler(BaseHTTPRequestHandler):
                               actual_cost=telnyx_cost)
                 self._spend_recorded = True
                 _mark_key_healthy("telnyx")
+                if _LIVE_ROUTER is not None:
+                    try:
+                        _LIVE_ROUTER.record_request(provider="telnyx", tokens=telnyx_tokens)
+                    except Exception:
+                        pass
                 # Capture cached_tokens for the rolling cache-hit ratio
                 # (used by _get_provider_cost to rank Telnyx fairly).
                 _telnyx_ptd = telnyx_usage.get("prompt_tokens_details") or {}
@@ -4162,6 +4200,11 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[oxalpha] SPEND DETECTED — cost=${ext_cost_usd:.6f} — tier KILLED", flush=True)
                 _OXALPHA_TIER.note_success()
                 _record_spend("oxalpha", "stealth/ox-alpha", ext_tokens, actual_cost=ext_cost_usd)
+                if _LIVE_ROUTER is not None:
+                    try:
+                        _LIVE_ROUTER.record_request(provider="oxalpha", tokens=ext_tokens)
+                    except Exception:
+                        pass
                 _log_api_call(
                     key_name="oxalpha", key_suffix=_ox_key[-4:],
                     model="stealth/ox-alpha",
@@ -4352,6 +4395,11 @@ class Handler(BaseHTTPRequestHandler):
                         # _estimate_cost_usd inside _record_spend when None).
                         _record_spend(provider_name, ext_model, ext_tokens,
                                       actual_cost=ext_cost_usd)
+                        if _LIVE_ROUTER is not None:
+                            try:
+                                _LIVE_ROUTER.record_request(provider=provider_name, tokens=ext_tokens)
+                            except Exception:
+                                pass
                         # D6: PPQ daily-budget tracker (cap / hourly / 80% alert)
                         if provider_name == "ppq":
                             _ppq_record_success(ext_tokens, ext_cost_usd)

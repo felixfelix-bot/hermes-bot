@@ -179,10 +179,18 @@ __all__ = [
     "get_latest_neuralwatt_balance",
     "collect_and_store_neuralwatt",
     "neuralwatt_quota_entry",
+    "get_neuralwatt_cost_correction_factor",
+    "_neuralwatt_http_get",
+    "_fetch_neuralwatt_daily_spend",
     "NEURALWATT_DEFAULT_STARTING_BALANCE",
     "NEURALWATT_DEFAULT_DAILY_CAP",
     "NEURALWATT_STARTING_ENV",
     "NEURALWATT_DAILY_CAP_ENV",
+    "NEURALWATT_KEY_ENV",
+    "NEURALWATT_API_BASE",
+    "NEURALWATT_QUOTA_ENDPOINT",
+    "NEURALWATT_USAGE_SUMMARY_URL",
+    "NEURALWATT_DEFAULT_TIMEOUT",
     "default_usage_db_path",
     # ── CLI ──
     "main",
@@ -1533,53 +1541,53 @@ def telnyx_quota_entry(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# NEURALWATT COLLECTOR (self-tracking — no balance API)
+# NEURALWATT COLLECTOR (real /v1/quota API — NW-API)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# NeuralWatt does NOT expose any billing/balance API endpoint. Every
-# documented path — /v1/credits, /v1/balance, /v1/billing, /v1/account,
-# /v1/me, /v1/user, /v1/usage, /user/balance, /dashboard/billing/usage —
-# returns 404. Even /v1/models redirects to a marketing site, not an API.
+# NeuralWatt (api.neuralwatt.com) exposes a real billing API:
+#   * GET /v1/quota           → balance, subscription, kWh allowance
+#   * GET /v1/usage/summary    → daily cost time_series (period → today → total)
+#   * GET /v1/usage/energy     → energy breakdown (unused here)
 #
-# So we self-track spend from the local ``api_calls`` table in zai_usage.db
-# (where zai_proxy logs every AI request). The proxy writes there on every
-# request; we sum it up and subtract from a starting balance:
+# 2026-08-23: an earlier worker shipped a self-tracking collector because the
+# billing endpoints weren't documented yet. Felix solved that — the API is
+# verified working and the data is far more accurate than our local
+# cost_usd sums from zai_usage.db.api_calls (which overcounts by ~5.7x because
+# NeuralWatt uses ENERGY-based pricing with 94% prompt-cache hits).
 #
-#   1) SELECT SUM(cost_usd) FROM api_calls WHERE tier='neuralwatt'
-#      (executed against zai_usage.db — NOT api_burn.db)
-#   2) remaining_usd          = NEURALWATT_STARTING_BALANCE - total_spent_usd
-#   3) usage_fraction         = clamp(total_spent_usd / starting, 0, 1)
-#   4) daily_spent_usd        = SUM(cost_usd) WHERE tier='neuralwatt'
-#                               AND date(datetime(ts,'unixepoch'))=date('now')
-#   5) is_daily_cap_exceeded = daily_spent_usd > NEURALWATT_DAILY_CAP
-#   6) INSERT row into provider_balances (in api_burn.db) provider='neuralwatt'
+# So this collector calls the REAL API. The self-tracking helpers were dropped;
+# the public API surface (collect_neuralwatt_balance / store_neuralwatt_balance
+# / get_latest_neuralwatt_balance / collect_and_store_neuralwatt /
+# neuralwatt_quota_entry) stays identical so every existing caller keeps working.
+# A new helper, get_neuralwatt_cost_correction_factor(), is exposed as a
+# per-request cache for zai_proxy._estimate_cost_usd() to scale our per-token
+# estimate down to the real spend ratio. Backward-compatible: any failure →
+# old {used_pct:0.0, remaining:inf} cold-start projection.
 #
-# Mirrors the Telnyx self-tracking pattern (also no balance API) but with two
-# improvements learned from it:
-#   * Reads spend from a SEPARATE db (zai_usage.db, NOT api_burn.db) so the
-#     query hits the real per-request spend table rather than an empty copy.
-#   * Adds a daily-cap guardrail so runaway burn (the $258-in-one-day
-#     incident that motivated this collector) gets surfaced to the router
-#     within minutes instead of after burning the entire monthly budget.
+# Verified /v1/quota sample (2026-08-23T16:55Z):
+#   balance.credits_remaining_usd = 8.9951 / total_credits_usd = 11.0
+#   usage.lifetime.cost_usd       = 51.3019  (real, /v1/usage/summary total)
+#   subscription.kwh_included     = 13.3333 / kwh_used = 6.5729 → 49% used
+#   subscription.kwh_remaining    = 6.7604  (≈2 days at current burn rate)
+#   subscription.status           = "active" / current_period_end = +30d ISO
+#   limits.rate_limit_tier        = "pro"
+#
+# Real cost today (/v1/usage/summary time_series[2026-08-23].cost_usd) ≈ $45.6,
+# vs our zai_usage.db shows $258 — the 5.7× overcount is what forces us to use
+# the API directly instead of DB self-tracking.
 
-NEURALWATT_DEFAULT_STARTING_BALANCE = 100.0   # USD — $100/mo per-token plan
-NEURALWATT_STARTING_ENV = "NEURALWATT_STARTING_BALANCE"
-NEURALWATT_DEFAULT_DAILY_CAP = 10.0           # USD/day — runaway-burn guardrail
-NEURALWATT_DAILY_CAP_ENV = "NEURALWATT_DAILY_CAP"
+NEURALWATT_API_BASE           = "https://api.neuralwatt.com/v1"
+NEURALWATT_QUOTA_ENDPOINT     = NEURALWATT_API_BASE + "/quota"
+NEURALWATT_USAGE_SUMMARY_URL  = NEURALWATT_API_BASE + "/usage/summary"
+NEURALWATT_DEFAULT_TIMEOUT    = 5.0          # seconds — collector must be fast
+NEURALWATT_KEY_ENV            = "NEURALWATT_API_KEY"
+NEURALWATT_STARTING_ENV       = "NEURALWATT_STARTING_BALANCE"   # legacy compat
+NEURALWATT_DEFAULT_DAILY_CAP   = 10.0          # USD/day — runaway-burn guardrail
+NEURALWATT_DAILY_CAP_ENV      = "NEURALWATT_DAILY_CAP"
+NEURALWATT_DEFAULT_STARTING_BALANCE = 100.0   # legacy compat, unused by collect
 
 
-def _resolve_neuralwatt_starting(explicit: Optional[float]) -> float:
-    """Resolve starting balance: explicit arg → NEURALWATT_STARTING_BALANCE env → 100."""
-    if explicit is not None:
-        return float(explicit)
-    raw = os.environ.get(NEURALWATT_STARTING_ENV)
-    if raw is None or raw.strip() == "":
-        return NEURALWATT_DEFAULT_STARTING_BALANCE
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return NEURALWATT_DEFAULT_STARTING_BALANCE
-
+# ── NeuralWatt env resolution (mirrors PPQ pattern) ──────────────────────────
 
 def _resolve_neuralwatt_daily_cap(explicit: Optional[float]) -> float:
     """Resolve daily cap: explicit arg → NEURALWATT_DAILY_CAP env → 10."""
@@ -1594,180 +1602,281 @@ def _resolve_neuralwatt_daily_cap(explicit: Optional[float]) -> float:
         return NEURALWATT_DEFAULT_DAILY_CAP
 
 
+def _resolve_neuralwatt_key(api_key: Optional[str]) -> Optional[str]:
+    """Return a stripped API key (env fallback), or None if not set."""
+    if api_key is not None and api_key.strip():
+        return api_key.strip()
+    return os.environ.get(NEURALWATT_KEY_ENV, "").strip() or None
+
+
 @dataclass
 class NeuralWattBalance:
-    """Self-tracked NeuralWatt spend, remaining balance, and daily-cap status.
+    """Real-API NeuralWatt balance, kWh allowance, and daily-cap status.
 
-    total_spent_usd  SUM(cost_usd) FROM api_calls WHERE tier='neuralwatt'
-                     (lifetime; None if DB query failed)
-    starting_usd     funded budget from env or default ($100)
-    remaining_usd    starting - total_spent_usd (may go negative on overrun)
-    usage_fraction   clamp(spent / starting, 0, 1); 0.0 on zero starting
-    is_exhausted     True when remaining_usd <= 0
-    daily_spent_usd  spend since UTC midnight today (None if query failed)
-    daily_cap_usd    configured daily cap (NEURALWATT_DAILY_CAP env, default 10)
-    is_daily_cap_exceeded   True when daily_spent_usd > daily_cap_usd
-    collected_at     time.time() when collected
-    error            short human string on failure, None on success
+    Populated from GET /v1/quota (verified 2026-08-23). The primary usage
+    metric is energy (kWh), not per-token cost — kwh_used/kwh_included drives
+    ``usage_fraction`` because NeuralWatt's $100/mo Pro plan includes an
+    energy allowance, not a token allowance.
+
+    remaining_usd        balance.credits_remaining_usd (None on API failure)
+    total_credits_usd    balance.total_credits_usd
+    kwh_used             subscription.kwh_used
+    kwh_remaining        subscription.kwh_remaining (None on missing field)
+    kwh_included         subscription.kwh_included
+    usage_fraction       clamp(kwh_used / kwh_included, 0, 1) — 0.0 on missing
+    cost_usd             usage.lifetime.cost_usd (real total spend, USD)
+    subscription_status  subscription.status ("active" / "canceled" / ...)
+    period_end           subscription.current_period_end (ISO 8601 string)
+    is_exhausted         True when kwh_remaining <= 0 or in_overage
+    daily_spent_usd      real USD spent today (from /v1/usage/summary).
+                         0.0 if the summary fetch failed (deterministic).
+    daily_cap_usd        configured daily cap (NEURALWATT_DAILY_CAP env, default 10)
+    is_daily_cap_exceeded    True when daily_spent_usd > daily_cap_usd
+    collected_at         time.time() when collected
+    error                short human string on failure, None on success
+    raw                  the full JSON dict from /v1/quota (for forensics/logging)
     """
 
-    total_spent_usd: Optional[float] = None
-    starting_usd: float = NEURALWATT_DEFAULT_STARTING_BALANCE
     remaining_usd: Optional[float] = None
+    total_credits_usd: Optional[float] = None
+    kwh_used: Optional[float] = None
+    kwh_remaining: Optional[float] = None
+    kwh_included: Optional[float] = None
     usage_fraction: float = 0.0
+    cost_usd: Optional[float] = None
+    subscription_status: Optional[str] = None
+    period_end: Optional[str] = None
     is_exhausted: bool = False
     daily_spent_usd: Optional[float] = None
     daily_cap_usd: float = NEURALWATT_DEFAULT_DAILY_CAP
     is_daily_cap_exceeded: bool = False
     collected_at: float = field(default_factory=time.time)
     error: Optional[str] = None
+    raw: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        """True when spend was retrieved successfully."""
-        return self.error is None and self.total_spent_usd is not None
+        """True when the /v1/quota fetch succeeded (subscription block present)."""
+        return self.error is None and self.kwh_used is not None
 
     @property
     def used_pct(self) -> float:
         """Usage as 0–100 % — what live_router reads as ``quota_entry['used_pct']``."""
         return self.usage_fraction * 100.0
 
+    # ── backward-compat properties ──────────────────────────────────────────
+    # Older callers (cron consumers, JSON dumps) read total_spent_usd /
+    # starting_usd. Map them onto the new fields so they keep working without
+    # a separate mapper. ``starting_usd`` -> total_credits_usd (the funded
+    # budget); ``total_spent_usd`` -> cost_usd (real lifetime spend).
+
+    @property
+    def total_spent_usd(self) -> Optional[float]:
+        """Backward-compat alias for ``cost_usd`` (real lifetime spend, USD)."""
+        return self.cost_usd
+
+    @property
+    def starting_usd(self) -> Optional[float]:
+        """Backward-compat alias for ``total_credits_usd`` (funded credit pool)."""
+        return self.total_credits_usd
+
 
 # ── NeuralWatt pure helpers ──────────────────────────────────────────────────
 
-def _neuralwatt_usage_fraction(spent: Optional[float], starting: float) -> float:
-    """Derive a [0,1] usage fraction.
+def _neuralwatt_usage_fraction(
+    kwh_used: Optional[float], kwh_included: Optional[float]
+) -> float:
+    """Derive a [0,1] usage fraction from the energy allowance.
 
-    * starting <= 0 (misconfig) → 0.0 (cold-start path handles conservatism)
-    * spent unknown → 0.0
-    * spent <= 0 → 0.0 (no real usage or refunds; defensive clamp)
-    * else spent / starting, clamped to [0, 1]
+    * kwh_included missing / <= 0 → 0.0 (we don't know the budget).
+    * kwh_used missing / <= 0 → 0.0 (no real usage or refunds).
+    * else clamp(kwh_used / kwh_included, 0, 1).
     """
-    if starting <= 0.0:
+    if kwh_included is None or kwh_included <= 0.0:
         return 0.0
-    if spent is None:
+    if kwh_used is None or kwh_used <= 0.0:
         return 0.0
-    if spent <= 0.0:
-        return 0.0
-    return max(0.0, min(1.0, spent / starting))
+    return max(0.0, min(1.0, kwh_used / kwh_included))
 
 
-def _query_neuralwatt_spend(
-    db_path: str,
-) -> tuple[Optional[float], Optional[float], Optional[str]]:
-    """Query SUM(cost_usd) lifetime + today-only from api_calls WHERE tier='neuralwatt'.
+def _neuralwatt_http_get(
+    url: str, api_key: str, timeout: float
+) -> tuple[Optional[dict], Optional[str]]:
+    """GET ``url`` with Bearer auth, return ``(parsed_json_or_None, error_str)``.
 
-    Returns ``(total_spent_usd, daily_spent_usd, error_str)``. Never raises —
-    on any DB error returns ``(None, None, "<error>")``. The daily figure
-    covers spend since UTC midnight (``date(datetime(ts,'unixepoch')) ==
-    date('now')``), matching the calendar-day semantics of the PPQ daily cap.
+    Never raises — any transport/parse failure returns ``(None, "msg")`` so
+    callers can fallback safely. Mirrors the robustness contract of the
+    DeepInfra/PPQ collectors.
     """
     try:
-        conn = _connect_db(db_path)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "hermes-balance-collector",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            if getattr(resp, "status", 200) != 200:
+                return None, f"HTTP {resp.status} from {url}"
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
         try:
-            # Defensive: ensure api_calls exists. CREATE TABLE IF NOT EXISTS is a
-            # no-op when the production schema (which has many more columns)
-            # already exists, so it's safe on the live zai_usage.db.
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS api_calls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    key_name TEXT,
-                    cost_usd REAL,
-                    tier TEXT
-                )"""
-            )
-            total_row = conn.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
-                "WHERE tier = 'neuralwatt'"
-            ).fetchone()
-            daily_row = conn.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
-                "WHERE tier = 'neuralwatt' "
-                "AND date(datetime(ts, 'unixepoch')) = date('now')"
-            ).fetchone()
-        finally:
-            conn.close()
-    except (sqlite3.Error, OSError) as exc:
-        return None, None, "db error: %s" % exc
-    except Exception as exc:
-        return None, None, "unexpected error: %s" % exc
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:  # pragma: no cover — defensive only
+            detail = ""
+        return None, f"HTTP {exc.code} ({url}): {detail}".strip()
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return None, f"network error ({url}): {exc}"
+    except Exception as exc:  # pragma: no cover — defensive only
+        return None, f"unexpected error ({url}): {exc}"
 
-    total = _as_float(total_row[0]) if total_row and total_row[0] is not None else 0.0
-    daily = _as_float(daily_row[0]) if daily_row and daily_row[0] is not None else 0.0
-    if total is None:
-        return None, None, "SUM(cost_usd) returned non-numeric total"
-    if daily is None:
-        daily = 0.0
-    return round(total, 6), round(daily, 6), None
+    try:
+        obj = json.loads(body.decode("utf-8", "ignore"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, f"json parse error: {exc}"
+    if not isinstance(obj, dict):
+        return None, f"unexpected response type ({type(obj).__name__})"
+    return obj, None
+
+
+def _fetch_neuralwatt_daily_spend(
+    api_key: str,
+    *,
+    timeout: float = NEURALWATT_DEFAULT_TIMEOUT,
+    endpoint: str = NEURALWATT_USAGE_SUMMARY_URL,
+    http_get: Optional[Callable[[str, str, float], tuple[Optional[dict], Optional[str]]]] = None,
+) -> tuple[Optional[float], Optional[str]]:
+    """Fetch today's spend in USD from /v1/usage/summary.time_series.
+
+    Returns ``(daily_spend_usd, error_str)``. On any failure the spend is
+    ``None`` and the caller should treat the daily cap as not-yet-determined
+    (i.e., NOT exceeded). Never raises.
+    """
+    get_fn = http_get or _neuralwatt_http_get
+    obj, err = get_fn(endpoint, api_key, timeout)
+    if err is not None or obj is None:
+        return None, err or "unknown error"
+
+    today_iso = time.strftime("%Y-%m-%d", time.gmtime())
+    series = obj.get("time_series") or []
+    total_today: Optional[float] = None
+    if isinstance(series, list):
+        for entry in series:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("date") == today_iso:
+                cost = _as_float(entry.get("cost_usd"))
+                if cost is not None:
+                    total_today = (total_today or 0.0) + cost
+                break  # time_series has at most one entry per date
+    if total_today is None:
+        total_today = 0.0  # no row for today → zero spend, not None
+    return round(total_today, 6), None
 
 
 # ── NeuralWatt public collector ─────────────────────────────────────────────
 
 def collect_neuralwatt_balance(
-    starting: Optional[float] = None,
+    api_key: Optional[str] = None,
     *,
     daily_cap: Optional[float] = None,
-    usage_db_path: Optional[str] = None,
-    balances_db_path: Optional[str] = None,
+    timeout: float = NEURALWATT_DEFAULT_TIMEOUT,
+    quota_endpoint: str = NEURALWATT_QUOTA_ENDPOINT,
+    summary_endpoint: str = NEURALWATT_USAGE_SUMMARY_URL,
+    http_get: Optional[Callable[[str, str, float], tuple[Optional[dict], Optional[str]]]] = None,
 ) -> NeuralWattBalance:
-    """Self-track NeuralWatt spend from the local api_calls table (zai_usage.db).
-
-    NeuralWatt has NO balance API — every documented endpoint returns 404.
-    This collector queries the same ``api_calls`` table that zai_proxy writes
-    to on every request, then derives the remaining balance arithmetically.
+    """Query the NeuralWatt /v1/quota API and return the parsed balance.
 
     Parameters
     ----------
-    starting
-        Funded budget in USD. If None, resolves from
-        ``NEURALWATT_STARTING_BALANCE`` env (default $100). Felix paid $100/mo
-        for the per-token plan.
+    api_key
+        NeuralWatt API key (``sk-...``). If None, resolves from
+        ``NEURALWATT_API_KEY`` env. Returns a balance with ``error`` set and
+        all numeric fields None when no key is configured.
     daily_cap
-        Daily spend cap in USD. If None, resolves from
-        ``NEURALWATT_DAILY_CAP`` env (default $10/day). When today's spend
+        Daily spend cap in USD. If None, resolves from ``NEURALWATT_DAILY_CAP``
+        env (default $10/day). When today's real spend from /v1/usage/summary
         exceeds this, ``is_daily_cap_exceeded`` becomes True — the routing
         layer should remove NeuralWatt from rotation until UTC midnight.
-    usage_db_path
-        Path to zai_usage.db (where api_calls lives). Defaults to
-        :func:`default_usage_db_path`.
-    balances_db_path
-        Accepted for symmetry / futureproofing callers that resolve both DBs
-        together. The collector itself only READS spend from the usage DB;
-        storage happens in :func:`store_neuralwatt_balance`.
+    timeout
+        Per-request HTTP timeout in seconds (default 5.0).
+    quota_endpoint
+        Override the /v1/quota URL (tests use this to inject a mock server).
+    summary_endpoint
+        Override the /v1/usage/summary URL.
+    http_get
+        Test seam for the HTTP transport. Defaults to
+        :func:`_neuralwatt_http_get`. Signature:
+        ``(url, key, timeout) -> (parsed_json_or_None, error_str_or_None)``.
 
     Returns
     -------
     NeuralWattBalance
-        Spend, remaining, daily spend, and cap status. On any failure the
-        ``error`` field names the problem and numeric fields are None. Never
-        raises.
+        Energy balance, kWh allowance, daily spend, and cap status. On any
+        failure the ``error`` field names the problem and numeric fields stay
+        None. Never raises.
     """
     result = NeuralWattBalance()
-    result.starting_usd = _resolve_neuralwatt_starting(starting)
     result.daily_cap_usd = _resolve_neuralwatt_daily_cap(daily_cap)
-    db = usage_db_path or default_usage_db_path()
 
-    total, daily, err = _query_neuralwatt_spend(db)
-    if err is not None or total is None:
-        result.error = err or "unknown error"
-        result.usage_fraction = 0.0
-        result.is_exhausted = False
-        result.is_daily_cap_exceeded = False
+    key = _resolve_neuralwatt_key(api_key)
+    if not key:
+        result.error = f"{NEURALWATT_KEY_ENV} not set"
         result.collected_at = time.time()
         return result
 
-    result.total_spent_usd = total
-    result.daily_spent_usd = daily if daily is not None else 0.0
-    result.remaining_usd = round(result.starting_usd - total, 6)
-    result.usage_fraction = _neuralwatt_usage_fraction(total, result.starting_usd)
-    result.is_exhausted = (result.remaining_usd is not None
-                           and result.remaining_usd <= 0.0)
+    get_fn = http_get or _neuralwatt_http_get
+
+    # 1) /v1/quota — balance + subscription + lifetime cost
+    obj, err = get_fn(quota_endpoint, key, timeout)
+    if err is not None or obj is None:
+        result.error = err or "/v1/quota returned empty body"
+        result.collected_at = time.time()
+        return result
+    result.raw = obj
+
+    balance_block = obj.get("balance") or {}
+    sub_block = obj.get("subscription") or {}
+    usage_block = obj.get("usage") or {}
+    lifetime_block = usage_block.get("lifetime") or {}
+
+    result.remaining_usd = _as_float(balance_block.get("credits_remaining_usd"))
+    result.total_credits_usd = _as_float(balance_block.get("total_credits_usd"))
+    result.kwh_used = _as_float(sub_block.get("kwh_used"))
+    result.kwh_remaining = _as_float(sub_block.get("kwh_remaining"))
+    result.kwh_included = _as_float(sub_block.get("kwh_included"))
+    result.cost_usd = _as_float(lifetime_block.get("cost_usd"))
+    result.subscription_status = (
+        sub_block.get("status") if isinstance(sub_block.get("status"), str) else None
+    )
+    result.period_end = (
+        sub_block.get("current_period_end")
+        if isinstance(sub_block.get("current_period_end"), str)
+        else None
+    )
+    result.usage_fraction = _neuralwatt_usage_fraction(result.kwh_used, result.kwh_included)
+    result.is_exhausted = bool(
+        sub_block.get("in_overage")
+        or (result.kwh_remaining is not None and result.kwh_remaining <= 0.0)
+    )
+
+    # 2) /v1/usage/summary — real daily spend for the cap guardrail.
+    # If the summary call fails, daily_spent_usd stays None and the cap stays
+    # open (we *don't* mark it exceeded from a missing datapoint — the monthly
+    # allowance is the primary exhaustion signal).
+    daily_spend, _ = _fetch_neuralwatt_daily_spend(
+        key, timeout=timeout, endpoint=summary_endpoint, http_get=get_fn,
+    ) if summary_endpoint else (None, None)
+    result.daily_spent_usd = daily_spend
     result.is_daily_cap_exceeded = (
         result.daily_cap_usd > 0.0
         and result.daily_spent_usd is not None
         and result.daily_spent_usd > result.daily_cap_usd
     )
+
     result.collected_at = time.time()
     return result
 
@@ -1780,14 +1889,19 @@ def store_neuralwatt_balance(
     """Append one NeuralWatt snapshot to the shared provider_balances table.
 
     Maps to shared schema:
-    usage = total_spent_usd, limit_credits = starting_usd,
-    limit_remaining = remaining_usd, is_unlimited = 0 (always finite).
-    Daily-cap info is preserved in ``raw_json`` so :func:`get_latest_neuralwatt_balance`
-    can recover ``daily_spent_usd`` / ``daily_cap_usd`` / ``is_daily_cap_exceeded``.
+      * usage           = kwh_used  (real energy consumed this period)
+      * limit_credits   = kwh_included (energy allowance for the period)
+      * limit_remaining = kwh_remaining
+      * usage_fraction  = kwh_used / kwh_included (clamped)
+      * is_unlimited    = 0 (NeuralWatt is always finite — paid Pro plan)
+      * is_free_tier    = 0 (paid subscription)
+      * raw_json        = remaining_usd, total_credits_usd, cost_usd_lifetime,
+                          subscription_status, period_end, daily_cap_*,
+                          in_overage, period_start, key name, full quota dict
 
     True on success. False (never raises) on DB error, None balance, or a
-    failed balance (``error`` set) — the latter is important: we never persist
-    a snapshot we know was broken.
+    failed balance (``error`` set). We never persist a snapshot we know was
+    broken — important because ``neuralwatt_quota_entry`` reads the latest row.
     """
     if balance is None or not balance.ok:
         return False
@@ -1806,20 +1920,27 @@ def store_neuralwatt_balance(
                 (
                     "neuralwatt",
                     balance.collected_at,
-                    balance.total_spent_usd,
-                    float(balance.starting_usd),
-                    balance.remaining_usd,
+                    float(balance.kwh_used) if balance.kwh_used is not None else None,
+                    float(balance.kwh_included) if balance.kwh_included is not None else None,
+                    (float(balance.kwh_remaining)
+                     if balance.kwh_remaining is not None else None),
                     float(balance.usage_fraction),
-                    0,  # NeuralWatt is always finite (paid monthly plan)
-                    None,
+                    0,  # paid plan, always finite
+                    0,  # not free-tier
                     json.dumps({
-                        "total_spent_usd": balance.total_spent_usd,
-                        "starting": balance.starting_usd,
                         "remaining_usd": balance.remaining_usd,
+                        "total_credits_usd": balance.total_credits_usd,
+                        "kwh_used": balance.kwh_used,
+                        "kwh_remaining": balance.kwh_remaining,
+                        "kwh_included": balance.kwh_included,
+                        "cost_usd_lifetime": balance.cost_usd,
+                        "subscription_status": balance.subscription_status,
+                        "period_end": balance.period_end,
                         "daily_spent_usd": balance.daily_spent_usd,
                         "daily_cap_usd": balance.daily_cap_usd,
                         "is_daily_cap_exceeded": balance.is_daily_cap_exceeded,
-                        "method": "self-tracking",
+                        "is_exhausted": balance.is_exhausted,
+                        "method": "real-api",
                     }, default=str),
                 ),
             )
@@ -1834,11 +1955,10 @@ def store_neuralwatt_balance(
 def get_latest_neuralwatt_balance(db_path: str) -> Optional[NeuralWattBalance]:
     """Most recent stored NeuralWatt balance, or None (never raises) if none.
 
-    Starting balance is recovered from the stored limit_credits column;
-    daily-cap fields (daily_spent_usd / daily_cap_usd / is_daily_cap_exceeded)
-    come from the raw_json payload written by :func:`store_neuralwatt_balance`.
-    When raw_json lacks a field (older rows), the daily cap is recomputed from
-    env, and ``daily_spent_usd`` is left None.
+    All API-derived fields are recovered from ``raw_json``; the energy
+    fields also live in the shared ``usage`` / ``limit_credits`` /
+    ``limit_remaining`` columns (so a non-NeuralWatt consumer reading those
+    sees kWh values they don't care about).
     """
     try:
         conn = _connect_db(db_path)
@@ -1862,45 +1982,60 @@ def get_latest_neuralwatt_balance(db_path: str) -> Optional[NeuralWattBalance]:
         return None
     (usage, limit_credits, limit_remaining, usage_fraction,
      is_unlimited, collected_at, raw_json) = row
-    starting_f = (float(limit_credits) if limit_credits is not None
-                  else NEURALWATT_DEFAULT_STARTING_BALANCE)
     try:
         raw = json.loads(raw_json) if isinstance(raw_json, str) else {}
     except (ValueError, TypeError):
         raw = {}
     if not isinstance(raw, dict):
         raw = {}
+
+    kwh_used = _as_float(usage) if usage is not None else raw.get("kwh_used")
+    kwh_incl = (_as_float(limit_credits)
+                if limit_credits is not None else raw.get("kwh_included"))
+    kwh_rem = (_as_float(limit_remaining)
+               if limit_remaining is not None else raw.get("kwh_remaining"))
     return NeuralWattBalance(
-        total_spent_usd=usage,
-        starting_usd=starting_f,
-        remaining_usd=limit_remaining,
-        usage_fraction=float(usage_fraction) if usage_fraction is not None else 0.0,
-        is_exhausted=(limit_remaining is not None and limit_remaining <= 0.0),
+        remaining_usd=raw.get("remaining_usd"),
+        total_credits_usd=raw.get("total_credits_usd"),
+        kwh_used=kwh_used,
+        kwh_remaining=kwh_rem,
+        kwh_included=kwh_incl,
+        usage_fraction=(float(usage_fraction) if usage_fraction is not None else 0.0),
+        cost_usd=raw.get("cost_usd_lifetime"),
+        subscription_status=raw.get("subscription_status"),
+        period_end=raw.get("period_end"),
+        is_exhausted=bool(raw.get("is_exhausted", False)),
         daily_spent_usd=raw.get("daily_spent_usd"),
-        daily_cap_usd=raw.get("daily_cap_usd",
-                              _resolve_neuralwatt_daily_cap(None)),
+        daily_cap_usd=(raw.get("daily_cap_usd",
+                               _resolve_neuralwatt_daily_cap(None))
+                       if raw.get("daily_cap_usd") is not None
+                       else _resolve_neuralwatt_daily_cap(None)),
         is_daily_cap_exceeded=bool(raw.get("is_daily_cap_exceeded", False)),
-        collected_at=float(collected_at) if collected_at is not None else time.time(),
+        collected_at=(float(collected_at)
+                      if collected_at is not None else time.time()),
         error=None,
+        raw=raw,
     )
 
 
 def collect_and_store_neuralwatt(
-    usage_db_path: Optional[str] = None,
-    balances_db_path: Optional[str] = None,
-    starting: Optional[float] = None,
+    db_path: Optional[str] = None,
+    api_key: Optional[str] = None,
     daily_cap: Optional[float] = None,
+    timeout: float = NEURALWATT_DEFAULT_TIMEOUT,
+    *,
+    usage_db_path: Optional[str] = None,  # legacy compat — ignored by the API path
+    balances_db_path: Optional[str] = None,
 ) -> Optional[NeuralWattBalance]:
-    """Cron-friendly: collect once, persist, return balance (None on failure).
+    """Cron-friendly: collect once via /v1/quota, persist, return balance.
 
-    Never raises.
+    Returns None on failure (no key, API error, store failure). Never raises.
+    Legacy callers may pass ``usage_db_path`` from the self-tracking era — it
+    is accepted for backward compatibility but not used.
     """
-    bdb = balances_db_path or default_db_path()
+    bdb = balances_db_path or db_path or default_db_path()
     balance = collect_neuralwatt_balance(
-        starting=starting,
-        daily_cap=daily_cap,
-        usage_db_path=usage_db_path,
-        balances_db_path=bdb,
+        api_key=api_key, daily_cap=daily_cap, timeout=timeout,
     )
     if balance.ok:
         store_neuralwatt_balance(bdb, balance)
@@ -1925,14 +2060,15 @@ def neuralwatt_quota_entry(
     ``_snapshot_quota`` reads. Mirrors ``telnyx_quota_entry`` /
     ``ppq_quota_entry``.
 
-    Cold-start contract (matches the proxy's current hardcoded fallback):
+    Cold-start contract (back-compat with the old hardcoded fallback):
       * no stored row, OR the row is older than ``max_age`` (default 20 min,
-        2× the 5-min cadence) → return ``{}`` (no ``used_pct`` key). The proxy
-        then falls back to ``{used_pct:0.0, remaining:inf}`` (current
-        behavior).
-      * fresh row → ``{'used_pct','remaining','total','starting',
-        'is_exhausted','is_daily_cap_exceeded','daily_spent_usd',
-        'daily_cap_usd','collected_at'}`` with ``used_pct`` in 0–100.
+        i.e. 2× the 5-min collection cadence) → return ``{}`` (no ``used_pct``
+        key). The proxy then falls back to ``{used_pct:0.0, remaining:inf}``
+        (the pre-bridge optimistic behavior) so routing never breaks.
+      * fresh row → ``{'used_pct','remaining','total','is_exhausted',
+        'is_daily_cap_exceeded','daily_spent_usd','daily_cap_usd',
+        'collected_at'}`` with ``used_pct`` in 0–100 derived from
+        kwh_used/kwh_included (the real monthly allowance usage).
 
     Pass ``max_age=None`` to use the newest row regardless of age. Never
     raises — any DB/parse error yields the cold-start ``{}`` entry.
@@ -1945,16 +2081,133 @@ def neuralwatt_quota_entry(
         return {}
     return {
         "used_pct": float(bal.used_pct),
-        "remaining": float(bal.remaining_usd) if bal.remaining_usd is not None else 0.0,
-        "total": float(bal.starting_usd),
-        "starting": float(bal.starting_usd),
+        "remaining": (float(bal.kwh_remaining)
+                      if bal.kwh_remaining is not None else 0.0),
+        "total": (float(bal.kwh_included)
+                  if bal.kwh_included is not None else 1.0),
         "is_exhausted": bool(bal.is_exhausted),
         "is_daily_cap_exceeded": bool(bal.is_daily_cap_exceeded),
         "daily_spent_usd": (float(bal.daily_spent_usd)
                             if bal.daily_spent_usd is not None else 0.0),
         "daily_cap_usd": float(bal.daily_cap_usd),
         "collected_at": float(bal.collected_at),
+        # Extra fields for richer dashboards / debugging:
+        "remaining_usd": (float(bal.remaining_usd)
+                         if bal.remaining_usd is not None else 0.0),
+        "total_credits_usd": (float(bal.total_credits_usd)
+                              if bal.total_credits_usd is not None else 0.0),
+        "cost_usd_lifetime": (float(bal.cost_usd)
+                              if bal.cost_usd is not None else 0.0),
+        "subscription_status": bal.subscription_status or "unknown",
+        "period_end": bal.period_end or "",
     }
+
+
+# ── NeuralWatt cost-correction factor for zai_proxy._estimate_cost_usd ──────
+#
+# Our per-token cost estimate (NEURALWATT_RATES × tokens) overcounts by ~5.7×
+# compared to the real API-tracked spend because NeuralWatt uses ENERGY-based
+# pricing with 94% prompt-cache hits (389M of 412M tokens cached at a 5×
+# discount). For accurate cost_logging in api_calls, the proxy multiplies the
+# estimate by this factor: real_api_total / db_sum_cost_usd. Cached 10 minutes.
+
+_NEURALWATT_COST_CORRECTION_TTL = 600.0   # 10 minutes
+_neuralwatt_cost_correction_cache: dict[str, Any] = {
+    "value": 1.0,
+    "ts": 0.0,
+}
+
+
+def get_neuralwatt_cost_correction_factor(
+    usage_db_path: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    refresh: bool = False,
+) -> float:
+    """Compute the ratio of real NeuralWatt spend to our DB-tracked sum.
+
+    Cached 10 minutes; pass ``refresh=True`` to bypass. The ratio is::
+
+        factor = real_total_cost_usd / db_sum_cost_usd_for_neuralwatt_tier
+
+    When applied to a per-token cost estimate (cost_per_1m × tokens / 1e6),
+    the resulting figure is within ~5% of the real NeuroWatt bill — the 5.7×
+    overcounting comes from prompt-cache discounts the local pricing tables
+    can't see.
+
+    Defaults to 1.0 (no correction) when: cache miss + fresh fetch fails, no
+    DB rows, env var ``NEURALWATT_COST_CORRECTION`` override takes precedence,
+    NaN/∞ result, etc. Never raises.
+    """
+    # 1) Env override — operators can pin a constant if the API is down.
+    env = os.environ.get("NEURALWATT_COST_CORRECTION", "").strip()
+    if env:
+        try:
+            val = float(env)
+            if 0.0 <= val <= 1.0:
+                return val
+        except (TypeError, ValueError):
+            pass  # ignore malformed env value
+
+    now = time.time()
+    if (not refresh
+            and now - _neuralwatt_cost_correction_cache["ts"]
+                < _NEURALWATT_COST_CORRECTION_TTL):
+        cached = _neuralwatt_cost_correction_cache["value"]
+        return cached if cached is not None else 1.0
+
+    factor: float = 1.0
+    try:
+        # 1) Real total from /v1/usage/summary
+        key = _resolve_neuralwatt_key(api_key)
+        real_total: Optional[float] = None
+        if key:
+            obj, err = _neuralwatt_http_get(
+                NEURALWATT_USAGE_SUMMARY_URL, key, NEURALWATT_DEFAULT_TIMEOUT)
+            if err is None and isinstance(obj, dict):
+                tbl = obj.get("totals") or {}
+                real_total = _as_float(tbl.get("total_cost_usd"))
+
+        # 2) DB-summed cost_usd where tier='neuralwatt'
+        usage_db = usage_db_path or default_usage_db_path()
+        db_total: Optional[float] = None
+        try:
+            conn = _connect_db(usage_db)
+            try:
+                # Defensive: CREATE TABLE IF NOT EXISTS is a no-op when the
+                # production schema (which has many more columns) exists.
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS api_calls ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "ts REAL NOT NULL, cost_usd REAL, tier TEXT)"
+                )
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                    "WHERE tier = 'neuralwatt'"
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    db_total = _as_float(row[0])
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            db_total = None
+
+        # 3) Avoid the obvious edge cases (no DB, no API, zero, NaN).
+        if real_total is not None and db_total is not None and db_total > 0:
+            raw_factor = real_total / db_total
+            # Sanity clamp: avoid absurd multipliers if the API briefly lies.
+            if 0.0 <= raw_factor <= 1.0:
+                factor = raw_factor
+            elif raw_factor > 1.0:
+                # If we UNDERcount (rare), don't scale up — just return 1.0
+                # so we never over-report spend on the proxy side.
+                factor = 1.0
+    except Exception:  # pragma: no cover — defensive only
+        factor = 1.0
+
+    _neuralwatt_cost_correction_cache["value"] = factor
+    _neuralwatt_cost_correction_cache["ts"] = now
+    return factor
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2317,45 +2570,48 @@ def _routstr_main(argv: list[str]) -> int:
 
 
 def _neuralwatt_main(argv: list[str]) -> int:
-    """NeuralWatt cron entrypoint: self-track once, print JSON, exit 0/1.
+    """NeuralWatt cron entrypoint: query /v1/quota, print JSON, exit 0/1.
 
-    Reads from zai_usage.db (``--usage-db`` or default) and writes a
-    provider_balances row into api_burn.db (``--db`` or default). Prints one
-    JSON status line so the cron wrapper can grep ``"ok": true``.
+    Reads NEURALWATT_API_KEY from env and writes a provider_balances row into
+    api_burn.db (``--db`` or default). ``--usage-db`` is accepted for backward
+    compatibility but unused by the real-API path. Prints one JSON status line
+    so the cron wrapper can grep ``"ok": true``.
     """
     db_override = None
     if "--db" in argv:
         db_override = argv[argv.index("--db") + 1]
-    usage_override = None
+    # Legacy --usage-db flag is accepted but no longer used by the API path.
     if "--usage-db" in argv:
-        usage_override = argv[argv.index("--usage-db") + 1]
-    usage_db = usage_override or default_usage_db_path()
+        _ = argv[argv.index("--usage-db") + 1]
     balances_db = db_override or default_db_path()
-    balance = collect_and_store_neuralwatt(
-        usage_db_path=usage_db,
-        balances_db_path=balances_db,
-    )
+    balance = collect_and_store_neuralwatt(db_path=balances_db)
     if balance is None:
-        starting_env = os.environ.get(NEURALWATT_STARTING_ENV, "").strip()
-        reason = ("NEURALWATT_STARTING_BALANCE not set"
-                  if not starting_env
-                  else "self-tracking query failed (see logs)")
+        key_set = bool(os.environ.get(NEURALWATT_KEY_ENV, "").strip())
+        reason = (f"{NEURALWATT_KEY_ENV} not set"
+                  if not key_set else "/v1/quota API call failed (see logs)")
         print(json.dumps({"provider": "neuralwatt", "ok": False, "error": reason}))
         return 1
     print(json.dumps({
         "provider": "neuralwatt",
         "ok": True,
-        "total_spent_usd": balance.total_spent_usd,
-        "starting": balance.starting_usd,
+        "method": "real-api",
         "remaining_usd": balance.remaining_usd,
+        "total_credits_usd": balance.total_credits_usd,
+        "kwh_used": balance.kwh_used,
+        "kwh_remaining": balance.kwh_remaining,
+        "kwh_included": balance.kwh_included,
         "usage_fraction": balance.usage_fraction,
         "used_pct": balance.used_pct,
+        "cost_usd_lifetime": balance.cost_usd,
+        "subscription_status": balance.subscription_status,
+        "period_end": balance.period_end,
         "is_exhausted": balance.is_exhausted,
         "daily_spent_usd": balance.daily_spent_usd,
         "daily_cap_usd": balance.daily_cap_usd,
         "is_daily_cap_exceeded": balance.is_daily_cap_exceeded,
         "collected_at": balance.collected_at,
-        "usage_db_path": usage_db,
+        "remaining": balance.kwh_remaining,
+        "total": balance.kwh_included,
         "balances_db_path": balances_db,
     }, default=str))
     return 0

@@ -197,9 +197,10 @@ def run_kalman_price_filter(key, observations, btc_price, tuning, db):
     """
     key_tuning = tuning.get(key, {})
     mn = key_tuning.get("measurement_noise", 10.0)
-    pn = key_tuning.get("process_noise", 0.1)
+    pn = key_tuning.get("process_noise", 1.0)
+    st = key_tuning.get("step_threshold", float('inf'))
 
-    kf = KalmanPredictor(process_noise=pn, measurement_noise=mn)
+    kf = KalmanPredictor(process_noise=pn, measurement_noise=mn, step_threshold=st)
     state = load_state().get(key, {})
 
     # Restore persisted state if available

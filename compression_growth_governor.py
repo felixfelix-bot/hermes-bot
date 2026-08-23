@@ -7,6 +7,12 @@ using a 1-D Kalman filter. Adjusts compression.threshold via
 lower threshold → compact sooner) or sparse (low growth → raise threshold
 → preserve context longer).
 
+**Multi-profile**: iterates over ALL profiles in ~/.hermes/profiles/*/
+and applies the same growth-rate-based threshold to each. The growth
+rate is measured globally (zai_usage.db does not track per-profile
+sessions); the threshold computation is per-profile because each profile
+can have a different context_length.
+
 Runs AFTER compression_cost_governor.py (chained in same cron slot).
 
 State:  ~/.hermes/bot/compression_growth_state.json
@@ -35,7 +41,9 @@ BOT_DIR = Path.home() / ".hermes" / "bot"
 DB_PATH = BOT_DIR / "zai_usage.db"
 STATE_FILE = BOT_DIR / "compression_growth_state.json"
 AUDIT_FILE = BOT_DIR / "compression_growth_override.json"
-CONFIG_PATH = Path.home() / ".hermes" / "profiles" / "manager" / "config.yaml"
+PROFILES_DIR = Path.home() / ".hermes" / "profiles"
+# Backward compat: tests and old callers reference CONFIG_PATH for manager
+CONFIG_PATH = PROFILES_DIR / "manager" / "config.yaml"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,6 +70,33 @@ G_MAX = 20000              # Ceiling for growth estimate
 # At g=681 (sparse):  delta = 0.00004 * (1119)  = +0.045
 # At g=200:           delta = 0.00004 * (1600)  = +0.064 → clamped to ≤ MAX
 K_SENSITIVITY = 0.00004
+
+
+# ---------------------------------------------------------------------------
+# Profile discovery
+# ---------------------------------------------------------------------------
+
+def discover_profiles(profiles_dir: Path | None = None) -> list[str]:
+    """Return all profile directory names that have a ``config.yaml``.
+
+    Scans *profiles_dir* (default: ``~/.hermes/profiles``) and returns
+    sorted names of subdirectories that contain ``config.yaml``.
+    Returns an empty list if the directory doesn't exist or is empty.
+    """
+    if profiles_dir is None:
+        profiles_dir = PROFILES_DIR
+    if not profiles_dir or not profiles_dir.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in profiles_dir.iterdir()
+        if entry.is_dir() and (entry / "config.yaml").exists()
+    )
+
+
+def profile_config_path(profile_name: str) -> Path:
+    """Return the ``config.yaml`` path for a given profile name."""
+    return PROFILES_DIR / profile_name / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +201,9 @@ def measure_growth_rate(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> f
     positive deltas (excluding post-compression resets and ``task_type``
     rows), and returns the median across all sessions.
 
+    Note: The DB does not track per-profile sessions, so this returns a
+    **global** growth rate applied to all profiles.
+
     Falls back to **G_BASELINE** on any error or insufficient data.
     """
     if not db_path.exists():
@@ -255,9 +293,11 @@ def _write_audit(
     applied: bool,
     growth_rate: float = 0.0,
     kalman_estimate: float = 0.0,
+    profile: str = "manager",
 ):
     """Write audit data to the override file."""
     audit = {
+        "profile": profile,
         "threshold": round(new_threshold, 4),
         "old_threshold": round(old_threshold, 4),
         "applied": applied,
@@ -275,7 +315,13 @@ def _write_audit(
         print(f"[growth-governor] audit write failed: {e}", file=sys.stderr)
 
 
-def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bool:
+def apply_threshold(
+    new_threshold: float,
+    config_path: Path = CONFIG_PATH,
+    profile_name: str = "manager",
+    growth_rate: float = 0.0,
+    kalman_estimate: float = 0.0,
+) -> bool:
     """Apply threshold via ``hermes config set`` if change exceeds hysteresis.
 
     Reads current threshold and context_length dynamically from *config_path*.
@@ -288,7 +334,8 @@ def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bo
 
     # Write audit regardless (captures decision rationale)
     _write_audit(new_threshold, current_threshold, context_length,
-                 False)  # will overwrite below if applied
+                 False, growth_rate=growth_rate,
+                 kalman_estimate=kalman_estimate, profile=profile_name)
 
     if abs(new_threshold - current_threshold) < HYSTERESIS:
         return False  # Within hysteresis band — no change
@@ -296,18 +343,20 @@ def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bo
     try:
         result = subprocess.run(
             [
-                "hermes", "--profile", "manager", "config", "set",
+                "hermes", "--profile", profile_name, "config", "set",
                 "compression.threshold", f"{new_threshold:.4f}",
             ],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
-            _write_audit(new_threshold, current_threshold, context_length, True)
+            _write_audit(new_threshold, current_threshold, context_length, True,
+                         growth_rate=growth_rate,
+                         kalman_estimate=kalman_estimate, profile=profile_name)
             return True
-        print(f"[growth-governor] hermes config set failed: {result.stderr}", file=sys.stderr)
+        print(f"[growth-governor] hermes config set failed for {profile_name}: {result.stderr}", file=sys.stderr)
         return False
     except Exception as e:
-        print(f"[growth-governor] config set exception: {e}", file=sys.stderr)
+        print(f"[growth-governor] config set exception for {profile_name}: {e}", file=sys.stderr)
         return False
 
 
@@ -315,15 +364,24 @@ def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bo
 # Main entry point (cron)
 # ---------------------------------------------------------------------------
 
-def main():
-    """Entry point for cron.  Zero LLM cost — pure computation."""
+def main(profiles: list[str] | None = None):
+    """Entry point for cron.  Zero LLM cost — pure computation.
+
+    Iterates over ALL profiles in ~/.hermes/profiles/ and applies
+    the growth-rate-based threshold to each. Growth rate is measured
+    globally (the DB does not track per-profile sessions); the threshold
+    computation is per-profile because each profile can have a different
+    context_length.
+    """
+    if profiles is None:
+        profiles = discover_profiles()
+    if not profiles:
+        profiles = ["manager"]
+
     state = load_state()
     kf = GrowthRateKalman.from_dict(state.get("kalman", {}))
 
-    # Read context_length dynamically from config.yaml
-    context_length, old_threshold = read_config()
-
-    # Measure current growth rate
+    # Measure global growth rate (DB doesn't track per-profile)
     measured_g = measure_growth_rate(DB_PATH)
 
     # Skip Kalman update when DB is missing (fake G_BASELINE measurement)
@@ -333,28 +391,56 @@ def main():
         kf.predict()
         g_estimate = kf.update(measured_g)
 
-    # Compute optimal threshold (compose with cost governor's current value)
-    new_threshold = compute_threshold(g_estimate, context_length, old_threshold)
+    # Iterate over all profiles
+    profile_results: list[dict] = []
+    for profile_name in profiles:
+        config_path = profile_config_path(profile_name)
+        if not config_path.exists():
+            print(f"[growth-governor] skipping {profile_name}: no config.yaml",
+                  file=sys.stderr)
+            profile_results.append({
+                "profile": profile_name,
+                "skipped": True,
+                "reason": "no config.yaml",
+            })
+            continue
 
-    # Apply with hysteresis (reads config again inside)
-    applied = apply_threshold(new_threshold)
+        context_length, old_threshold = read_config(config_path)
+        new_threshold = compute_threshold(g_estimate, context_length, old_threshold)
+        applied = apply_threshold(
+            new_threshold, config_path, profile_name,
+            growth_rate=measured_g, kalman_estimate=g_estimate,
+        )
+
+        if applied:
+            print(f"[growth-governor] updated {profile_name}: "
+                  f"threshold {old_threshold:.4f} → {new_threshold:.4f}",
+                  file=sys.stderr)
+
+        profile_results.append({
+            "profile": profile_name,
+            "old_threshold": round(old_threshold, 4),
+            "new_threshold": round(new_threshold, 4),
+            "context_length": context_length,
+            "applied": applied,
+        })
 
     # Update persisted state
     history: list = state.get("threshold_history", [])
     history.append({
         "ts": time.time(),
-        "old_threshold": round(old_threshold, 4),
-        "new_threshold": round(new_threshold, 4),
-        "applied": applied,
+        "new_threshold": round(profile_results[-1]["new_threshold"], 4)
+            if profile_results and "new_threshold" in profile_results[-1]
+            else None,
+        "applied": any(r.get("applied") for r in profile_results),
     })
     history = history[-100:]  # Keep last 100 entries
 
     state["kalman"] = kf.to_dict()
     state["last_measurement"] = round(measured_g, 1)
     state["last_ts"] = time.time()
-    state["current_threshold"] = new_threshold if applied else old_threshold
+    state["profiles_processed"] = len(profile_results)
     state["threshold_history"] = history
-    state["context_length"] = context_length
 
     try:
         save_state(state)
@@ -365,10 +451,8 @@ def main():
     summary = {
         "growth_rate": round(measured_g, 1),
         "kalman_estimate": round(g_estimate, 1),
-        "old_threshold": round(old_threshold, 4),
-        "new_threshold": round(new_threshold, 4),
-        "context_length": context_length,
-        "applied": applied,
+        "profiles_processed": len(profile_results),
+        "profile_results": profile_results,
     }
     print(json.dumps(summary, indent=2))
 

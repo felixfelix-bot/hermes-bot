@@ -8,6 +8,8 @@ Tests cover:
 - Hysteresis (threshold unchanged when delta < 0.02)
 - Dynamic context_length (verify floor changes with different values)
 - Fallback when zai_usage.db doesn't exist or is empty
+- Profile discovery (discover_profiles)
+- Multi-profile iteration (main processes all profiles)
 """
 import json
 import os
@@ -33,6 +35,8 @@ from compression_growth_governor import (
     save_state,
     main,
     _write_audit,
+    discover_profiles,
+    profile_config_path,
     G_BASELINE,
     G_MIN,
     G_MAX,
@@ -357,6 +361,17 @@ class TestComputeThreshold:
 class TestHysteresis:
     """Test that apply_threshold respects the hysteresis threshold."""
 
+    @staticmethod
+    def _write_config(path, context_length=200000, threshold=0.4000):
+        """Write a valid YAML config file."""
+        import yaml as _yaml
+        with open(path, 'w') as f:
+            _yaml.dump(
+                {"model": {"context_length": context_length},
+                 "compression": {"threshold": threshold}},
+                f,
+            )
+
     def test_small_delta_not_applied(self):
         """Threshold change < 0.02 should not be applied."""
         with patch('compression_growth_governor.subprocess.run') as mock_run:
@@ -364,9 +379,7 @@ class TestHysteresis:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 config_path = Path(tmpdir) / "config.yaml"
-                config_path.write_text(
-                    f"model:\n  context_length: 200000\ncompression:\n  threshold: 0.4000\n"
-                )
+                self._write_config(config_path, threshold=0.4000)
                 audit_path = Path(tmpdir) / "audit.json"
                 with patch('compression_growth_governor.AUDIT_FILE', audit_path):
                     with patch('compression_growth_governor.CONFIG_PATH', config_path):
@@ -382,9 +395,7 @@ class TestHysteresis:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 config_path = Path(tmpdir) / "config.yaml"
-                config_path.write_text(
-                    f"model:\n  context_length: 200000\ncompression:\n  threshold: 0.4000\n"
-                )
+                self._write_config(config_path, threshold=0.4000)
                 audit_path = Path(tmpdir) / "audit.json"
                 with patch('compression_growth_governor.AUDIT_FILE', audit_path):
                     with patch('compression_growth_governor.CONFIG_PATH', config_path):
@@ -393,6 +404,26 @@ class TestHysteresis:
         assert result is True, "Large delta should be applied"
         mock_run.assert_called_once()
 
+    def test_large_delta_applied_with_profile(self):
+        """apply_threshold with profile_name should include it in subprocess args."""
+        with patch('compression_growth_governor.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "config.yaml"
+                self._write_config(config_path, threshold=0.4000)
+                audit_path = Path(tmpdir) / "audit.json"
+                with patch('compression_growth_governor.AUDIT_FILE', audit_path):
+                    with patch('compression_growth_governor.CONFIG_PATH', config_path):
+                        result = apply_threshold(0.4500, config_path, profile_name="worker-dq05")
+
+        assert result is True
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "--profile" in args
+        idx = args.index("--profile")
+        assert args[idx + 1] == "worker-dq05"
+
     def test_config_set_failure_returns_false(self):
         """If hermes config set fails, should return False."""
         with patch('compression_growth_governor.subprocess.run') as mock_run:
@@ -400,9 +431,7 @@ class TestHysteresis:
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 config_path = Path(tmpdir) / "config.yaml"
-                config_path.write_text(
-                    f"model:\n  context_length: 200000\ncompression:\n  threshold: 0.4000\n"
-                )
+                self._write_config(config_path, threshold=0.4000)
                 audit_path = Path(tmpdir) / "audit.json"
                 with patch('compression_growth_governor.AUDIT_FILE', audit_path):
                     with patch('compression_growth_governor.CONFIG_PATH', config_path):
@@ -584,6 +613,17 @@ class TestAuditFile:
                 assert data["context_length"] == 200000
                 assert data["growth_rate"] == 5000.0
 
+    def test_audit_includes_profile(self):
+        """_write_audit should include the profile field."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit_path = Path(tmpdir) / "audit.json"
+            with patch("compression_growth_governor.AUDIT_FILE", audit_path):
+                _write_audit(0.4500, 0.4000, 200000, True,
+                             growth_rate=5000.0, kalman_estimate=4800.0,
+                             profile="worker-dq05")
+                data = json.loads(audit_path.read_text())
+                assert data["profile"] == "worker-dq05"
+
 
 class TestReadConfigException:
     """Test read_config error handling."""
@@ -607,8 +647,74 @@ class TestReadConfigException:
             assert threshold == FALLBACK_THRESHOLD
 
 
+# ---------------------------------------------------------------------------
+# 8. Profile discovery
+# ---------------------------------------------------------------------------
+
+class TestDiscoverProfiles:
+    """Test discover_profiles() for the growth governor."""
+
+    def test_returns_profiles_with_config(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        for name in ["alpha", "beta"]:
+            d = profiles_dir / name
+            d.mkdir(parents=True)
+            (d / "config.yaml").write_text("model:\n  default: glm-5.2\n")
+        result = discover_profiles(profiles_dir)
+        assert result == ["alpha", "beta"]
+
+    def test_skips_dirs_without_config(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        good = profiles_dir / "good"
+        good.mkdir(parents=True)
+        (good / "config.yaml").write_text("model:\n  default: glm-5.2\n")
+        bad = profiles_dir / "bad"
+        bad.mkdir(parents=True)
+
+        result = discover_profiles(profiles_dir)
+        assert result == ["good"]
+
+    def test_empty_dir_returns_empty(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir(parents=True)
+        assert discover_profiles(profiles_dir) == []
+
+    def test_nonexistent_dir_returns_empty(self, tmp_path: Path):
+        assert discover_profiles(tmp_path / "noexist") == []
+
+    def test_default_profiles_dir(self):
+        """When called with no args, should use module's PROFILES_DIR."""
+        from compression_growth_governor import PROFILES_DIR
+        with patch("compression_growth_governor.PROFILES_DIR", Path("/nonexistent/98765")):
+            result = discover_profiles()
+        assert result == []
+
+
+class TestProfileConfigPath:
+    def test_returns_path_for_profile(self):
+        path = profile_config_path("worker-test")
+        assert path.name == "config.yaml"
+        assert "worker-test" in str(path)
+
+
+# ---------------------------------------------------------------------------
+# 9. main() — multi-profile iteration
+# ---------------------------------------------------------------------------
+
 class TestMain:
-    """Test the main() entry point."""
+    """Test the main() entry point with multi-profile support."""
+
+    def _make_config(self, tmpdir, context_length=200000, threshold=0.6228, name="manager"):
+        """Helper: create a mock profiles dir with one profile."""
+        profiles_dir = Path(tmpdir) / "profiles"
+        prof_dir = profiles_dir / name
+        prof_dir.mkdir(parents=True)
+        config_path = prof_dir / "config.yaml"
+        config_path.write_text(
+            f"model:\n  context_length: {context_length}\n"
+            f"compression:\n  threshold: {threshold}\n"
+        )
+        return profiles_dir, config_path
 
     def test_main_with_mock_db(self):
         """main() should produce JSON output and update state."""
@@ -618,10 +724,7 @@ class TestMain:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
             audit_path = Path(tmpdir) / "audit.json"
-            config_path = Path(tmpdir) / "config.yaml"
-            config_path.write_text(
-                "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
-            )
+            profiles_dir, config_path = self._make_config(tmpdir)
 
             # Create a test DB with growth data
             db_path = Path(tmpdir) / "test.db"
@@ -644,6 +747,7 @@ class TestMain:
 
             with patch("compression_growth_governor.STATE_FILE", state_path), \
                  patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
                  patch("compression_growth_governor.CONFIG_PATH", config_path), \
                  patch("compression_growth_governor.DB_PATH", db_path), \
                  patch("compression_growth_governor.subprocess.run") as mock_run:
@@ -657,11 +761,15 @@ class TestMain:
             summary = json.loads(output)
             assert "growth_rate" in summary
             assert "kalman_estimate" in summary
-            assert "old_threshold" in summary
-            assert "new_threshold" in summary
-            assert "context_length" in summary
-            assert "applied" in summary
-            assert summary["context_length"] == 200000
+            assert "profiles_processed" in summary
+            assert summary["profiles_processed"] >= 1
+            assert "profile_results" in summary
+            pr = summary["profile_results"][0]
+            assert "old_threshold" in pr
+            assert "new_threshold" in pr
+            assert "context_length" in pr
+            assert "applied" in pr
+            assert pr["context_length"] == 200000
             assert state_path.exists()
 
     def test_main_db_missing_no_crash(self):
@@ -672,13 +780,11 @@ class TestMain:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
             audit_path = Path(tmpdir) / "audit.json"
-            config_path = Path(tmpdir) / "config.yaml"
-            config_path.write_text(
-                "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
-            )
+            profiles_dir, config_path = self._make_config(tmpdir)
 
             with patch("compression_growth_governor.STATE_FILE", state_path), \
                  patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
                  patch("compression_growth_governor.CONFIG_PATH", config_path), \
                  patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
                  patch("compression_growth_governor.subprocess.run") as mock_run:
@@ -690,5 +796,170 @@ class TestMain:
 
             summary = json.loads(f.getvalue())
             assert summary["growth_rate"] == G_BASELINE
-            assert summary["context_length"] == 200000
+            assert summary["profiles_processed"] >= 1
+            pr = summary["profile_results"][0]
+            assert pr["context_length"] == 200000
             assert state_path.exists()
+
+    def test_main_processes_multiple_profiles(self):
+        """main() should iterate over all discovered profiles."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            for name in ["alpha", "beta", "gamma"]:
+                d = profiles_dir / name
+                d.mkdir(parents=True)
+                (d / "config.yaml").write_text(
+                    f"model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+                )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 3
+            names = [pr["profile"] for pr in summary["profile_results"]]
+            assert names == ["alpha", "beta", "gamma"]
+
+    def test_main_skips_profile_without_config(self):
+        """Profiles without config.yaml should be skipped."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            # good profile
+            good_dir = profiles_dir / "good"
+            good_dir.mkdir(parents=True)
+            (good_dir / "config.yaml").write_text(
+                "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+            )
+            # bad profile — no config.yaml
+            bad_dir = profiles_dir / "bad"
+            bad_dir.mkdir(parents=True)
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["good", "bad"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 2  # both processed (bad as skipped entry)
+            pr = summary["profile_results"][0]
+            assert pr["profile"] == "good"
+            # bad should be in profile_results as skipped
+            skipped = [p for p in summary["profile_results"] if p.get("skipped")]
+            assert len(skipped) == 1
+            assert skipped[0]["profile"] == "bad"
+
+    def test_main_with_explicit_profile_list(self):
+        """main(profiles=[...]) should process only given profiles."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            for name in ["alpha", "beta", "gamma"]:
+                d = profiles_dir / name
+                d.mkdir(parents=True)
+                (d / "config.yaml").write_text(
+                    "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+                )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["alpha", "gamma"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 2
+            names = [pr["profile"] for pr in summary["profile_results"]]
+            assert names == ["alpha", "gamma"]
+
+    def test_main_profile_with_no_context_length(self):
+        """Profile with config.yaml but no context_length should use default."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            prof_dir = profiles_dir / "worker-new"
+            prof_dir.mkdir(parents=True)
+            (prof_dir / "config.yaml").write_text(
+                "model:\n  default: glm-5.2\ncompression:\n  threshold: 0.6228\n"
+            )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["worker-new"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 1
+            pr = summary["profile_results"][0]
+            # No context_length in config → defaults to 131072
+            assert pr["context_length"] == 131072
+
+    def test_main_empty_profiles_falls_back_to_manager(self):
+        """If no profiles discovered, fall back to ['manager']."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "empty"
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            summary = json.loads(f.getvalue())
+            # Falls back to "manager" which won't exist in fake dir → skipped
+            assert any(
+                p.get("skipped") and p.get("profile") == "manager"
+                for p in summary["profile_results"]
+            )

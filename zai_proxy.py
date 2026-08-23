@@ -484,9 +484,37 @@ def _load_external_keys():
                     keys["opencode_go"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("NEURALWATT_API_KEY=") and "neuralwatt" not in keys:
                     keys["neuralwatt"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OPENROUTER_OXALPHA_KEY=") and "oxalpha" not in keys:
+                    keys["oxalpha"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
+
+# ── oxalpha promo tier (OX-2, 2026-08-22) ──────────────────────────────────
+# Import + construct the tier from repo src.oxalpha_tier (pure, contract-tested).
+# Fail-closed: any import/config error -> tier absent -> zero regression.
+# NOTE: Must be AFTER _EXTERNAL_KEYS = _load_external_keys() — the tier needs the key.
+_OXALPHA_TIER = None
+try:
+    from src.oxalpha_tier import OxalphaTier, load_tier_from_config
+    from src.promo_tier import PromoTierGuard
+    import yaml as _yaml_ox
+    _ox_cfg_path = os.path.expanduser("~/.hermes/bot/config/providers.yaml")
+    _ox_cfg = {}
+    if os.path.exists(_ox_cfg_path):
+        with open(_ox_cfg_path) as _f:
+            _ox_full = _yaml_ox.safe_load(_f) or {}
+        _ox_cfg = _ox_full.get("oxalpha") or {}
+        _ox_strategy = _ox_full.get("strategy") or {}
+    else:
+        _ox_strategy = {}
+    _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
+    _OXALPHA_TIER = load_tier_from_config(_ox_cfg, _ox_strategy, _ox_key)
+    print(f"[oxalpha] tier loaded — failover_enabled={_OXALPHA_TIER.failover_enabled} "
+          f"configured={_OXALPHA_TIER.configured} key={'present' if _ox_key else 'ABSENT'}", flush=True)
+except Exception as _ox_e:
+    print(f"[oxalpha] tier DISABLED — {_ox_e}", flush=True)
+    _OXALPHA_TIER = None
 
 # Ollama Cloud — primary provider (same tier as z.ai, not just failover)
 OLLAMA_CLOUD_KEY = _EXTERNAL_KEYS.get("ollama_cloud", "")
@@ -626,11 +654,6 @@ EXTERNAL_PROVIDERS = {
         # Model IDs come from the network catalog (same short IDs as ours).
         "base_url": _EXTERNAL_KEYS.get("routstrd_base", "http://localhost:8008") + "/v1",
         "key": _EXTERNAL_KEYS.get("routstrd", ""),
-    },
-    "opencode_go": {
-        # OpenCode Go — $10/mo flat-rate, native glm-5.3, prompt caching.
-        "base_url": OPENCODE_GO_BASE,
-        "key": OPENCODE_GO_KEY,
     },
     "neuralwatt": {
         # NeuralWatt — per-token, deepseek-v4-flash $0.14/M, prompt caching.
@@ -1534,6 +1557,22 @@ def _shadow_live_label(chosen_key):
 # The proxy passes through whatever model the profile requests.
 _select_model_tier = None
 
+# ── Compression model selection hook ──────────────────────────────────────────
+# Parallel to _select_model_tier — when a request is tagged as a compression
+# call (X-Task-Type: compression or model == "__compress__" sentinel), this
+# hook selects the cheapest capable summarizer model based on cost, pressure,
+# benchmarks, and context constraints. See compression_model_router.py.
+_select_compression_model = None
+try:
+    from compression_model_router import (
+        select_compression_model as _cmr_select,
+        is_compression_request as _cmr_is_compression,
+    )
+    _select_compression_model = _cmr_select
+    _is_compression_request = _cmr_is_compression
+except Exception:
+    _is_compression_request = lambda tt, m: False
+
 # ── Kalman-backed rate-limit predictor (unlimited retries) ───────────────────
 # Models 429 inter-arrival times to predict recovery.  Falls back to capped
 # exponential backoff when insufficient data.  A broken import never crashes
@@ -2239,6 +2278,7 @@ _FALLBACK_OLLAMA_CLOUD_BASE = 0.0155    # was 0.024 (35% wrong); measured = 0.01
 _FALLBACK_OLLAMA_CLOUD_EXTRA = 0.15     # above-quota rate
 _FALLBACK_RATES: dict[str, float] = {
     "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
+    "ollama_cloud_2": _FALLBACK_OLLAMA_CLOUD_BASE,
     "friend":       0.001,    # shared z.ai subscription → marginal $0
     "ours":         0.001,    # z.ai subscription → marginal $0
     "deepinfra":    1.30,
@@ -2555,11 +2595,11 @@ def _spend_tier(key_name: str | None) -> str:
     telnyx/ppq/openrouter/routstr (paid external failover providers)."""
     if key_name in ("ours", "friend"):
         return key_name
-    elif key_name == "ollama_cloud":
-        return "ollama_cloud"
+    elif key_name in ("ollama_cloud", "ollama_cloud_2"):
+        return key_name
     elif key_name == "deepinfra":
         return "deepinfra"
-    elif key_name in ("telnyx", "ppq", "openrouter", "routstr", "routstrd"):
+    elif key_name in ("telnyx", "ppq", "openrouter", "routstr", "routstrd", "neuralwatt", "opencode_go"):
         return key_name
     return "unknown"
 
@@ -4054,6 +4094,91 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def _serve_via_oxalpha(self, body: bytes, response_buffer: bytearray, t0: float) -> bool:
+        """Attempt a single request to the oxalpha free promo tier.
+
+        Single attempt, 90s timeout, forced model=stealth/ox-alpha.
+        On ANY error (429/timeout/5xx/402) falls through to the paid chain.
+        Returns True on success (response already sent), False otherwise.
+        """
+        if not _OXALPHA_TIER or not _OXALPHA_TIER.failover_eligible():
+            return False
+        _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
+        if not _ox_key:
+            return False
+        try:
+            body_json = json.loads(body) if body else {}
+        except Exception:
+            return False
+        req_body = _OXALPHA_TIER.build_request_body(body_json)
+        fwd = json.dumps(req_body).encode()
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        hdrs = {
+            "Authorization": f"Bearer {_ox_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://hermes.local",
+            "X-Title": "Hermes Agent (oxalpha promo)",
+        }
+        print(f"[failover] trying oxalpha model=stealth/ox-alpha cost=$0.00/M (FREE promo)", flush=True)
+        try:
+            req = urllib.request.Request(url, data=fwd, method="POST", headers=hdrs)
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                self.send_response(resp.status)
+                for h, v in resp.headers.items():
+                    if h.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(h, v)
+                self.send_header("X-Failover-Provider", "oxalpha")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    response_buffer.extend(chunk)
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                # Parse usage for spend tracking + cost guard
+                ext_usage = _parse_usage(bytes(response_buffer))
+                ext_tokens = int(ext_usage.get("total_tokens") or 0)
+                ext_cost_usd, ext_cost_source = _extract_cost("openrouter", bytes(response_buffer), ext_tokens)
+                # Observe cost — any cost > 0 kills the tier (no re-enable)
+                if ext_cost_usd is not None and ext_cost_usd > 0:
+                    _OXALPHA_TIER.observe_response_cost(ext_cost_usd)
+                    print(f"[oxalpha] SPEND DETECTED — cost=${ext_cost_usd:.6f} — tier KILLED", flush=True)
+                _OXALPHA_TIER.note_success()
+                _record_spend("oxalpha", "stealth/ox-alpha", ext_tokens, actual_cost=ext_cost_usd)
+                _log_api_call(
+                    key_name="oxalpha", key_suffix=_ox_key[-4:],
+                    model="stealth/ox-alpha",
+                    prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                    completion_tokens=int(ext_usage.get("completion_tokens") or 0),
+                    total_tokens=ext_tokens,
+                    tier="oxalpha", status_code=resp.status, error=None,
+                    duration_ms=int((time.time() - t0) * 1000),
+                    cost_usd=ext_cost_usd, cost_source=ext_cost_source,
+                    cache_hit=0,
+                    session_id=getattr(self, "_session_id", None),
+                    task_type=getattr(self, "_task_type", None),
+                )
+                _log_key_decision(chosen_key="oxalpha", reason="zai_exhausted_oxalpha_free_failover")
+                return True
+        except urllib.error.HTTPError as he:
+            if he.code == 429:
+                delay = _OXALPHA_TIER.note_429()
+                # Log ALL rate-limit headers for empirical discovery
+                rl_headers = {k: v for k, v in he.headers.items() if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
+                print(f"[failover] oxalpha returned 429 — backoff {delay}s — headers={rl_headers} — trying next", flush=True)
+            elif he.code == 402:
+                _OXALPHA_TIER.note_http_status(402)
+                print(f"[failover] oxalpha returned 402 — tier disabled for promo remainder — trying next", flush=True)
+            else:
+                _OXALPHA_TIER.note_failure()
+                print(f"[failover] oxalpha returned HTTP {he.code} — trying next", flush=True)
+            return False
+        except Exception as e:
+            _OXALPHA_TIER.note_failure()
+            print(f"[failover] oxalpha exception: {type(e).__name__}: {e} — trying next", flush=True)
+            return False
+
     def _try_external_failover(self, body: bytes, model: str | None,
                                 response_buffer: bytearray, t0: float,
                                 preferred: str | None = None) -> bool:
@@ -4074,6 +4199,15 @@ class Handler(BaseHTTPRequestHandler):
         Returns True on success (response already sent),
         False on failure (caller should send error response).
         """
+        # ── OX-2 EMERGENCY: oxalpha free-tier attempt BEFORE any paid provider ──
+        # Positioned after z.ai keys (the only way this function is reached)
+        # and before every paid candidate. Single attempt, 90s timeout.
+        # ANY error falls through to the paid chain — zero regression.
+        if _OXALPHA_TIER is not None and _OXALPHA_TIER.failover_eligible():
+            if self._serve_via_oxalpha(body, response_buffer, t0):
+                return True
+            # oxalpha failed — fall through to paid chain below
+
         # Choose failover model based on requesting profile's quality tier.
         # Manager (glm-5.2/glm-5.3): quality floor at glm-5.2 externally
         # (externals lack 5.3 until open weights land ~Aug 28).
@@ -4149,6 +4283,12 @@ class Handler(BaseHTTPRequestHandler):
                 # "deepseek-ai/DeepSeek-V4-Pro" (case-sensitive, dotted form).
                 actual_model = _PROVIDER_MODEL_NAMES.get(provider_name, {}).get(ext_model, ext_model)
                 body_json["model"] = actual_model
+                # Strip non-OpenAI fields that some providers reject with 422.
+                # neuralwatt is strict — it rejects reasoning/task_type/tier_hint.
+                if provider_name == "neuralwatt":
+                    for _strip_key in ("reasoning", "task_type", "tier_hint",
+                                       "X-Model-Tier", "X-Task-Type"):
+                        body_json.pop(_strip_key, None)
                 fwd_body = json.dumps(body_json).encode()
 
                 url = prov["base_url"] + "/chat/completions"
@@ -4245,6 +4385,9 @@ class Handler(BaseHTTPRequestHandler):
                     if he.code == 402:
                         print(f"[failover] {provider_name} returned 402 (unfunded) — marking unfunded, trying next", flush=True)
                         _mark_unfunded(provider_name)
+                        if provider_name == "routstrd":
+                            _routstrd_bal_cache["entry"] = {"used_pct": 100.0, "remaining": 0.0, "balance_sats": 0}
+                            _routstrd_bal_cache["ts"] = time.time()
                         continue
                     print(f"[failover] {provider_name} returned HTTP {he.code} — trying next", flush=True)
                     raise
@@ -4347,6 +4490,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # Telnyx failed — fall through to normal z.ai/failover chain
             # (z.ai will also fail, but Ollama/external failover may work)
+
+        # Step 1c-3: Non-z.ai models (deepseek, qwen, etc.) — skip z.ai
+        # entirely and go straight to external failover. z.ai returns 400
+        # for any model not in its catalog, wasting a round-trip.
+        if original_model.startswith(("deepseek/", "qwen", "minimax", "mimo")):
+            response_buffer = bytearray()
+            if OPENCODE_GO_KEY and self._try_opencode_go(body, original_model, response_buffer, t0):
+                return
+            if self._try_external_failover(body, original_model, response_buffer, t0):
+                return
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(f'{{"error":"all external providers failed for non-z.ai model {original_model}"}}'.encode())
+            return
 
         # Step 1d + Step 2 — choose a routing key.
         #
@@ -4573,6 +4731,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        # Step 3b: Compression model selection (parallel to tier routing)
+        # When the request is a compression call (X-Task-Type: compression or
+        # model == "__compress__" sentinel), select the cheapest capable
+        # summarizer model based on cost × pressure × benchmarks.
+        compression_info = None
+        if _select_compression_model is not None and _is_compression_request(self._task_type, original_model):
+            try:
+                session_ctx = 131072
+                compression_info = _select_compression_model(
+                    session_id=self._session_id,
+                    session_context_length=session_ctx,
+                )
+                new_model = compression_info.get("model")
+                if new_model:
+                    body_json = json.loads(body)
+                    body_json["model"] = new_model
+                    body = json.dumps(body_json).encode()
+                    self.headers["Content-Length"] = str(len(body))
+            except Exception:
+                compression_info = None
+
         # Step 4: Extract final model (may have been rewritten)
         model = _extract_model(body)
 
@@ -4599,6 +4778,19 @@ class Handler(BaseHTTPRequestHandler):
                 base_tier="client",
                 hint=tier_hint if tier_hint else None,
                 reason=f"client X-Model-Tier={tier_hint}",
+                peak=0,
+                active_key=chosen,
+            )
+
+        if compression_info:
+            _log_model_decision(
+                key_name=chosen,
+                model=model,
+                original_model=original_model,
+                tier="compression",
+                base_tier="compression",
+                hint=None,
+                reason=compression_info.get("reason"),
                 peak=0,
                 active_key=chosen,
             )
@@ -5035,6 +5227,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(b"ok")
+        elif self.path == "/kalman-pricing":
+            # Kalman-aware pricing feed for routstrd (read-only).
+            # Returns effective prices per z.ai key + PPQ, computed from
+            # the same Kalman state the dispatch_gate uses.  See
+            # IMPL-SPEC-kalman-pricing-feed.md.
+            #
+            # Uses the shared _build_kalman_pricing_json() function so the
+            # endpoint and the Nostr publisher always emit identical data.
+            self.close_connection = True
+            try:
+                result = _build_kalman_pricing_json()
+                payload = json.dumps(result, indent=2).encode()
+            except Exception as e:
+                payload = json.dumps(
+                    {"error": str(e), "hint": "kalman-pricing endpoint failed"},
+                    indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
         elif self.path == "/tier":
             # Current recommended model tier (for dispatch gate queries)
             # Supports ?urgency=urgent|standard|background query parameter
@@ -5396,9 +5610,250 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# ── oxalpha 5-min usage-delta poller (OX-2 §4.3) ────────────────────────────
+# Polls /api/v1/key for cumulative usage. Kill on cumulative INCREASE.
+# First sample = baseline (never a kill). State in ~/.hermes/bot/.oxalpha_usage_state.json
+def _oxalpha_usage_poller():
+    import json as _json
+    _state_path = os.path.expanduser("~/.hermes/bot/.oxalpha_usage_state.json")
+    _key = _EXTERNAL_KEYS.get("oxalpha", "")
+    if not _key:
+        return
+    while True:
+        try:
+            if _OXALPHA_TIER is None or not _OXALPHA_TIER.configured:
+                time.sleep(300)
+                continue
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read())
+            new_usage = float(data.get("usage", 0) or 0)
+            # Load previous state
+            prev = None
+            if os.path.exists(_state_path):
+                try:
+                    with open(_state_path) as f:
+                        prev = _json.loads(f.read()).get("cumulative_usage")
+                except Exception:
+                    prev = None
+            kill = _OXALPHA_TIER.decide_usage_kill(prev, new_usage)
+            if kill is not None:
+                print(f"[oxalpha] USAGE DELTA KILL — prev={prev} new={new_usage} delta={new_usage - (prev or 0):.6f}", flush=True)
+            # Save state
+            with open(_state_path, "w") as f:
+                _json.dump({"cumulative_usage": new_usage}, f)
+        except Exception as _e:
+            print(f"[oxalpha] usage poller error: {_e}", flush=True)
+        time.sleep(300)
+
+
+# ── Nostr kind-30315 Kalman pricing publisher ────────────────────────────────
+# Background thread that publishes the /kalman-pricing endpoint data as a
+# public kind-30315 replaceable Nostr event every 30 seconds.  This replaces
+# the old reverse SSH tunnel — Nostr relays are the transport now, so any
+# machine on any network can subscribe.
+#
+# The publisher uses the `nak` CLI (available at ~/.local/bin/nak) to sign
+# and publish events.  Falls back gracefully: all exceptions are caught and
+# logged, never crashing the main proxy.
+_NOSTR_SEC_PATH = Path.home() / ".hermes" / "bot" / "kalman_npub.nsec"
+_NOSTR_RELAYS = [
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+    "wss://relay.damus.io",
+]
+_NOSTR_PUBLISH_INTERVAL = 30  # seconds
+_NOSTR_PUBLISHER_NPUB = "npub1q2pk0674pg7yn5et8vhxxp3pe6s74grwpy30qj3wja7dysduqtms0ef294"
+
+
+def _load_nostr_sec() -> str | None:
+    """Load the Nostr private key from disk.  Returns hex sec or None."""
+    try:
+        if _NOSTR_SEC_PATH.exists():
+            sec = _NOSTR_SEC_PATH.read_text().strip()
+            if len(sec) == 64:
+                return sec
+    except Exception:
+        pass
+    return None
+
+
+def _build_kalman_pricing_json() -> dict:
+    """Build the same JSON that /kalman-pricing returns, plus source field.
+    Extracted so the publisher thread can call it without HTTP self-request.
+    """
+    peak = _is_peak_hour()
+    peak_mult = 3.0 if peak else 1.0
+    quota_snap = _snapshot_quota()
+    health_snap = _snapshot_health()
+
+    zai_providers = {}
+    available_zai = []
+    for key in ("ours", "friend"):
+        healthy = health_snap.get(key, False)
+        with lock:
+            wins = quota_cache.get(key, ([], 0.0))[0]
+        locked, lwin, lpct, lthr = is_key_locked(key, wins)
+        pct = _max_pct(wins)
+
+        win_pcts = {}
+        for w in wins:
+            wname = w.get("name", "unknown")
+            win_pcts[wname] = w.get("used_pct", 0)
+
+        base = (_converged_rates or {}).get(key)
+        if base is None:
+            base = _rpt_rate(key)
+
+        cost_mult = _KEY_COST_MULTIPLIER.get(key, 1.0)
+        scarcity_mult = 1.0
+        if pct >= 80:
+            scarcity_mult = 1.0 + (pct - 80) / 20.0
+
+        health_mult = 1.0 if healthy else 10.0
+
+        preds = _get_cached_predictions(key)
+        exhaust = _will_exhaust(preds)
+        burn_rate = (exhaust or {}).get("burn_rate_pct_per_hour", 0.0) or 0.0
+        hours_until = (exhaust or {}).get("exhausts_in_hours", None)
+        will_exhaust = bool(exhaust)
+        pace_mult = 1.0
+        if will_exhaust and hours_until is not None and hours_until < 6:
+            pace_mult = 1.0 + (6.0 - hours_until) / 6.0
+
+        effective = base * cost_mult * peak_mult * scarcity_mult * health_mult * pace_mult
+
+        available = healthy and not locked
+        zai_providers[f"zai_{key}"] = {
+            "base_rate_usd_per_m": round(base, 6),
+            "effective_price_usd_per_m": round(effective, 6),
+            "peak_multiplier": peak_mult,
+            "scarcity_multiplier": round(scarcity_mult, 3),
+            "health_multiplier": health_mult,
+            "pace_multiplier": round(pace_mult, 3),
+            "quota_used_pct": win_pcts,
+            "locked": locked,
+            "locked_window": lwin,
+            "locked_threshold": lthr,
+            "will_exhaust": will_exhaust,
+            "hours_until_exhaustion": round(hours_until, 1) if hours_until else None,
+            "burn_rate_tph": round(burn_rate, 1),
+            "available": available,
+        }
+        if available:
+            available_zai.append((key, effective))
+
+    ppq_base = 0.28
+    ppq_snap = quota_snap.get("ppq", {})
+    ppq_available = ppq_snap.get("used_pct", 0.0) < 100.0
+    zai_providers["ppq"] = {
+        "base_rate_usd_per_m": ppq_base,
+        "effective_price_usd_per_m": ppq_base,
+        "available": ppq_available,
+    }
+
+    if available_zai:
+        available_zai.sort(key=lambda x: x[1])
+        zai_eff_price = available_zai[0][1]
+        zai_available = True
+        zai_locked_reason = None
+    else:
+        zai_eff_price = None
+        zai_available = False
+        reasons = []
+        for key in ("ours", "friend"):
+            p = zai_providers.get(f"zai_{key}", {})
+            if p.get("locked"):
+                reasons.append(f"{key}:locked({p.get('locked_window')})")
+            elif not p.get("available"):
+                reasons.append(f"{key}:unhealthy")
+        zai_locked_reason = "; ".join(reasons) if reasons else "no keys available"
+
+    return {
+        "timestamp": int(time.time()),
+        "source": "T470",
+        "providers": zai_providers,
+        "zai_effective_price_usd_per_m": round(zai_eff_price, 6) if zai_eff_price else None,
+        "zai_available": zai_available,
+        "zai_locked_reason": zai_locked_reason,
+        "is_peak_hour": peak,
+    }
+
+
+def _nostr_publish_kalman():
+    """Background thread: publish kalman pricing as kind-30315 every 30s."""
+    import subprocess as _sp
+
+    sec = _load_nostr_sec()
+    if not sec:
+        print("[nostr] No private key found at ~/.hermes/bot/kalman_npub.nsec — publisher disabled",
+              flush=True)
+        return
+
+    nak_bin = None
+    for candidate in [os.path.expanduser("~/.local/bin/nak"), "/usr/local/bin/nak", "nak"]:
+        try:
+            _r = _sp.run(["which", candidate], capture_output=True, text=True, timeout=3)
+            if _r.returncode == 0 or os.path.exists(candidate):
+                nak_bin = candidate if os.path.exists(candidate) else _r.stdout.strip()
+                break
+        except Exception:
+            pass
+    if not nak_bin:
+        print("[nostr] nak CLI not found — publisher disabled", flush=True)
+        return
+
+    print(f"[nostr] Kalman publisher thread started — npub={_NOSTR_PUBLISHER_NPUB}", flush=True)
+
+    while True:
+        try:
+            pricing = _build_kalman_pricing_json()
+            content = json.dumps(pricing, separators=(",", ":"))
+
+            # Build nak event command — publish to all relays in one call
+            # NOTE: pass the secret key via NOSTR_SECRET_KEY env var, NOT --sec
+            # CLI arg, so it doesn't appear in ps aux / /proc/*/cmdline.
+            env = os.environ.copy()
+            env["NOSTR_SECRET_KEY"] = sec
+            cmd = [
+                nak_bin, "event",
+                "--kind", "30315",
+                "--tag", "d=kalman-pricing",
+                "--tag", "t=routstr",
+                "--content", content,
+            ] + _NOSTR_RELAYS
+
+            result = _sp.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+            if result.returncode == 0:
+                # Log a compact summary
+                zai_avail = pricing.get("zai_available", False)
+                zai_price = pricing.get("zai_effective_price_usd_per_m")
+                print(f"[nostr] Published kind-30315 — zai_available={zai_avail} "
+                      f"price={zai_price} ts={pricing.get('timestamp')}", flush=True)
+            else:
+                print(f"[nostr] nak event failed (rc={result.returncode}): "
+                      f"{result.stderr[:200]}", flush=True)
+        except _sp.TimeoutExpired:
+            print("[nostr] nak event timed out — will retry next cycle", flush=True)
+        except Exception as e:
+            print(f"[nostr] publisher error: {e}", flush=True)
+
+        time.sleep(_NOSTR_PUBLISH_INTERVAL)
+
+
 if __name__ == "__main__":
     t = threading.Thread(target=_refresh_loop, daemon=True)
     t.start()
+    # OX-2: start oxalpha usage-delta poller
+    if _OXALPHA_TIER is not None and _OXALPHA_TIER.configured:
+        _ox_poll = threading.Thread(target=_oxalpha_usage_poller, daemon=True)
+        _ox_poll.start()
+    # Nostr kind-30315 Kalman pricing publisher
+    _nostr_thread = threading.Thread(target=_nostr_publish_kalman, daemon=True)
+    _nostr_thread.start()
     time.sleep(3)  # let first quota fetch complete
     print(f"zai_proxy on :{PORT}  quotas={ {n: _max_pct(v[0]) for n, v in quota_cache.items()} }")
     # Allow socket reuse to prevent "Address already in use" on restart

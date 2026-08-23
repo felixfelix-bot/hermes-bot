@@ -3223,6 +3223,7 @@ def _get_telnyx_balance() -> float | None:
             headers={
                 "Authorization": f"Bearer {TELNYX_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -3475,7 +3476,7 @@ def _fetch_quota_windows(key: str) -> list[dict]:
     ``used_pct=999`` so the caller treats the key as locked.
     """
     try:
-        req = urllib.request.Request(QUOTA_URL, headers={"Authorization": f"Bearer {key}"})
+        req = urllib.request.Request(QUOTA_URL, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         limits = data.get("data", {}).get("limits", [])
@@ -4013,6 +4014,7 @@ class Handler(BaseHTTPRequestHandler):
             hdrs = {
                 "Authorization": f"Bearer {_api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
             }
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
@@ -4139,6 +4141,7 @@ class Handler(BaseHTTPRequestHandler):
             hdrs = {
                 "Authorization": f"Bearer {OPENCODE_GO_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
             }
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
@@ -4279,6 +4282,7 @@ class Handler(BaseHTTPRequestHandler):
                 hdrs = {
                     "Authorization": f"Bearer {TELNYX_KEY}",
                     "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
                 }
             else:
                 url = TELNYX_DEMO_URL
@@ -4378,6 +4382,7 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type": "application/json",
             "HTTP-Referer": "https://hermes.local",
             "X-Title": "Hermes Agent (oxalpha promo)",
+            "User-Agent": "Mozilla/5.0",
         }
         print(f"[failover] trying oxalpha model=stealth/ox-alpha cost=$0.00/M (FREE promo)", flush=True)
         try:
@@ -4560,6 +4565,7 @@ class Handler(BaseHTTPRequestHandler):
                 hdrs = {
                     "Authorization": f"Bearer {prov['key']}",
                     "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
                 }
                 if provider_name == "openrouter":
                     hdrs["HTTP-Referer"] = "https://hermes.local"
@@ -5898,7 +5904,7 @@ def _oxalpha_usage_poller():
                 continue
             req = urllib.request.Request(
                 "https://openrouter.ai/api/v1/key",
-                headers={"Authorization": f"Bearer {_key}"},
+                headers={"Authorization": f"Bearer {_key}", "User-Agent": "Mozilla/5.0"},
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = _json.loads(resp.read())

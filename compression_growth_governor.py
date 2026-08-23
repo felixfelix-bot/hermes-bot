@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -173,19 +174,21 @@ def measure_growth_rate(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> f
     cutoff = time.time() - hours * 3600
     try:
         conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            """
-            SELECT session_id, prompt_tokens, ts
-            FROM api_calls
-            WHERE ts >= ? AND status_code = 200
-              AND session_id IS NOT NULL
-              AND task_type IS NULL
-              AND prompt_tokens IS NOT NULL
-            ORDER BY session_id, ts
-            """,
-            (cutoff,),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                """
+                SELECT session_id, prompt_tokens, ts
+                FROM api_calls
+                WHERE ts >= ? AND status_code = 200
+                  AND session_id IS NOT NULL
+                  AND task_type IS NULL
+                  AND prompt_tokens IS NOT NULL
+                ORDER BY session_id, ts
+                """,
+                (cutoff,),
+            ).fetchall()
+        finally:
+            conn.close()
     except Exception:
         return G_BASELINE
 
@@ -266,7 +269,7 @@ def _write_audit(
     try:
         AUDIT_FILE.write_text(json.dumps(audit, indent=2))
     except Exception as e:
-        print(f"[growth-governor] audit write failed: {e}")
+        print(f"[growth-governor] audit write failed: {e}", file=sys.stderr)
 
 
 def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bool:
@@ -298,10 +301,10 @@ def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bo
         if result.returncode == 0:
             _write_audit(new_threshold, current_threshold, context_length, True)
             return True
-        print(f"[growth-governor] hermes config set failed: {result.stderr}")
+        print(f"[growth-governor] hermes config set failed: {result.stderr}", file=sys.stderr)
         return False
     except Exception as e:
-        print(f"[growth-governor] config set exception: {e}")
+        print(f"[growth-governor] config set exception: {e}", file=sys.stderr)
         return False
 
 
@@ -353,7 +356,7 @@ def main():
     try:
         save_state(state)
     except Exception as e:
-        print(f"[growth-governor] save_state failed: {e}")
+        print(f"[growth-governor] save_state failed: {e}", file=sys.stderr)
 
     # Print JSON summary (consumed by cron / health scripts)
     summary = {

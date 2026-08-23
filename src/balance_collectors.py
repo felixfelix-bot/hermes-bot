@@ -172,6 +172,18 @@ __all__ = [
     "TELNYX_DEFAULT_STARTING_BALANCE",
     "TELNYX_KEY_ENV",
     "TELNYX_STARTING_ENV",
+    # ── NeuralWatt ──
+    "NeuralWattBalance",
+    "collect_neuralwatt_balance",
+    "store_neuralwatt_balance",
+    "get_latest_neuralwatt_balance",
+    "collect_and_store_neuralwatt",
+    "neuralwatt_quota_entry",
+    "NEURALWATT_DEFAULT_STARTING_BALANCE",
+    "NEURALWATT_DEFAULT_DAILY_CAP",
+    "NEURALWATT_STARTING_ENV",
+    "NEURALWATT_DAILY_CAP_ENV",
+    "default_usage_db_path",
     # ── CLI ──
     "main",
 ]
@@ -187,6 +199,20 @@ def default_db_path() -> str:
     """Resolve the usage DB: ``API_BURN_DB`` env → ``~/.hermes/bot/api_burn.db``."""
     return os.environ.get("API_BURN_DB") or os.path.expanduser(
         "~/.hermes/bot/api_burn.db"
+    )
+
+
+def default_usage_db_path() -> str:
+    """Resolve the request-logging DB: ``ZAI_USAGE_DB`` env → ``~/.hermes/bot/zai_usage.db``.
+
+    zai_proxy.py writes every AI request to ``api_calls`` in zai_usage.db.
+    The NeuralWatt collector (which has no balance API) reads cumulative
+    spend from that table here. Kept separate from :func:`default_db_path`
+    (api_burn.db, which holds provider_balances snapshots) because they are
+    genuinely two different files in the proxy.
+    """
+    return os.environ.get("ZAI_USAGE_DB") or os.path.expanduser(
+        "~/.hermes/bot/zai_usage.db"
     )
 
 
@@ -1507,6 +1533,431 @@ def telnyx_quota_entry(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# NEURALWATT COLLECTOR (self-tracking — no balance API)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# NeuralWatt does NOT expose any billing/balance API endpoint. Every
+# documented path — /v1/credits, /v1/balance, /v1/billing, /v1/account,
+# /v1/me, /v1/user, /v1/usage, /user/balance, /dashboard/billing/usage —
+# returns 404. Even /v1/models redirects to a marketing site, not an API.
+#
+# So we self-track spend from the local ``api_calls`` table in zai_usage.db
+# (where zai_proxy logs every AI request). The proxy writes there on every
+# request; we sum it up and subtract from a starting balance:
+#
+#   1) SELECT SUM(cost_usd) FROM api_calls WHERE tier='neuralwatt'
+#      (executed against zai_usage.db — NOT api_burn.db)
+#   2) remaining_usd          = NEURALWATT_STARTING_BALANCE - total_spent_usd
+#   3) usage_fraction         = clamp(total_spent_usd / starting, 0, 1)
+#   4) daily_spent_usd        = SUM(cost_usd) WHERE tier='neuralwatt'
+#                               AND date(datetime(ts,'unixepoch'))=date('now')
+#   5) is_daily_cap_exceeded = daily_spent_usd > NEURALWATT_DAILY_CAP
+#   6) INSERT row into provider_balances (in api_burn.db) provider='neuralwatt'
+#
+# Mirrors the Telnyx self-tracking pattern (also no balance API) but with two
+# improvements learned from it:
+#   * Reads spend from a SEPARATE db (zai_usage.db, NOT api_burn.db) so the
+#     query hits the real per-request spend table rather than an empty copy.
+#   * Adds a daily-cap guardrail so runaway burn (the $258-in-one-day
+#     incident that motivated this collector) gets surfaced to the router
+#     within minutes instead of after burning the entire monthly budget.
+
+NEURALWATT_DEFAULT_STARTING_BALANCE = 100.0   # USD — $100/mo per-token plan
+NEURALWATT_STARTING_ENV = "NEURALWATT_STARTING_BALANCE"
+NEURALWATT_DEFAULT_DAILY_CAP = 10.0           # USD/day — runaway-burn guardrail
+NEURALWATT_DAILY_CAP_ENV = "NEURALWATT_DAILY_CAP"
+
+
+def _resolve_neuralwatt_starting(explicit: Optional[float]) -> float:
+    """Resolve starting balance: explicit arg → NEURALWATT_STARTING_BALANCE env → 100."""
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get(NEURALWATT_STARTING_ENV)
+    if raw is None or raw.strip() == "":
+        return NEURALWATT_DEFAULT_STARTING_BALANCE
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return NEURALWATT_DEFAULT_STARTING_BALANCE
+
+
+def _resolve_neuralwatt_daily_cap(explicit: Optional[float]) -> float:
+    """Resolve daily cap: explicit arg → NEURALWATT_DAILY_CAP env → 10."""
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get(NEURALWATT_DAILY_CAP_ENV)
+    if raw is None or raw.strip() == "":
+        return NEURALWATT_DEFAULT_DAILY_CAP
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return NEURALWATT_DEFAULT_DAILY_CAP
+
+
+@dataclass
+class NeuralWattBalance:
+    """Self-tracked NeuralWatt spend, remaining balance, and daily-cap status.
+
+    total_spent_usd  SUM(cost_usd) FROM api_calls WHERE tier='neuralwatt'
+                     (lifetime; None if DB query failed)
+    starting_usd     funded budget from env or default ($100)
+    remaining_usd    starting - total_spent_usd (may go negative on overrun)
+    usage_fraction   clamp(spent / starting, 0, 1); 0.0 on zero starting
+    is_exhausted     True when remaining_usd <= 0
+    daily_spent_usd  spend since UTC midnight today (None if query failed)
+    daily_cap_usd    configured daily cap (NEURALWATT_DAILY_CAP env, default 10)
+    is_daily_cap_exceeded   True when daily_spent_usd > daily_cap_usd
+    collected_at     time.time() when collected
+    error            short human string on failure, None on success
+    """
+
+    total_spent_usd: Optional[float] = None
+    starting_usd: float = NEURALWATT_DEFAULT_STARTING_BALANCE
+    remaining_usd: Optional[float] = None
+    usage_fraction: float = 0.0
+    is_exhausted: bool = False
+    daily_spent_usd: Optional[float] = None
+    daily_cap_usd: float = NEURALWATT_DEFAULT_DAILY_CAP
+    is_daily_cap_exceeded: bool = False
+    collected_at: float = field(default_factory=time.time)
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """True when spend was retrieved successfully."""
+        return self.error is None and self.total_spent_usd is not None
+
+    @property
+    def used_pct(self) -> float:
+        """Usage as 0–100 % — what live_router reads as ``quota_entry['used_pct']``."""
+        return self.usage_fraction * 100.0
+
+
+# ── NeuralWatt pure helpers ──────────────────────────────────────────────────
+
+def _neuralwatt_usage_fraction(spent: Optional[float], starting: float) -> float:
+    """Derive a [0,1] usage fraction.
+
+    * starting <= 0 (misconfig) → 0.0 (cold-start path handles conservatism)
+    * spent unknown → 0.0
+    * spent <= 0 → 0.0 (no real usage or refunds; defensive clamp)
+    * else spent / starting, clamped to [0, 1]
+    """
+    if starting <= 0.0:
+        return 0.0
+    if spent is None:
+        return 0.0
+    if spent <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, spent / starting))
+
+
+def _query_neuralwatt_spend(
+    db_path: str,
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """Query SUM(cost_usd) lifetime + today-only from api_calls WHERE tier='neuralwatt'.
+
+    Returns ``(total_spent_usd, daily_spent_usd, error_str)``. Never raises —
+    on any DB error returns ``(None, None, "<error>")``. The daily figure
+    covers spend since UTC midnight (``date(datetime(ts,'unixepoch')) ==
+    date('now')``), matching the calendar-day semantics of the PPQ daily cap.
+    """
+    try:
+        conn = _connect_db(db_path)
+        try:
+            # Defensive: ensure api_calls exists. CREATE TABLE IF NOT EXISTS is a
+            # no-op when the production schema (which has many more columns)
+            # already exists, so it's safe on the live zai_usage.db.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    key_name TEXT,
+                    cost_usd REAL,
+                    tier TEXT
+                )"""
+            )
+            total_row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                "WHERE tier = 'neuralwatt'"
+            ).fetchone()
+            daily_row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_calls "
+                "WHERE tier = 'neuralwatt' "
+                "AND date(datetime(ts, 'unixepoch')) = date('now')"
+            ).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        return None, None, "db error: %s" % exc
+    except Exception as exc:
+        return None, None, "unexpected error: %s" % exc
+
+    total = _as_float(total_row[0]) if total_row and total_row[0] is not None else 0.0
+    daily = _as_float(daily_row[0]) if daily_row and daily_row[0] is not None else 0.0
+    if total is None:
+        return None, None, "SUM(cost_usd) returned non-numeric total"
+    if daily is None:
+        daily = 0.0
+    return round(total, 6), round(daily, 6), None
+
+
+# ── NeuralWatt public collector ─────────────────────────────────────────────
+
+def collect_neuralwatt_balance(
+    starting: Optional[float] = None,
+    *,
+    daily_cap: Optional[float] = None,
+    usage_db_path: Optional[str] = None,
+    balances_db_path: Optional[str] = None,
+) -> NeuralWattBalance:
+    """Self-track NeuralWatt spend from the local api_calls table (zai_usage.db).
+
+    NeuralWatt has NO balance API — every documented endpoint returns 404.
+    This collector queries the same ``api_calls`` table that zai_proxy writes
+    to on every request, then derives the remaining balance arithmetically.
+
+    Parameters
+    ----------
+    starting
+        Funded budget in USD. If None, resolves from
+        ``NEURALWATT_STARTING_BALANCE`` env (default $100). Felix paid $100/mo
+        for the per-token plan.
+    daily_cap
+        Daily spend cap in USD. If None, resolves from
+        ``NEURALWATT_DAILY_CAP`` env (default $10/day). When today's spend
+        exceeds this, ``is_daily_cap_exceeded`` becomes True — the routing
+        layer should remove NeuralWatt from rotation until UTC midnight.
+    usage_db_path
+        Path to zai_usage.db (where api_calls lives). Defaults to
+        :func:`default_usage_db_path`.
+    balances_db_path
+        Accepted for symmetry / futureproofing callers that resolve both DBs
+        together. The collector itself only READS spend from the usage DB;
+        storage happens in :func:`store_neuralwatt_balance`.
+
+    Returns
+    -------
+    NeuralWattBalance
+        Spend, remaining, daily spend, and cap status. On any failure the
+        ``error`` field names the problem and numeric fields are None. Never
+        raises.
+    """
+    result = NeuralWattBalance()
+    result.starting_usd = _resolve_neuralwatt_starting(starting)
+    result.daily_cap_usd = _resolve_neuralwatt_daily_cap(daily_cap)
+    db = usage_db_path or default_usage_db_path()
+
+    total, daily, err = _query_neuralwatt_spend(db)
+    if err is not None or total is None:
+        result.error = err or "unknown error"
+        result.usage_fraction = 0.0
+        result.is_exhausted = False
+        result.is_daily_cap_exceeded = False
+        result.collected_at = time.time()
+        return result
+
+    result.total_spent_usd = total
+    result.daily_spent_usd = daily if daily is not None else 0.0
+    result.remaining_usd = round(result.starting_usd - total, 6)
+    result.usage_fraction = _neuralwatt_usage_fraction(total, result.starting_usd)
+    result.is_exhausted = (result.remaining_usd is not None
+                           and result.remaining_usd <= 0.0)
+    result.is_daily_cap_exceeded = (
+        result.daily_cap_usd > 0.0
+        and result.daily_spent_usd is not None
+        and result.daily_spent_usd > result.daily_cap_usd
+    )
+    result.collected_at = time.time()
+    return result
+
+
+# ── NeuralWatt persistence ──────────────────────────────────────────────────
+
+def store_neuralwatt_balance(
+    db_path: str, balance: Optional[NeuralWattBalance]
+) -> bool:
+    """Append one NeuralWatt snapshot to the shared provider_balances table.
+
+    Maps to shared schema:
+    usage = total_spent_usd, limit_credits = starting_usd,
+    limit_remaining = remaining_usd, is_unlimited = 0 (always finite).
+    Daily-cap info is preserved in ``raw_json`` so :func:`get_latest_neuralwatt_balance`
+    can recover ``daily_spent_usd`` / ``daily_cap_usd`` / ``is_daily_cap_exceeded``.
+
+    True on success. False (never raises) on DB error, None balance, or a
+    failed balance (``error`` set) — the latter is important: we never persist
+    a snapshot we know was broken.
+    """
+    if balance is None or not balance.ok:
+        return False
+    try:
+        conn = _connect_db(db_path)
+        try:
+            _ensure_table(conn)
+            conn.execute(
+                f"""
+                INSERT INTO {PROVIDER_BALANCES_TABLE}
+                    (provider, collected_at, usage, limit_credits,
+                     limit_remaining, usage_fraction, is_unlimited,
+                     is_free_tier, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "neuralwatt",
+                    balance.collected_at,
+                    balance.total_spent_usd,
+                    float(balance.starting_usd),
+                    balance.remaining_usd,
+                    float(balance.usage_fraction),
+                    0,  # NeuralWatt is always finite (paid monthly plan)
+                    None,
+                    json.dumps({
+                        "total_spent_usd": balance.total_spent_usd,
+                        "starting": balance.starting_usd,
+                        "remaining_usd": balance.remaining_usd,
+                        "daily_spent_usd": balance.daily_spent_usd,
+                        "daily_cap_usd": balance.daily_cap_usd,
+                        "is_daily_cap_exceeded": balance.is_daily_cap_exceeded,
+                        "method": "self-tracking",
+                    }, default=str),
+                ),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return False
+
+
+def get_latest_neuralwatt_balance(db_path: str) -> Optional[NeuralWattBalance]:
+    """Most recent stored NeuralWatt balance, or None (never raises) if none.
+
+    Starting balance is recovered from the stored limit_credits column;
+    daily-cap fields (daily_spent_usd / daily_cap_usd / is_daily_cap_exceeded)
+    come from the raw_json payload written by :func:`store_neuralwatt_balance`.
+    When raw_json lacks a field (older rows), the daily cap is recomputed from
+    env, and ``daily_spent_usd`` is left None.
+    """
+    try:
+        conn = _connect_db(db_path)
+        try:
+            _ensure_table(conn)
+            row = conn.execute(
+                f"""
+                SELECT usage, limit_credits, limit_remaining, usage_fraction,
+                       is_unlimited, collected_at, raw_json
+                FROM {PROVIDER_BALANCES_TABLE}
+                WHERE provider = 'neuralwatt'
+                ORDER BY collected_at DESC LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+    if not row:
+        return None
+    (usage, limit_credits, limit_remaining, usage_fraction,
+     is_unlimited, collected_at, raw_json) = row
+    starting_f = (float(limit_credits) if limit_credits is not None
+                  else NEURALWATT_DEFAULT_STARTING_BALANCE)
+    try:
+        raw = json.loads(raw_json) if isinstance(raw_json, str) else {}
+    except (ValueError, TypeError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return NeuralWattBalance(
+        total_spent_usd=usage,
+        starting_usd=starting_f,
+        remaining_usd=limit_remaining,
+        usage_fraction=float(usage_fraction) if usage_fraction is not None else 0.0,
+        is_exhausted=(limit_remaining is not None and limit_remaining <= 0.0),
+        daily_spent_usd=raw.get("daily_spent_usd"),
+        daily_cap_usd=raw.get("daily_cap_usd",
+                              _resolve_neuralwatt_daily_cap(None)),
+        is_daily_cap_exceeded=bool(raw.get("is_daily_cap_exceeded", False)),
+        collected_at=float(collected_at) if collected_at is not None else time.time(),
+        error=None,
+    )
+
+
+def collect_and_store_neuralwatt(
+    usage_db_path: Optional[str] = None,
+    balances_db_path: Optional[str] = None,
+    starting: Optional[float] = None,
+    daily_cap: Optional[float] = None,
+) -> Optional[NeuralWattBalance]:
+    """Cron-friendly: collect once, persist, return balance (None on failure).
+
+    Never raises.
+    """
+    bdb = balances_db_path or default_db_path()
+    balance = collect_neuralwatt_balance(
+        starting=starting,
+        daily_cap=daily_cap,
+        usage_db_path=usage_db_path,
+        balances_db_path=bdb,
+    )
+    if balance.ok:
+        store_neuralwatt_balance(bdb, balance)
+        return balance
+    return None
+
+
+# ── NeuralWatt bridge to quota_state['neuralwatt'] ───────────────────────────
+
+_NEURALWATT_BALANCE_MAX_AGE = 1200.0  # 20 min — 2× the 5-min cadence (slack)
+
+
+def neuralwatt_quota_entry(
+    db_path: Optional[str] = None,
+    *,
+    max_age: Optional[float] = _NEURALWATT_BALANCE_MAX_AGE,
+) -> dict:
+    """Build the ``quota_state['neuralwatt']`` entry from the latest stored row.
+
+    The bridge from the collector (``provider_balances`` table in api_burn.db)
+    to the ``quota_state['neuralwatt']`` dict that the proxy's
+    ``_snapshot_quota`` reads. Mirrors ``telnyx_quota_entry`` /
+    ``ppq_quota_entry``.
+
+    Cold-start contract (matches the proxy's current hardcoded fallback):
+      * no stored row, OR the row is older than ``max_age`` (default 20 min,
+        2× the 5-min cadence) → return ``{}`` (no ``used_pct`` key). The proxy
+        then falls back to ``{used_pct:0.0, remaining:inf}`` (current
+        behavior).
+      * fresh row → ``{'used_pct','remaining','total','starting',
+        'is_exhausted','is_daily_cap_exceeded','daily_spent_usd',
+        'daily_cap_usd','collected_at'}`` with ``used_pct`` in 0–100.
+
+    Pass ``max_age=None`` to use the newest row regardless of age. Never
+    raises — any DB/parse error yields the cold-start ``{}`` entry.
+    """
+    db_path = db_path or default_db_path()
+    bal = get_latest_neuralwatt_balance(db_path)
+    if bal is None:
+        return {}
+    if max_age is not None and (time.time() - bal.collected_at) > max_age:
+        return {}
+    return {
+        "used_pct": float(bal.used_pct),
+        "remaining": float(bal.remaining_usd) if bal.remaining_usd is not None else 0.0,
+        "total": float(bal.starting_usd),
+        "starting": float(bal.starting_usd),
+        "is_exhausted": bool(bal.is_exhausted),
+        "is_daily_cap_exceeded": bool(bal.is_daily_cap_exceeded),
+        "daily_spent_usd": (float(bal.daily_spent_usd)
+                            if bal.daily_spent_usd is not None else 0.0),
+        "daily_cap_usd": float(bal.daily_cap_usd),
+        "collected_at": float(bal.collected_at),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # CLI DISPATCHER
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1865,6 +2316,51 @@ def _routstr_main(argv: list[str]) -> int:
     return 0
 
 
+def _neuralwatt_main(argv: list[str]) -> int:
+    """NeuralWatt cron entrypoint: self-track once, print JSON, exit 0/1.
+
+    Reads from zai_usage.db (``--usage-db`` or default) and writes a
+    provider_balances row into api_burn.db (``--db`` or default). Prints one
+    JSON status line so the cron wrapper can grep ``"ok": true``.
+    """
+    db_override = None
+    if "--db" in argv:
+        db_override = argv[argv.index("--db") + 1]
+    usage_override = None
+    if "--usage-db" in argv:
+        usage_override = argv[argv.index("--usage-db") + 1]
+    usage_db = usage_override or default_usage_db_path()
+    balances_db = db_override or default_db_path()
+    balance = collect_and_store_neuralwatt(
+        usage_db_path=usage_db,
+        balances_db_path=balances_db,
+    )
+    if balance is None:
+        starting_env = os.environ.get(NEURALWATT_STARTING_ENV, "").strip()
+        reason = ("NEURALWATT_STARTING_BALANCE not set"
+                  if not starting_env
+                  else "self-tracking query failed (see logs)")
+        print(json.dumps({"provider": "neuralwatt", "ok": False, "error": reason}))
+        return 1
+    print(json.dumps({
+        "provider": "neuralwatt",
+        "ok": True,
+        "total_spent_usd": balance.total_spent_usd,
+        "starting": balance.starting_usd,
+        "remaining_usd": balance.remaining_usd,
+        "usage_fraction": balance.usage_fraction,
+        "used_pct": balance.used_pct,
+        "is_exhausted": balance.is_exhausted,
+        "daily_spent_usd": balance.daily_spent_usd,
+        "daily_cap_usd": balance.daily_cap_usd,
+        "is_daily_cap_exceeded": balance.is_daily_cap_exceeded,
+        "collected_at": balance.collected_at,
+        "usage_db_path": usage_db,
+        "balances_db_path": balances_db,
+    }, default=str))
+    return 0
+
+
 def main(argv: Optional[list] = None) -> int:
     """Unified cron entrypoint.
 
@@ -1889,11 +2385,13 @@ def main(argv: Optional[list] = None) -> int:
         return _telnyx_main(argv)
     elif provider == "routstr":
         return _routstr_main(argv)
+    elif provider == "neuralwatt":
+        return _neuralwatt_main(argv)
     else:
         print(json.dumps({
             "ok": False,
             "error": f"unknown or missing --provider (got {provider!r}); "
-                     f"use --provider ppq|openrouter|deepinfra|telnyx|routstr",
+                     f"use --provider ppq|openrouter|deepinfra|telnyx|routstr|neuralwatt",
         }))
         return 1
 

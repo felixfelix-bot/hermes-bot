@@ -30,12 +30,13 @@ Usage (from the production proxy's failover path)::
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
-import math
 import sqlite3
 import threading
 import time
+import logging
 from typing import Any
 
 # ── Path bootstrap (same as shadow_hook) ────────────────────────────────────
@@ -89,6 +90,8 @@ from src.real_price_tracker import (
 )
 
 __all__ = ["LiveRouter"]
+
+logger = logging.getLogger(__name__)
 
 # ── Kill switch (EU-R3): extra-usage pricing is disabled by default ──────────
 # Until shadow mode validates the extra-usage multiplier, the multiplier is
@@ -1012,7 +1015,8 @@ class LiveRouter:
                     quota_state, health_state, peak,
                     failure_counts, pace_windows, task_type, model,
                 )
-        except Exception:
+        except Exception as e:
+            logger.warning("select_failover failed: %s: %s", type(e).__name__, e, exc_info=True)
             return ((None, None), (None, None))
 
     def select_primary(
@@ -1057,7 +1061,8 @@ class LiveRouter:
                 if pick:
                     return (pick, pick_model)
                 return (None, None)
-        except Exception:
+        except Exception as e:
+            logger.warning("select_primary failed: %s: %s", type(e).__name__, e, exc_info=True)
             return (None, None)
 
     def record_request(
@@ -1340,16 +1345,18 @@ class LiveRouter:
 
             # Determine model tier and peak config
             if name in ("ours", "friend"):
-                # Tier "medium" — z.ai competes on price with ollama_cloud
+                # Tier "standard" — z.ai competes on price with ollama_cloud
                 # and paid externals rather than being structurally preferred.
                 # When z.ai quota pressure inflates its effective price past
                 # a paid alternative (e.g. NeuralWatt $0.21/M), the optimizer
                 # can switch without waiting for full exhaustion.
-                tier = "medium"
+                # NOTE: "standard" not "medium" — "medium" is a difficulty
+                # name, not a tier name. TIER_RANK accepts: low, standard, high.
+                tier = "standard"
                 prov_model = "glm-5.2"
                 prov_peak = _ZAI_PEAK
                 prov_peak_mult = 3.0
-            elif name == "ollama_cloud":
+            elif name in ("ollama_cloud", "ollama_cloud_2"):
                 # ── RP-PRICING: When continuous pressure is ON, keep ollama at
                 # "high" tier — rerouting is driven by PRICE (the pressure
                 # factor), not by tier lowering. The optimizer reroutes GLM-5.2

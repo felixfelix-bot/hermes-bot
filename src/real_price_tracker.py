@@ -199,7 +199,7 @@ LAST_RESORT_RATES: dict[str, float] = {
     "ollama_cloud_extra": 0.15,     # above-quota rate (above PPQ $0.14/M so optimizer reroutes)
     "ollama_cloud_2":     0.0155,   # second subscription, same economics as #1
     "opencode_go":        0.0155,   # $10/mo flat-rate → marginal $0, floored
-    "neuralwatt":         0.21,     # deepseek-v4-flash blended: (0.14+0.28)/2 ≈ 0.21
+    "neuralwatt":         2.21,     # glm-5.2 blended (primary model, 77% of traffic) — conservative seed
     "ppq":                0.14,     # known list price
     "openrouter":         0.135,    # known list price
     "deepinfra":          1.30,     # known list price
@@ -214,6 +214,13 @@ LAST_RESORT_RATES: dict[str, float] = {
 LAST_RESORT_RATES_PER_MODEL: dict[str, dict[str, float]] = {
     "telnyx": {
         "glm-5.3": 13.50,   # z.ai GLM-5.3 — premium tier (same subscription)
+    },
+    "neuralwatt": {
+        "glm-5.2":               2.2125,   # (1.45*3 + 4.50*1) / 4 — 3:1 input:output blend
+        "kimi-k3":               2.2125,   # same tier as glm-5.2
+        "deepseek-v4-flash":     0.175,    # (0.14*3 + 0.28*1) / 4
+        "deepseek-v4-pro":       1.875,    # (1.00*3 + 3.00*1) / 4
+        "gemma-4-31b":            0.21,     # (0.14*3 + 0.42*1) / 4
     },
 }
 
@@ -249,7 +256,7 @@ SEED_RATES: dict[str, float] = {
     "ollama_cloud": 0.0155,   # measured blended rate (pre-RP-3)
     "ollama_cloud_2": 0.0155, # second subscription, same economics
     "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
-    "neuralwatt":   0.21,     # deepseek-v4-flash blended
+    "neuralwatt":   2.21,     # glm-5.2 blended (primary model, conservative seed)
     "ppq":          0.14,     # list price
     "openrouter":   0.135,    # list price
     "deepinfra":    1.30,     # all-time measured average (real)

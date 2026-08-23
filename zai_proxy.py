@@ -343,30 +343,38 @@ except Exception as _rqe:
     print(f"[routstr] balance bridge DISABLED — {_rqe}", flush=True)
     _routstr_quota_entry_fn = None
 
-# ── NeuralWatt credit-balance bridge (NW-BALANCE) ───────────────────────────
+# ── NeuralWatt credit-balance bridge (NW-API) ───────────────────────────────
 # quota_state['neuralwatt'] was hardcoded {used_pct:0.0, remaining:inf} —
 # spend tracking was invisible to the pricing engine. The $258-in-one-day
 # incident burned ~3,300 glm-5.2 calls through neuralwatt with no guardrail
 # in place because the proxy literally saw "infinity remaining".
 #
-# NeuralWatt has NO balance API. The bridge imports
-# `neuralwatt_quota_entry` from src.balance_collectors, which self-tracks
-# spend by summing cost_usd from api_calls WHERE tier='neuralwatt' in
-# zai_usage.db (where zai_proxy writes every request), subtracts from
-# NEURALWATT_STARTING_BALANCE (default $100), and exposes a daily-cap
-# guardrail (NEURALWATT_DAILY_CAP, default $10/day).
+# 2026-08-23: Felix found NeuralWatt's REAL billing API:
+#   * GET /v1/quota           → balance, subscription, kWh allowance
+#   * GET /v1/usage/summary   → daily cost time_series (period → today → total)
 #
-# When daily spend exceeds the cap, the entry surfaces is_daily_cap_exceeded=True
-# and we mark the key unhealthy so the router drops neuralwatt from rotation
-# until UTC midnight (when daily_spend resets). Revert-safe: any failure → the
-# old optimistic {used_pct:0.0, remaining:inf} so routing never breaks.
+# NeuralWatt uses ENERGY-based pricing (kWh, not per-token). The Pro plan
+# ($100/mo) includes 13.33 kWh/month. 94% of prompt tokens are cached at a
+# 5× discount, so our per-token cost estimate OVERCOUNTS by ~5.7×. The bridge
+# imports `neuralwatt_quota_entry` from src.balance_collectors — which calls
+# /v1/quota for real kWh remaining and /v1/usage/summary for today's real USD
+# spend — exposes a NEURALWATT_DAILY_CAP guardrail (default $10/day), and a
+# `get_neuralwatt_cost_correction_factor()` helper used by
+# `_estimate_cost_usd()` to scale our over-estimated per-token cost down to
+# the real spend ratio.
+#
+# When daily spend exceeds the cap (real number from the API), the entry
+# surfaces is_daily_cap_exceeded=True and we mark the key unhealthy so the
+# router drops neuralwatt from rotation until UTC midnight. Revert-safe: any
+# failure → the old optimistic {used_pct:0.0, remaining:inf} so routing
+# never breaks.
 # REVERT: delete this block + restore the one-line hardcode
 # `snap["neuralwatt"] = {"used_pct": 0.0, "remaining": float("inf")}` in
 # _snapshot_quota(), and `h["neuralwatt"] = True` in _snapshot_health().
 _neuralwatt_quota_entry_fn = None
 try:
     from src.balance_collectors import neuralwatt_quota_entry as _neuralwatt_quota_entry_fn
-    print("[neuralwatt] balance bridge loaded — quota_state['neuralwatt'] reads self-tracked spend",
+    print("[neuralwatt] balance bridge loaded — quota_state['neuralwatt'] reads real /v1/quota API",
           flush=True)
 except Exception as _nwe:
     print(f"[neuralwatt] balance bridge DISABLED — {_nwe}", flush=True)
@@ -374,6 +382,20 @@ except Exception as _nwe:
 
 # Optional: mirror key_health gate so the daily-cap call can flag exhaustion.
 _NEURALWATT_DAILY_CAP_DEFAULT = 10.0  # USD/day — synced with balance_collectors
+
+# Cost-correction factor (cached) — applied in _estimate_cost_usd() so the
+# per-token cost estimate is brought in-line with the real NeuralWatt bill.
+# Computed as real_api_total / db_sum_cost_usd, refreshed every 10 minutes.
+_neuralwatt_cost_correction_fn = None
+try:
+    from src.balance_collectors import (
+        get_neuralwatt_cost_correction_factor as _neuralwatt_cost_correction_fn,
+    )
+    print("[neuralwatt] cost-correction bridge loaded — _estimate_cost_usd will scale to real API spend",
+          flush=True)
+except Exception as _nce:
+    print(f"[neuralwatt] cost-correction bridge DISABLED — {_nce}", flush=True)
+    _neuralwatt_cost_correction_fn = None
 
 # ── Pressure FSM bridge (S2b two-layer pressure routing, t_4dfaf0d5) ────────
 # Layer-2 request-time half of DESIGN-two-layer-pressure-routing.md:
@@ -1311,20 +1333,22 @@ def _routstr_quota_snapshot() -> dict:
 
 
 def _neuralwatt_quota_snapshot() -> dict:
-    """quota_state['neuralwatt'] from the self-tracked balance (NW-BALANCE).
+    """quota_state['neuralwatt'] from the real /v1/quota API (NW-API).
 
     Mirrors _ppq_quota_snapshot / _routstr_quota_snapshot: delegates to the
     extracted ``neuralwatt_quota_entry`` (reads the newest 'neuralwatt' row
     from provider_balances in api_burn.db, written by the
     balance_collectors --provider neuralwatt cron).
 
-    The collector itself queries zai_usage.db:api_calls WHERE tier='neuralwatt'
-    for cumulative + today's spend, subtracts from NEURALWATT_STARTING_BALANCE
-    (default $100), and surfaces a NEURALWATT_DAILY_CAP guardrail (default
-    $10/day). When ``is_daily_cap_exceeded`` is True on the returned entry,
-    we bump ``used_pct`` to 100.0 so the routing layer treats neuralwatt as
-    exhausted for the rest of the UTC calendar day (capped spend resets at
-    midnight). is_exhausted (cumulative running out) is preserved as-is.
+    The collector itself calls GET https://api.neuralwatt.com/v1/quota for the
+    real kWh allowance (kwh_used / kwh_included) and GET
+    https://api.neuralwatt.com/v1/usage/summary for today's real USD spend
+    via /v1/usage/summary.time_series[today].cost_usd. The shared daily-cap
+    guardrail is NEURALWATT_DAILY_CAP (default $10/day). When
+    ``is_daily_cap_exceeded`` is True on the returned entry, we bump
+    ``used_pct`` to 100.0 so the routing layer treats neuralwatt as
+    exhausted for the rest of the UTC calendar day. is_exhausted
+    (kwh_remaining <= 0 or in_overage) is preserved as-is.
 
     Cold-start contract (matches the proxy's current hardcoded fallback):
       * bridge import disabled, OR no fresh row →
@@ -1332,7 +1356,8 @@ def _neuralwatt_quota_snapshot() -> dict:
       * fresh row → forwards the collector's dict, but if the daily cap is
         exceeded we override used_pct=100 so routing drops neuralwatt today.
 
-    Never raises.
+    Revert-safe: on any failure returns the cold-start fallback dict so
+    routing never breaks. Never raises.
     """
     if _neuralwatt_quota_entry_fn is None:
         return {"used_pct": 0.0, "remaining": float("inf")}
@@ -1396,7 +1421,7 @@ def _snapshot_quota() -> dict:
             "total": float("inf"),
             "regime": "included",
         }
-        # NW-BALANCE: real self-tracked spend from zai_usage.db via the
+        # NW-API: real /v1/quota (energy allowance + lifetime cost) via the
         # neuralwatt_quota_entry bridge. Falls back to "{used_pct:0.0,
         # remaining:inf}" when the bridge is disabled / no fresh row (current
         # pre-bridge behavior) so routing never breaks.
@@ -1419,12 +1444,14 @@ def _snapshot_health() -> dict:
         h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
         h["ollama_cloud_2"] = _is_key_healthy("ollama_cloud_2")
         h["opencode_go"] = _is_key_healthy("opencode_go")
-        # NW-BALANCE: neuralwatt is per-token (no 401/403 health gating), so
-        # baseline is healthy. The only thing that flips it unhealthy is the
-        # daily-spend cap from neuralwatt_quota_entry — when today's spend
-        # exceeds NEURALWATT_DAILY_CAP (default $10/day) we mark the key
-        # unhealthy so the router drops neuralwatt until UTC midnight. This
-        # is the runaway-burn guardrail (prevents another $258-in-one-day).
+        # NW-API: daily-cap guardrail (real /v1/usage/summary).
+        # When today's REAL spend from /v1/usage/summary exceeds
+        # NEURALWATT_DAILY_CAP (default $10/day) we mark the key unhealthy
+        # so the router drops neuralwatt until UTC midnight. The previous
+        # guardrail summed cost_usd from zai_usage.db which overcounts by
+        # ~5.7× (NeuralWatt uses ENERGY-based pricing with 94% prompt-cache
+        # hits — $258 in the DB vs $45 in real spend on 2026-08-22-to-23).
+        # The real-API bridge eliminates that overcount entirely.
         if _neuralwatt_quota_entry_fn is not None:
             try:
                 nw_entry = _neuralwatt_quota_entry_fn()
@@ -2774,14 +2801,29 @@ def _estimate_cost_usd(key_name: str | None, total_tokens: int,
     elif key_name == "neuralwatt" and model:
         # Try exact match, then stripped prefix (deepseek/deepseek-v4-flash → deepseek-v4-flash)
         rates = NEURALWATT_RATES.get(model) or NEURALWATT_RATES.get(model.split("/")[-1])
+        # NW-API: NeuralWatt uses ENERGY-based pricing. Our per-token estimate
+        # overcounts by ~5.7× because 94% of prompt tokens are cached at a 5×
+        # discount. Bring the logged cost_usd in line with the real bill by
+        # multiplying by the correction factor from /v1/usage/summary totals
+        # (real_api_total / db_sum_cost_usd, cached 10 min). Defaults to 1.0
+        # (no correction) on any failure / bridge disabled, so we never
+        # under-report.
+        nw_correction = 1.0
+        if _neuralwatt_cost_correction_fn is not None:
+            try:
+                nw_correction = float(_neuralwatt_cost_correction_fn() or 1.0)
+            except Exception:
+                nw_correction = 1.0
         if rates and prompt_tokens is not None and completion_tokens is not None:
-            input_rate = rates.get("input", 0.14)
-            output_rate = rates.get("output", 0.28)
-            return (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
+            return (prompt_tokens * rates.get("input", 0.14)
+                    + completion_tokens * rates.get("output", 0.28)) / 1_000_000 * nw_correction
         elif rates:
-            return _blended_rate(rates["input"], rates["output"]) * total_tokens / 1_000_000
-        # No model match → fall through to flat provider rate
+            return _blended_rate(rates["input"], rates["output"]) * total_tokens / 1_000_000 * nw_correction
+        # No model match → fall through to flat provider rate (also scaled)
         cost_per_1m = _rpt_rate(key_name)
+        if cost_per_1m == float("inf"):
+            return float("inf")
+        return (total_tokens / 1_000_000) * cost_per_1m * nw_correction
     else:
         cost_per_1m = _rpt_rate(key_name)
     if cost_per_1m == float("inf"):

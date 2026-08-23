@@ -46,7 +46,7 @@ MINIMUM_CONTEXT_LENGTH = 64000  # Hard floor in context_compressor
 
 # Safety bounds (MIN_THRESHOLD is dynamic: MINIMUM_CONTEXT_LENGTH / context_length)
 MAX_THRESHOLD = 0.70
-FALLBACK_THRESHOLD = 0.40
+FALLBACK_THRESHOLD = 0.60
 HYSTERESIS = 0.02          # Only change config if delta > this
 
 # Growth-rate bounds
@@ -222,12 +222,14 @@ def measure_growth_rate(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> f
 # Control law
 # ---------------------------------------------------------------------------
 
-def compute_threshold(growth_rate: float, context_length: int) -> float:
+def compute_threshold(growth_rate: float, context_length: int,
+                      current_threshold: float = None) -> float:
     """Compute optimal threshold from growth-rate estimate and context length.
 
-    Control law::
+    Control law (composes with cost governor)::
 
-        threshold = FALLBACK_THRESHOLD + K × (G_BASELINE − g_estimate)
+        base = current_threshold or FALLBACK_THRESHOLD
+        threshold = base + K × (G_BASELINE − g_estimate)
 
     Dense sessions (high *g*) → lower threshold → compact sooner.
     Sparse sessions (low *g*) → raise threshold → preserve context.
@@ -236,8 +238,9 @@ def compute_threshold(growth_rate: float, context_length: int) -> float:
     ``MIN_THRESHOLD = MINIMUM_CONTEXT_LENGTH / context_length``.
     """
     min_threshold = MINIMUM_CONTEXT_LENGTH / context_length
+    base = current_threshold if current_threshold is not None else FALLBACK_THRESHOLD
     delta = K_SENSITIVITY * (G_BASELINE - growth_rate)
-    new_threshold = FALLBACK_THRESHOLD + delta
+    new_threshold = base + delta
     return max(min_threshold, min(MAX_THRESHOLD, new_threshold))
 
 
@@ -330,8 +333,8 @@ def main():
         kf.predict()
         g_estimate = kf.update(measured_g)
 
-    # Compute optimal threshold
-    new_threshold = compute_threshold(g_estimate, context_length)
+    # Compute optimal threshold (compose with cost governor's current value)
+    new_threshold = compute_threshold(g_estimate, context_length, old_threshold)
 
     # Apply with hysteresis (reads config again inside)
     applied = apply_threshold(new_threshold)

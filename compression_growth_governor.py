@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """Context-growth-rate Kalman governor for adaptive compaction threshold.
 
-Tracks the average context growth rate (tokens/call) from zai_usage.db
+Tracks the median context growth rate (tokens/call) from zai_usage.db
 using a 1-D Kalman filter. Adjusts compression.threshold via
-`hermes config set` based on whether sessions are dense (high growth ->
-lower threshold -> compact sooner) or sparse (low growth -> raise threshold
--> preserve context longer).
+``hermes config set`` based on whether sessions are dense (high growth →
+lower threshold → compact sooner) or sparse (low growth → raise threshold
+→ preserve context longer).
 
 Runs AFTER compression_cost_governor.py (chained in same cron slot).
 
-State: ~/.hermes/bot/compression_growth_state.json
-Output: hermes config set compression.threshold <value>
-Audit: ~/.hermes/bot/compression_growth_override.json
+State:  ~/.hermes/bot/compression_growth_state.json
+Output: ``hermes config set compression.threshold <value>``
+Audit:  ~/.hermes/bot/compression_growth_override.json
 
 Fallback: On any failure, leaves config.yaml unchanged.
 
-CONSTANTS CORRECTED for 131072 context length (glm-5.2):
-  - MIN_THRESHOLD = 64000/131072 = 0.4883
-  - MAX_THRESHOLD = 0.70
-  - FALLBACK_THRESHOLD = 0.60
-  - G_BASELINE = 1800
+CRITICAL: context_length is read dynamically from config.yaml — NOT hardcoded.
 """
 from __future__ import annotations
 
@@ -29,67 +25,76 @@ import subprocess
 import time
 from pathlib import Path
 
+import yaml
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 BOT_DIR = Path.home() / ".hermes" / "bot"
 DB_PATH = BOT_DIR / "zai_usage.db"
 STATE_FILE = BOT_DIR / "compression_growth_state.json"
 AUDIT_FILE = BOT_DIR / "compression_growth_override.json"
 CONFIG_PATH = Path.home() / ".hermes" / "profiles" / "manager" / "config.yaml"
 
-# --- Constants ---
-WINDOW_HOURS = 6           # Shorter window — growth rate is more recent signal
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+WINDOW_HOURS = 6           # Shorter window — growth rate is a recent signal
 C0 = 17500                 # Manager fixed prefix (tokens)
+MINIMUM_CONTEXT_LENGTH = 64000  # Hard floor in context_compressor
 
-# CRITICAL: context_length=131072 (NOT 202752 — design doc was wrong)
-CONTEXT_LENGTH = 131072
+# Safety bounds (MIN_THRESHOLD is dynamic: MINIMUM_CONTEXT_LENGTH / context_length)
+MAX_THRESHOLD = 0.70
+FALLBACK_THRESHOLD = 0.40
+HYSTERESIS = 0.02          # Only change config if delta > this
 
-# Safety bounds (corrected for 131K context)
-MIN_THRESHOLD = 64000 / 131072   # = 0.4883 — the MINIMUM_CONTEXT_LENGTH floor
-MAX_THRESHOLD = 0.70             # Don't let context grow past 70% of window
-FALLBACK_THRESHOLD = 0.60        # If anything goes wrong, stay at current baseline
-HYSTERESIS = 0.02                # Only change config if delta > this
-
-# Growth rate bounds
+# Growth-rate bounds
 G_BASELINE = 1800          # Measured average (tokens/call)
 G_MIN = 200                # Floor for growth estimate
 G_MAX = 20000              # Ceiling for growth estimate
 
-# Control law sensitivity — recalculated for 131K context.
-#
-# threshold = base + K * (g_baseline - g_estimate), clamped to [MIN, MAX]
-#
-# Design doc used K=0.00004 for 202752 context. For 131072 the available
-# threshold range is [0.488, 0.70] = 0.212 wide. We want:
-#   - g=10000 (dense):  delta = K * (1800-10000) = K * (-8200) should reach ~MIN
-#   - g=200 (sparse):   delta = K * (1800-200)   = K * (1600)  should reach ~MAX
-#
-# For dense: need K * 8200 >= (0.60 - 0.488) = 0.112 → K >= 0.112/8200 = 0.0000137
-# For sparse: need K * 1600 <= (0.70 - 0.60) = 0.10  → K <= 0.10/1600 = 0.0000625
-#
-# Pick K = 0.00003 (midpoint, gives good spread on both sides):
-#   - g=10000: delta = 0.00003 * (-8200) = -0.246 → clamped at MIN (0.488)
-#   - g=5000:  delta = 0.00003 * (-3200) = -0.096 → threshold = 0.504
-#   - g=1800:  delta = 0 (baseline)
-#   - g=681:   delta = 0.00003 * (1119)  = +0.034  → threshold = 0.634
-#   - g=200:   delta = 0.00003 * (1600)  = +0.048  → threshold = 0.648
-K_SENSITIVITY = 0.00003
+# Control-law sensitivity
+# threshold = FALLBACK_THRESHOLD + K * (G_BASELINE - g_estimate)
+# At g=10000 (dense):  delta = 0.00004 * (-8200) = -0.328 → clamped to MIN_THRESHOLD
+# At g=5000:          delta = 0.00004 * (-3200) = -0.128
+# At g=1800 (normal): delta = 0 (baseline)
+# At g=681 (sparse):  delta = 0.00004 * (1119)  = +0.045
+# At g=200:           delta = 0.00004 * (1600)  = +0.064 → clamped to ≤ MAX
+K_SENSITIVITY = 0.00004
 
+
+# ---------------------------------------------------------------------------
+# GrowthRateKalman
+# ---------------------------------------------------------------------------
 
 class GrowthRateKalman:
-    """1-D Kalman filter on context growth rate (tokens/call)."""
+    """1-D Kalman filter on context growth rate (tokens/call).
+
+    Initial state: x=1800, p=500000.0, q=50000.0, r=300000.0
+    """
 
     def __init__(self, initial_g: float = G_BASELINE):
-        self.x = initial_g        # State estimate
-        self.p = 500000.0         # Estimate uncertainty
-        self.q = 50000.0          # Process noise
-        self.r = 300000.0         # Measurement noise
-        self.n = 0                # Update count
+        self.x = initial_g          # State estimate
+        self.p = 500000.0           # Estimate uncertainty
+        self.q = 50000.0            # Process noise
+        self.r = 300000.0           # Measurement noise
+        self.n = 0                  # Update count
+
+    def predict(self) -> float:
+        """Prediction step (random walk): uncertainty grows by Q.
+
+        State does not change (random walk model has F=1).
+        """
+        self.p = self.p + self.q
+        return self.x
 
     def update(self, measurement: float) -> float:
+        """Correction step: incorporate measurement into state estimate."""
         self.n += 1
         k = self.p / (self.p + self.r)
         self.x = self.x + k * (measurement - self.x)
         self.x = max(G_MIN, min(G_MAX, self.x))  # Clamp to bounds
-        self.p = (1 - k) * self.p + self.q
+        self.p = (1 - k) * self.p
         return self.x
 
     def to_dict(self):
@@ -105,6 +110,31 @@ class GrowthRateKalman:
         return kf
 
 
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def read_config(config_path: Path = CONFIG_PATH) -> tuple[int, float]:
+    """Read context_length and current compression.threshold from config.yaml.
+
+    Returns (context_length, current_threshold).
+    Falls back to (131072, FALLBACK_THRESHOLD) when config is missing
+    or malformed.
+    """
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        context_length = cfg.get("model", {}).get("context_length", 131072)
+        current_threshold = cfg.get("compression", {}).get("threshold", FALLBACK_THRESHOLD)
+        return int(context_length), float(current_threshold)
+    except Exception:
+        return 131072, FALLBACK_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -116,7 +146,7 @@ def load_state() -> dict:
         "last_measurement": 0.0,
         "last_ts": 0,
         "current_threshold": FALLBACK_THRESHOLD,
-        "last_config_threshold": FALLBACK_THRESHOLD,
+        "threshold_history": [],
     }
 
 
@@ -124,22 +154,27 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
+# ---------------------------------------------------------------------------
+# Measurement
+# ---------------------------------------------------------------------------
+
+def measure_growth_rate(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> float:
     """Measure median positive context growth per call in recent sessions.
 
-    Queries the api_calls table in zai_usage.db, computes per-session
-    positive deltas (excluding post-compression resets and compression
-    task_type rows), and returns the median across all sessions.
+    Queries the ``api_calls`` table in *zai_usage.db*, computes per-session
+    positive deltas (excluding post-compression resets and ``task_type``
+    rows), and returns the median across all sessions.
 
-    Falls back to G_BASELINE on any error or insufficient data.
+    Falls back to **G_BASELINE** on any error or insufficient data.
     """
     if not db_path.exists():
-        return G_BASELINE  # Fallback
+        return G_BASELINE
 
     cutoff = time.time() - hours * 3600
     try:
         conn = sqlite3.connect(str(db_path))
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT session_id, prompt_tokens, ts
             FROM api_calls
             WHERE ts >= ? AND status_code = 200
@@ -147,7 +182,9 @@ def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
               AND task_type IS NULL
               AND prompt_tokens IS NOT NULL
             ORDER BY session_id, ts
-        """, (cutoff,)).fetchall()
+            """,
+            (cutoff,),
+        ).fetchall()
         conn.close()
     except Exception:
         return G_BASELINE
@@ -155,125 +192,73 @@ def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
     if len(rows) < 10:
         return G_BASELINE
 
-    # Compute per-session growth, then collect all positive deltas
-    deltas = []
-    current_sid = None
-    prev_tokens = None
+    # Compute per-session positive deltas
+    deltas: list[float] = []
+    current_sid: str | None = None
+    prev_tokens: int | None = None
 
-    try:
-        for sid, pt, ts in rows:
-            if sid != current_sid:
-                current_sid = sid
-                prev_tokens = pt
-                continue
-            if pt is not None and prev_tokens is not None and pt > prev_tokens:
-                deltas.append(pt - prev_tokens)
+    for sid, pt, _ts in rows:
+        if sid != current_sid:
+            current_sid = sid
             prev_tokens = pt
-    except Exception:
-        return G_BASELINE
+            continue
+        if pt is not None and prev_tokens is not None and pt > prev_tokens:
+            deltas.append(float(pt - prev_tokens))
+        prev_tokens = pt
 
     if not deltas:
         return G_BASELINE
 
-    # Use median (robust to outliers — tool outputs can spike 40K+)
+    # Median (robust to outliers — tool outputs can spike 40K+)
     deltas.sort()
     median = deltas[len(deltas) // 2]
     return float(median)
 
 
-def compute_threshold(g_estimate: float, base_threshold: float = FALLBACK_THRESHOLD) -> float:
-    """Compute absolute threshold from growth rate estimate.
+# ---------------------------------------------------------------------------
+# Control law
+# ---------------------------------------------------------------------------
 
-    Control law (absolute, NOT incremental): dense sessions (high g) -> lower
-    threshold -> compact sooner.  Sparse sessions (low g) -> raise threshold
-    -> preserve context longer.
+def compute_threshold(growth_rate: float, context_length: int) -> float:
+    """Compute optimal threshold from growth-rate estimate and context length.
 
-    threshold = base + K * (g_baseline - g_estimate), clamped to [MIN, MAX]
+    Control law::
 
-    This is an absolute law: the same g always produces the same threshold
-    regardless of how many times the governor has run.  The hysteresis in
-    apply_threshold prevents churn when g is near baseline.
+        threshold = FALLBACK_THRESHOLD + K × (G_BASELINE − g_estimate)
+
+    Dense sessions (high *g*) → lower threshold → compact sooner.
+    Sparse sessions (low *g*) → raise threshold → preserve context.
+
+    Result is clamped to ``[MIN_THRESHOLD, MAX_THRESHOLD]`` where
+    ``MIN_THRESHOLD = MINIMUM_CONTEXT_LENGTH / context_length``.
     """
-    delta = K_SENSITIVITY * (G_BASELINE - g_estimate)
-    new_threshold = base_threshold + delta
-    return max(MIN_THRESHOLD, min(MAX_THRESHOLD, new_threshold))
+    min_threshold = MINIMUM_CONTEXT_LENGTH / context_length
+    delta = K_SENSITIVITY * (G_BASELINE - growth_rate)
+    new_threshold = FALLBACK_THRESHOLD + delta
+    return max(min_threshold, min(MAX_THRESHOLD, new_threshold))
 
 
-def apply_threshold(threshold: float, old_threshold: float) -> bool:
-    """Apply threshold via `hermes config set` if change exceeds hysteresis.
+# ---------------------------------------------------------------------------
+# Apply threshold
+# ---------------------------------------------------------------------------
 
-    Returns True if config was updated, False if skipped or failed.
-    On any failure, config is left unchanged — backward-compatible.
-    """
-    if abs(threshold - old_threshold) < HYSTERESIS:
-        return False  # No change needed
-
-    try:
-        result = subprocess.run(
-            ["hermes", "--profile", "manager", "config", "set",
-             "compression.threshold", f"{threshold:.4f}"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"[growth-governor] hermes config set failed: {result.stderr}")
-            return False
-    except Exception as e:
-        print(f"[growth-governor] config set exception: {e}")
-        return False
-
-
-def main():
-    state = load_state()
-    kf = GrowthRateKalman.from_dict(state.get("kalman", {}))
-
-    # Measure current growth rate
-    measured_g = measure_growth_rate(DB_PATH)
-
-    # Skip Kalman update when DB fallback returns G_BASELINE (fake measurement)
-    if measured_g == G_BASELINE and not DB_PATH.exists():
-        g_estimate = kf.x  # Keep last estimate, don't update
-    else:
-        g_estimate = kf.update(measured_g)
-
-    # Absolute control law: compute from FALLBACK_THRESHOLD as base
-    # (NOT incremental — same g always produces same threshold)
-    new_threshold = compute_threshold(g_estimate, FALLBACK_THRESHOLD)
-
-    # Compare against last-applied threshold for hysteresis
-    current_threshold = state.get("current_threshold", FALLBACK_THRESHOLD)
-
-    # Apply with hysteresis
-    applied = apply_threshold(new_threshold, current_threshold)
-    if applied:
-        state["last_config_threshold"] = current_threshold
-        state["current_threshold"] = new_threshold
-    else:
-        state["current_threshold"] = current_threshold
-
-    # Save state
-    state["kalman"] = kf.to_dict()
-    state["last_measurement"] = measured_g
-    state["last_ts"] = time.time()
-    try:
-        save_state(state)
-    except Exception as e:
-        print(f"[growth-governor] save_state failed: {e}")
-
-    # Write audit file
+def _write_audit(
+    new_threshold: float,
+    old_threshold: float,
+    context_length: int,
+    applied: bool,
+    growth_rate: float = 0.0,
+    kalman_estimate: float = 0.0,
+):
+    """Write audit data to the override file."""
     audit = {
-        "growth_estimate": round(g_estimate, 1),
-        "growth_measured": round(measured_g, 1),
-        "growth_baseline": G_BASELINE,
-        "target_threshold": round(new_threshold, 4),
-        "current_threshold": round(state["current_threshold"], 4),
+        "threshold": round(new_threshold, 4),
+        "old_threshold": round(old_threshold, 4),
         "applied": applied,
-        "implied_turns_to_compaction": int(
-            (state["current_threshold"] * CONTEXT_LENGTH - C0) / max(g_estimate, 1)
-        ),
-        "context_length": CONTEXT_LENGTH,
-        "min_threshold": round(MIN_THRESHOLD, 4),
+        "context_length": context_length,
+        "growth_rate": round(growth_rate, 1),
+        "kalman_estimate": round(kalman_estimate, 1),
+        "min_threshold": round(MINIMUM_CONTEXT_LENGTH / context_length, 4),
         "max_threshold": MAX_THRESHOLD,
         "k_sensitivity": K_SENSITIVITY,
         "updated_at": time.time(),
@@ -283,11 +268,103 @@ def main():
     except Exception as e:
         print(f"[growth-governor] audit write failed: {e}")
 
-    tag = "ADJUSTED" if applied else "stable"
-    print(f"[growth-governor] g={measured_g:.0f} est={g_estimate:.0f} "
-          f"threshold={state['current_threshold']:.4f} "
-          f"turns_to_compact={audit['implied_turns_to_compaction']} "
-          f"[{tag}] n={kf.n}")
+
+def apply_threshold(new_threshold: float, config_path: Path = CONFIG_PATH) -> bool:
+    """Apply threshold via ``hermes config set`` if change exceeds hysteresis.
+
+    Reads current threshold and context_length dynamically from *config_path*.
+
+    Only applies if ``|new_threshold − current| > HYSTERESIS``.
+
+    Returns **True** if config was updated, **False** otherwise.
+    """
+    context_length, current_threshold = read_config(config_path)
+
+    # Write audit regardless (captures decision rationale)
+    _write_audit(new_threshold, current_threshold, context_length,
+                 False)  # will overwrite below if applied
+
+    if abs(new_threshold - current_threshold) < HYSTERESIS:
+        return False  # Within hysteresis band — no change
+
+    try:
+        result = subprocess.run(
+            [
+                "hermes", "--profile", "manager", "config", "set",
+                "compression.threshold", f"{new_threshold:.4f}",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            _write_audit(new_threshold, current_threshold, context_length, True)
+            return True
+        print(f"[growth-governor] hermes config set failed: {result.stderr}")
+        return False
+    except Exception as e:
+        print(f"[growth-governor] config set exception: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main entry point (cron)
+# ---------------------------------------------------------------------------
+
+def main():
+    """Entry point for cron.  Zero LLM cost — pure computation."""
+    state = load_state()
+    kf = GrowthRateKalman.from_dict(state.get("kalman", {}))
+
+    # Read context_length dynamically from config.yaml
+    context_length, old_threshold = read_config()
+
+    # Measure current growth rate
+    measured_g = measure_growth_rate(DB_PATH)
+
+    # Skip Kalman update when DB is missing (fake G_BASELINE measurement)
+    if measured_g == G_BASELINE and not DB_PATH.exists():
+        g_estimate = kf.x  # Keep last estimate, don't inject fake measurement
+    else:
+        kf.predict()
+        g_estimate = kf.update(measured_g)
+
+    # Compute optimal threshold
+    new_threshold = compute_threshold(g_estimate, context_length)
+
+    # Apply with hysteresis (reads config again inside)
+    applied = apply_threshold(new_threshold)
+
+    # Update persisted state
+    history: list = state.get("threshold_history", [])
+    history.append({
+        "ts": time.time(),
+        "old_threshold": round(old_threshold, 4),
+        "new_threshold": round(new_threshold, 4),
+        "applied": applied,
+    })
+    history = history[-100:]  # Keep last 100 entries
+
+    state["kalman"] = kf.to_dict()
+    state["last_measurement"] = round(measured_g, 1)
+    state["last_ts"] = time.time()
+    state["current_threshold"] = new_threshold if applied else old_threshold
+    state["threshold_history"] = history
+    state["context_length"] = context_length
+
+    try:
+        save_state(state)
+    except Exception as e:
+        print(f"[growth-governor] save_state failed: {e}")
+
+    # Print JSON summary (consumed by cron / health scripts)
+    summary = {
+        "growth_rate": round(measured_g, 1),
+        "kalman_estimate": round(g_estimate, 1),
+        "old_threshold": round(old_threshold, 4),
+        "new_threshold": round(new_threshold, 4),
+        "context_length": context_length,
+        "applied": applied,
+    }
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

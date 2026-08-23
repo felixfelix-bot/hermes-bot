@@ -1,0 +1,28 @@
+---
+# Hermes kanban zombie-fix patch — ensures CLI dispatch reclaims stale tasks
+# and iterates all boards when no --board is specified.
+#
+# Apply after any Hermes install/update. Idempotent — skips if already applied.
+
+- name: Check if zombie-fix is already applied
+  ansible.builtin.shell: |
+    grep -c "dispatch_stale_timeout_seconds" {{ hermes_kanban_py_path }} || true
+  register: _zombie_fix_check
+  changed_when: false
+
+- name: Apply zombie-fix patch
+  ansible.builtin.patch:
+    src: kanban-zombie-fix.patch
+    dest: "{{ hermes_kanban_py_path }}"
+    state: present
+  when: _zombie_fix_check.stdout | int == 0
+  register: _patch_result
+
+- name: Report patch status
+  ansible.builtin.debug:
+    msg: >-
+      {% if _patch_result is changed %}
+      ✅ Zombie-fix applied to {{ hermes_kanban_py_path }}
+      {% else %}
+      ✅ Zombie-fix already present (skipped)
+      {% endif %}

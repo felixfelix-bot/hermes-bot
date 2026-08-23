@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""
+z.ai Usage Report CLI — query and export usage data from zai_usage.db.
+
+Subcommands:
+  summary     Total tokens per model, per key
+  timeseries  Tokens per hour/day, grouped by model or key
+  decisions   Key selection distribution and reasons
+  export      CSV or JSON export for external plotting
+  hit-rates   Cache / ollama / ppq hit rates
+
+Usage:
+  python3 zai_usage_report.py summary
+  python3 zai_usage_report.py timeseries --interval hour --group-by model
+  python3 zai_usage_report.py decisions
+  python3 zai_usage_report.py export --format csv --output usage.csv
+  python3 zai_usage_report.py hit-rates --from 2026-06-27 --to 2026-06-28
+"""
+
+import argparse
+import csv
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+DB_PATH = os.path.expanduser("~/.hermes/bot/zai_usage.db")
+
+PEAK_START = 6   # 06:00 UTC
+PEAK_END   = 10  # 10:00 UTC
+
+
+def get_connection():
+    if not os.path.exists(DB_PATH):
+        print(f"ERROR: database not found at {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+    return sqlite3.connect(DB_PATH)
+
+
+def build_where(args, extra=None):
+    """Build WHERE clause + params from --from / --to date args."""
+    parts = []
+    params = []
+    if getattr(args, "from_date", None):
+        from_ts = datetime.strptime(args.from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        parts.append("ts >= ?")
+        params.append(from_ts)
+    if getattr(args, "to_date", None):
+        to_ts = datetime.strptime(args.to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        to_ts = to_ts.replace(hour=23, minute=59, second=59).timestamp()
+        parts.append("ts <= ?")
+        params.append(to_ts)
+    if extra:
+        parts.extend(extra)
+    clause = ("WHERE " + " AND ".join(parts)) if parts else ""
+    return clause, params
+
+
+def fmt_table(rows, headers):
+    """Pretty-print rows as an aligned table."""
+    if not rows:
+        print("  (no data)")
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(str(val)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print(fmt.format(*["-" * w for w in widths]))
+    for row in rows:
+        print(fmt.format(*[str(v) for v in row]))
+
+
+# ──────────────────────────────────────────────
+#  Subcommand: summary
+# ──────────────────────────────────────────────
+def cmd_summary(args):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # Tokens per model
+    print("=== Tokens per Model ===")
+    where, params = build_where(args, extra=["model IS NOT NULL"])
+    q = f"""
+        SELECT model, COUNT(*) as calls, SUM(prompt_tokens) as prompt,
+               SUM(completion_tokens) as completion, SUM(total_tokens) as total,
+               ROUND(AVG(total_tokens),1) as avg_total
+        FROM api_calls {where}
+        GROUP BY model ORDER BY total DESC
+    """
+    cur.execute(q, params)
+    fmt_table(cur.fetchall(), ["Model", "Calls", "Prompt", "Completion", "Total", "Avg/Req"])
+
+    # Tokens per key
+    print("\n=== Tokens per Key ===")
+    where, params = build_where(args, extra=["key_name IS NOT NULL"])
+    q = f"""
+        SELECT key_name, COUNT(*) as calls, SUM(total_tokens) as total,
+               ROUND(AVG(total_tokens),1) as avg_total
+        FROM api_calls {where}
+        GROUP BY key_name ORDER BY total DESC
+    """
+    cur.execute(q, params)
+    fmt_table(cur.fetchall(), ["Key", "Calls", "Total Tokens", "Avg/Req"])
+
+    # Peak vs off-peak
+    print(f"\n=== Peak vs Off-Peak ({PEAK_START:02d}:00–{PEAK_END:02d}:00 UTC) ===")
+    where, params = build_where(args, extra=["total_tokens IS NOT NULL"])
+    q = f"""
+        SELECT
+            CASE
+                WHEN CAST(strftime('%H', ts, 'unixepoch') AS INTEGER) >= {PEAK_START}
+                 AND CAST(strftime('%H', ts, 'unixepoch') AS INTEGER) < {PEAK_END}
+                THEN 'peak' ELSE 'off-peak'
+            END as period,
+            COUNT(*) as calls, SUM(total_tokens) as total
+        FROM api_calls {where}
+        GROUP BY period ORDER BY period
+    """
+    cur.execute(q, params)
+    fmt_table(cur.fetchall(), ["Period", "Calls", "Total Tokens"])
+
+    conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Subcommand: timeseries
+# ──────────────────────────────────────────────
+def cmd_timeseries(args):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    interval = args.interval  # hour or day
+    group_by = args.group_by  # model or key
+
+    strftime_fmt = "%H:00" if interval == "hour" else "%Y-%m-%d"
+    group_col = "model" if group_by == "model" else "key_name"
+
+    where, params = build_where(args, extra=["total_tokens IS NOT NULL"])
+    q = f"""
+        SELECT
+            strftime('{strftime_fmt}', ts, 'unixepoch') as time_bucket,
+            {group_col} as grp,
+            COUNT(*) as calls,
+            SUM(total_tokens) as total
+        FROM api_calls {where}
+        GROUP BY time_bucket, grp
+        ORDER BY time_bucket, grp
+    """
+    cur.execute(q, params)
+    rows = cur.fetchall()
+
+    print(f"=== Timeseries ({interval}, grouped by {group_by}) ===")
+    headers = ["Time", group_by.title(), "Calls", "Total Tokens", "Peak?"]
+    data = []
+    for time_bucket, grp, calls, total in rows:
+        is_peak = ""
+        if interval == "hour":
+            try:
+                hr = int(time_bucket.split(":")[0])
+                if PEAK_START <= hr < PEAK_END:
+                    is_peak = "⚡ PEAK"
+            except (ValueError, IndexError):
+                pass
+        data.append((time_bucket, grp or "N/A", calls, total, is_peak))
+    fmt_table(data, headers)
+
+    conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Subcommand: decisions
+# ──────────────────────────────────────────────
+def cmd_decisions(args):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    where, params = build_where(args)
+
+    # total count for percentage calc
+    q = f"SELECT COUNT(*) FROM key_decisions {where}"
+    cur.execute(q, params)
+    total = cur.fetchone()[0]
+
+    if total == 0:
+        print("No decision data in range.")
+        conn.close()
+        return
+
+    # Key choice distribution
+    print("=== Key Selection Distribution ===")
+    q = f"""
+        SELECT chosen_key, COUNT(*) as count,
+               ROUND(100.0*COUNT(*)/{total},1) as pct
+        FROM key_decisions {where}
+        GROUP BY chosen_key ORDER BY count DESC
+    """
+    cur.execute(q, params)
+    fmt_table(cur.fetchall(), ["Chosen Key", "Count", "%"])
+
+    # Reason breakdown
+    print("\n=== Decision Reasons ===")
+    q = f"""
+        SELECT reason, COUNT(*) as count,
+               ROUND(100.0*COUNT(*)/{total},1) as pct
+        FROM key_decisions {where}
+        GROUP BY reason ORDER BY count DESC
+    """
+    cur.execute(q, params)
+    fmt_table(cur.fetchall(), ["Reason", "Count", "%"])
+
+    # Average quota percentages
+    print("\n=== Average Quota at Decision Time ===")
+    q = f"SELECT ROUND(AVG(ours_pct),1), ROUND(AVG(friend_pct),1) FROM key_decisions {where}"
+    cur.execute(q, params)
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        print(f"  ours:   {row[0]}%")
+        print(f"  friend: {row[1]}%")
+
+    conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Subcommand: export
+# ──────────────────────────────────────────────
+def cmd_export(args):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    where, params = build_where(args)
+    q = f"""
+        SELECT
+            datetime(ts, 'unixepoch') as datetime_utc,
+            key_name, model,
+            prompt_tokens, completion_tokens, total_tokens,
+            tier, cache_hit, ollama_hit, ppq_hit,
+            status_code, duration_ms
+        FROM api_calls {where}
+        ORDER BY ts
+    """
+    cur.execute(q, params)
+    rows = cur.fetchall()
+    headers = ["datetime_utc", "key_name", "model", "prompt_tokens", "completion_tokens",
+               "total_tokens", "tier", "cache_hit", "ollama_hit", "ppq_hit",
+               "status_code", "duration_ms"]
+
+    fmt = args.format
+    output = args.output or f"zai_usage_export.{'csv' if fmt == 'csv' else 'json'}"
+
+    if fmt == "csv":
+        with open(output, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        print(f"Exported {len(rows)} rows to {output} (CSV)")
+    else:
+        records = [dict(zip(headers, row)) for row in rows]
+        with open(output, "w") as f:
+            json.dump(records, f, indent=2, default=str)
+        print(f"Exported {len(rows)} rows to {output} (JSON)")
+
+    conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Subcommand: hit-rates
+# ──────────────────────────────────────────────
+def cmd_hit_rates(args):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    where, params = build_where(args)
+    q = f"SELECT COUNT(*) FROM api_calls {where}"
+    cur.execute(q, params)
+    total = cur.fetchone()[0]
+
+    if total == 0:
+        print("No data in range.")
+        conn.close()
+        return
+
+    print(f"=== Hit Rates (total calls: {total}) ===\n")
+
+    for hit_type, label in [("cache_hit", "Cache"), ("ollama_hit", "Ollama"), ("ppq_hit", "PPQ Fallback")]:
+        w2, p2 = build_where(args, extra=[f"{hit_type} = 1"])
+        q = f"SELECT COUNT(*) FROM api_calls {w2}"
+        cur.execute(q, p2)
+        hits = cur.fetchone()[0]
+        pct = round(100.0 * hits / total, 1)
+        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        print(f"  {label:16s} {bar} {pct:5.1f}%  ({hits}/{total})")
+
+    # Tier distribution
+    print("\n=== Tier Distribution ===")
+    where2, params2 = build_where(args, extra=["tier IS NOT NULL"])
+    q = f"""
+        SELECT tier, COUNT(*) as count,
+               ROUND(100.0*COUNT(*)/{total},1) as pct
+        FROM api_calls {where2}
+        GROUP BY tier ORDER BY count DESC
+    """
+    cur.execute(q, params2)
+    fmt_table(cur.fetchall(), ["Tier", "Count", "%"])
+
+    conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Main / argparse
+# ──────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="z.ai usage report and CSV export tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_date_args(p):
+        p.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD)")
+        p.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD)")
+
+    p_summary = sub.add_parser("summary", help="Total tokens per model, per key")
+    add_date_args(p_summary)
+    p_summary.set_defaults(func=cmd_summary)
+
+    p_ts = sub.add_parser("timeseries", help="Tokens per hour/day")
+    p_ts.add_argument("--interval", choices=["hour", "day"], default="hour")
+    p_ts.add_argument("--group-by", choices=["model", "key"], default="model")
+    add_date_args(p_ts)
+    p_ts.set_defaults(func=cmd_timeseries)
+
+    p_dec = sub.add_parser("decisions", help="Key selection distribution")
+    add_date_args(p_dec)
+    p_dec.set_defaults(func=cmd_decisions)
+
+    p_exp = sub.add_parser("export", help="Export to CSV or JSON")
+    p_exp.add_argument("--format", choices=["csv", "json"], default="csv")
+    p_exp.add_argument("--output", "-o", help="Output filename")
+    add_date_args(p_exp)
+    p_exp.set_defaults(func=cmd_export)
+
+    p_hr = sub.add_parser("hit-rates", help="Cache/ollama/ppq hit rates")
+    add_date_args(p_hr)
+    p_hr.set_defaults(func=cmd_hit_rates)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

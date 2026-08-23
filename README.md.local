@@ -1,0 +1,60 @@
+# Hermes Bot — custom components
+
+Build location for the Hermes bot (responsibilities 1–9). Everything here runs
+on top of Hermes's native scheduling/subagents/skills.
+
+## Live components (built & verified)
+
+### zai-watch — z.ai rate-limit monitor (responsibility #4, TOP PRIORITY)
+- Script: `~/.hermes/scripts/zai_monitor.py`
+- Cron: `*/15 * * * *` (no-agent, deliver local), name `zai-watch`
+- Polls `https://api.z.ai/api/monitor/usage/quota/limit` with `$ZAI_API_KEY`.
+- **Key source:** `ZAI_API_KEY` added to `~/.hermes/.env` (Hermes loads this for
+  cron jobs; the gateway service does NOT source `~/.bashrc`). The script's loader
+  also falls back to parsing `.env` and `.bashrc` directly, handling `export`/quotes.
+- Writes state → `~/.hermes/bot/zai_state.json` every run:
+  ```json
+  { "session_pct": 1, "token_pct": 4, "throttle": false, "critical": false, ... }
+  ```
+- Alerts (stdout delivered) only when `%` ≥ `ZAI_WARN_PCT` (80) or `ZAI_CRIT_PCT` (92).
+- **Scheduler integration:** other jobs should read `zai_state.json["throttle"]`
+  and self-skip while `true`. This is how the bot maximizes usage without hitting
+  the 5-hour throttle.
+- Tested: silent at 1%/4%; alert path verified with `ZAI_WARN_PCT=1`.
+
+### disk-watch — disk-space monitor (responsibility #9)
+- Script: `~/.hermes/scripts/disk_monitor.sh`
+- Cron: `*/30 * * * *` (no-agent, deliver local), name `disk-watch`
+- Alerts when: free `< 15G` or use% `≥ 92`; regrown caches `> 800M`;
+  stale (disabled) snaps present; excess installed kernels; opencode.db `≥ 3G`.
+- Seed pattern list = the cleanup Tier 1 dirs (ms-playwright, tracker3, go-build,
+  npm, cargo registry, pip, deno).
+- Tunables via env: `DISK_WARN_FREE_GB`, `DISK_WARN_FREE_PCT`,
+  `DISK_CACHE_REGROW_MB`, `DISK_KERNEL_KEEP`.
+
+### Gateway / scheduler
+- `hermes gateway install` ran — user systemd service `hermes-gateway.service`,
+  linger enabled (survives logout). This is what fires the cron jobs.
+
+## Config files
+- `npubs.env` — Nostr npub watchlist for responsibility #8 (fill in your npubs).
+- `zai_state.json` — live rate-limit state (written by zai-watch, read by other jobs).
+
+## Verified facts (for later phases)
+- **Prompt history:** 5259 user prompts in `opencode.db`, 4997 with text.
+  Extract with: `SELECT json_extract(p.data,'$.text') FROM part p JOIN message m
+  ON p.message_id=m.id WHERE m.data LIKE '%"role":"user"%' AND p.data LIKE '%text%';`
+  → feeds responsibility #2 (prompt learning).
+- **z.ai endpoints (verified working):** `…/quota/limit` (used). `…/model-usage`
+  returns 200/empty when idle.
+- **Sovereign Hybrid Compute API:** https://blesta.sovereignhybridcompute.com/user-api/docs/
+  + toolkit https://github.com/Amperstrand/shc-toolkit/ → feeds #7 (QEMU).
+- **git host:** https://gitworkshop.dev/ (needs auth token) → feeds #6/#7/#8.
+- **peripherals:** ESP32 via `lsusb` → feeds #5 (hardware-aware scheduling).
+
+## Not yet built (need user input or are heavier)
+- B2 done (zai-watch). B3 prompt-mining ready to build.
+- B4 worktree interface + repo-spawn; B5 hardware scheduler; B6 overnight decisions;
+  B7 npub mirror; B8 QEMU on SHC.
+- Deferred: messaging delivery (Telegram/Discord) so alerts reach you — change
+  `--deliver local` to `--deliver telegram` once configured.

@@ -1,0 +1,394 @@
+[
+  {
+    "slug": "awesome-community-networks-main",
+    "repo": "/home/c03rad0r/awesome-community-networks",
+    "worktree": "/home/c03rad0r/awesome-community-networks",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "awesome-tollgate-main",
+    "repo": "/home/c03rad0r/awesome-tollgate",
+    "worktree": "/home/c03rad0r/awesome-tollgate",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "pi"
+  },
+  {
+    "slug": "configurationwizzard-feature-upstream-wi",
+    "repo": "/home/c03rad0r/configurationwizzard",
+    "worktree": "/home/c03rad0r/configurationwizzard",
+    "branch": "feature/upstream-wifi-scan",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "contextvm-anker-solix-master",
+    "repo": "/home/c03rad0r/contextvm-anker-solix",
+    "worktree": "/home/c03rad0r/contextvm-anker-solix",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "direwolf-setup-master",
+    "repo": "/home/c03rad0r/direwolf-setup",
+    "worktree": "/home/c03rad0r/direwolf-setup",
+    "branch": "master",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "pi"
+  },
+  {
+    "slug": "esp32-balloon-integration-master",
+    "repo": "/home/c03rad0r/esp32-balloon-integration",
+    "worktree": "/home/c03rad0r/esp32-balloon-integration",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "pi"
+  },
+  {
+    "slug": "esp32-balloon-integration-feature-meshco",
+    "repo": "/home/c03rad0r/esp32-balloon-integration",
+    "worktree": "/home/c03rad0r/esp32-balloon-integration-meshcore-pr",
+    "branch": "feature/meshcore-lr2021-upstream-pr",
+    "default_branch": "master",
+    "harness": "pi"
+  },
+  {
+    "slug": "esp32-balloon-integration-hardware-fligh",
+    "repo": "/home/c03rad0r/esp32-balloon-integration",
+    "worktree": "/home/c03rad0r/flight-board-worktree",
+    "branch": "hardware/flight-board-v0.1",
+    "default_branch": "master",
+    "harness": "pi"
+  },
+  {
+    "slug": "esp32-mesh-feature-redeem-ecash",
+    "repo": "/home/c03rad0r/esp32-mesh",
+    "worktree": "/home/c03rad0r/esp32-mesh",
+    "branch": "feature/redeem-ecash",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "esp32-tollgate-master",
+    "repo": "/home/c03rad0r/esp32-tollgate",
+    "worktree": "/home/c03rad0r/esp32-tollgate",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "esp-miner-master",
+    "repo": "/home/c03rad0r/esp-miner",
+    "worktree": "/home/c03rad0r/esp-miner",
+    "branch": "master",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "esp-miner-feature-tollgate-component-int",
+    "repo": "/home/c03rad0r/esp-miner",
+    "worktree": "/home/c03rad0r/esp-miner-tollgate",
+    "branch": "feature/tollgate-component-integration",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "fips-feature-three-node-ota-antenna-vali",
+    "repo": "/home/c03rad0r/fips",
+    "worktree": "/home/c03rad0r/fips",
+    "branch": "feature/three-node-ota-antenna-validation",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "gitworkshop-main",
+    "repo": "/home/c03rad0r/gitworkshop",
+    "worktree": "/home/c03rad0r/gitworkshop",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-master",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/market",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-feat-cvm-worker-nip53-status",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/market-cvm-worker",
+    "branch": "feat/cvm-worker-nip53-status",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-feat-applesauce-wave-a",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/applesauce-wave-a",
+    "branch": "feat/applesauce-wave-a",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-ci-e2e-grep-input",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/ci-e2e-grep-input",
+    "branch": "ci/e2e-grep-input",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-chore-cvm-key-management",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/cvm-key-mgmt",
+    "branch": "chore/cvm-key-management",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-chore-applesauce-foundation",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/ndk-to-applesauce",
+    "branch": "chore/applesauce-foundation",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-feat-nip53-improvements",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/nip53-rebase",
+    "branch": "feat/nip53-improvements",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-chore-pr1003-review-plan",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/pr1003-review-plan",
+    "branch": "chore/pr1003-review-plan",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-security-critical-remediation",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/security-critical-remediation",
+    "branch": "security/critical-remediation",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "market-fix-shipping-selectors-cart-redes",
+    "repo": "/home/c03rad0r/market",
+    "worktree": "/home/c03rad0r/worktrees/test-cleanup",
+    "branch": "fix/shipping-selectors-cart-redesign",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "nostr-glasses-master",
+    "repo": "/home/c03rad0r/nostr-glasses",
+    "worktree": "/home/c03rad0r/nostr-glasses",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "nutband-main",
+    "repo": "/home/c03rad0r/nutband",
+    "worktree": "/home/c03rad0r/nutband",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "pi"
+  },
+  {
+    "slug": "opencode-setup-master",
+    "repo": "/home/c03rad0r/opencode-setup",
+    "worktree": "/home/c03rad0r/opencode-setup",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "openrouter-automation-master",
+    "repo": "/home/c03rad0r/openrouter-automation",
+    "worktree": "/home/c03rad0r/openrouter-automation",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "physical-router-test-automation-test-css",
+    "repo": "/home/c03rad0r/physical-router-test-automation",
+    "worktree": "/home/c03rad0r/physical-router-test-automation",
+    "branch": "test/css-regression-playwright-v2",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "physical-router-test-automation-fix-port",
+    "repo": "/home/c03rad0r/physical-router-test-automation",
+    "worktree": "/home/c03rad0r/physical-router-test-automation-wt",
+    "branch": "fix/portal-verify-drop-curl",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "rana-feat-entropy-mining",
+    "repo": "/home/c03rad0r/rana",
+    "worktree": "/home/c03rad0r/rana",
+    "branch": "feat/entropy-mining",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "setup-android-screen-sharing-master",
+    "repo": "/home/c03rad0r/setup-android-screen-sharing",
+    "worktree": "/home/c03rad0r/setup-android-screen-sharing",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "sx1280-testing-master",
+    "repo": "/home/c03rad0r/sx1280-testing",
+    "worktree": "/home/c03rad0r/sx1280-testing",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "pi"
+  },
+  {
+    "slug": "tollgate-bash-client-main",
+    "repo": "/home/c03rad0r/tollgate-bash-client",
+    "worktree": "/home/c03rad0r/tollgate-bash-client",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-community-calls-master",
+    "repo": "/home/c03rad0r/tollgate-community-calls",
+    "worktree": "/home/c03rad0r/tollgate-community-calls",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-infrastructure-kit-main",
+    "repo": "/home/c03rad0r/tollgate-infrastructure-kit",
+    "worktree": "/home/c03rad0r/tollgate-infrastructure-kit",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-fix-owner-first",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-module-basic-go",
+    "branch": "fix/owner-first-payouts",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-feat-set-hostna",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-module-basic-go-set-hostname",
+    "branch": "feat/set-hostname",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-feature-openwrt",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-openwrt-compat",
+    "branch": "feature/openwrt-feed-compat",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-head",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-worktrees/main-readiness",
+    "branch": "HEAD",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-feat-portal-pac",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-worktrees/portal-packaging",
+    "branch": "feat/portal-packaging",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-feat-config-sch",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-worktrees/step1-schema",
+    "branch": "feat/config-schema-dotpath-rebased",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-feat-cli-json-c",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-worktrees/step2-cli",
+    "branch": "feat/cli-json-config-rebased",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-module-basic-go-fix-upstream-au",
+    "repo": "/home/c03rad0r/tollgate-module-basic-go",
+    "worktree": "/home/c03rad0r/tollgate-worktrees/valve-retry",
+    "branch": "fix/upstream-autopay-gate-open-retry",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-nostr-signing-device-main",
+    "repo": "/home/c03rad0r/tollgate-nostr-signing-device",
+    "worktree": "/home/c03rad0r/tollgate-nostr-signing-device",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-quaterly-reports-master",
+    "repo": "/home/c03rad0r/tollgate-quaterly-reports",
+    "worktree": "/home/c03rad0r/tollgate-quaterly-reports",
+    "branch": "master",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "tollgate-release-explorer-site-main",
+    "repo": "/home/c03rad0r/tollgate-release-explorer-site",
+    "worktree": "/home/c03rad0r/tollgate-release-explorer-site",
+    "branch": "main",
+    "default_branch": "refs/remotes/origin/main",
+    "harness": "pi"
+  },
+  {
+    "slug": "tollgate-rs-design-review-notes",
+    "repo": "/home/c03rad0r/tollgate-rs",
+    "worktree": "/home/c03rad0r/tollgate-rs",
+    "branch": "design-review-notes",
+    "default_branch": "refs/remotes/origin/master",
+    "harness": "opencode"
+  },
+  {
+    "slug": "vanity-npub-ghdl-master",
+    "repo": "/home/c03rad0r/vanity-npub-ghdl",
+    "worktree": "/home/c03rad0r/vanity-npub-ghdl",
+    "branch": "master",
+    "default_branch": "master",
+    "harness": "opencode"
+  }
+]

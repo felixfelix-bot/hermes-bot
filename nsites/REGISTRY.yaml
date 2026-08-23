@@ -1,0 +1,70 @@
+# Nsite Registry — Single Source of Truth
+# Last updated: 2026-07-04
+# This file tracks ALL nsites, their keys, data sources, and deployment pipelines.
+# If you create a new nsite, ADD IT HERE.
+
+nsites:
+
+  kalman-data:
+    npub_hex: "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+    npub_bech32: "npub19y5kzwx985em9lc92xvdhr7d3qepftq5rv4q53rnljr4zzcwaswsnjalwn"
+    gateway_url: "https://npub19y5kzwx985em9lc92xvdhr7d3qepftq5rv4q53rnljr4zzcwaswsnjalwn.nsite.lol/"
+    nsec_file: "~/.hermes/state/kalman-data-nsec.key"
+    data_source:
+      db: "~/.hermes/bot/zai_usage.db"
+      table: "kalman_samples"
+      rows: 5517
+    deploy_script: "~/.hermes/profiles/manager/scripts/kalman-dashboard-deploy.sh"
+    github: "github.com/c03rad0r/kalman-data-dashboard"
+    cron: "every 10m (job: kalman-dashboard-refresh)"
+    architecture: "data.json + fetch (no baked-in snapshot)"
+    status: "active"
+
+  worker-dashboard:
+    npub_hex: "f6bde015400239a0053812b8c7bbfd0133d84d67bb062d98981ea2e102a1c92a"
+    nsec_file: "~/.hermes/state/worker-dashboard-nsec.key"
+    data_source:
+      db: "~/.hermes/bot/worker_metrics.db"
+      table: "worker_metrics"
+      rows: 1119
+    deploy_script: "~/.hermes/profiles/manager/scripts/worker-dashboard-deploy.sh"
+    cron: "every 30m (worker-dashboard-deploy.sh)"
+    architecture: "baked-in 5MB HTML (TODO: migrate to data.json)"
+    status: "active"
+
+  community-sentiment:
+    npub_bech32: "npub10e6sy7z7jmgwd4l77f6r44q6uscczmsql5rfnkxgnfrkle6d2fgqxfkwya"
+    gateway: "ngit only (NOT on nsite.lol)"
+    nsec_file: "UNKNOWN"
+    data_source: "unknown"
+    deploy_script: "none"
+    cron: "none"
+    status: "orphaned"
+    action_needed: "find key or decommission"
+
+  kanban-dashboard:
+    directory: "~/nsites/kanban-dashboard/"
+    status: "empty — never deployed"
+    action_needed: "remove or implement"
+
+# Key locations (all must be in ~/.hermes/state/ eventually)
+key_files:
+  - path: "~/.hermes/state/worker-dashboard-nsec.key"
+    npub: "f6bde015400239a0053812b8c7bbfd0133d84d67bb062d98981ea2e102a1c92a"
+    exists: true
+  - path: "~/.hermes/state/kalman-data-nsec.key"
+    npub: "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+    exists: false  # currently hardcoded in scripts — TODO: extract to file
+
+# Database inventory (data backing for all dashboards)
+databases:
+  - name: "zai_usage.db"
+    path: "~/.hermes/bot/zai_usage.db"
+    size: "19MB"
+    tables: ["kalman_samples", "system_readings", "anomaly_events", "key_decisions", "api_calls", "task_duration_samples", "rate_limit_samples"]
+    feeds: ["kalman-data"]
+  - name: "worker_metrics.db"
+    path: "~/.hermes/bot/worker_metrics.db"
+    size: "96KB"
+    tables: ["worker_metrics"]
+    feeds: ["worker-dashboard"]

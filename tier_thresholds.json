@@ -1,0 +1,8 @@
+{
+  "heavy_min_hours": 10.6,
+  "mid_max_hours": 10.6,
+  "tight_max_hours": 0.1,
+  "p95_hours": 14.6,
+  "n_samples": 1200,
+  "computed_at": 1783415540.9174602
+}

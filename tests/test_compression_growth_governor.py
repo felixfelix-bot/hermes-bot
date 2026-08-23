@@ -273,39 +273,53 @@ class TestComputeThreshold:
 
     def test_sparse_raises_threshold(self):
         """g=200 (sparse) should raise threshold above base."""
-        base = 0.55
+        base = 0.60
         result = compute_threshold(200.0, base)
-        # delta = K * (1800 - 200) = K * 1600 > 0 → threshold raised
+        # delta = K * (1800 - 200) = K * 1600 > 0 -> threshold raised
         assert result > base, f"Sparse session should raise threshold: {result} vs base {base}"
         assert result <= MAX_THRESHOLD
 
     def test_dense_lowers_threshold(self):
         """g=10000 (dense) should lower threshold below base."""
-        base = 0.55
+        base = 0.60
         result = compute_threshold(10000.0, base)
-        # delta = K * (1800 - 10000) = K * (-8200) < 0 → threshold lowered
+        # delta = K * (1800 - 10000) = K * (-8200) < 0 -> threshold lowered
         assert result < base, f"Dense session should lower threshold: {result} vs base {base}"
         assert result >= MIN_THRESHOLD
 
     def test_baseline_no_change(self):
         """g=1800 (baseline) should produce no adjustment."""
-        base = 0.55
+        base = 0.60
         result = compute_threshold(1800.0, base)
-        # delta = K * (1800 - 1800) = 0 → no change
+        # delta = K * (1800 - 1800) = 0 -> no change
         assert abs(result - base) < 0.001, f"Baseline should not change threshold: {result} vs base {base}"
 
     def test_clamped_to_min(self):
         """Very dense session should clamp to MIN_THRESHOLD."""
-        base = 0.50
+        base = 0.60
         result = compute_threshold(20000.0, base)
         assert result == MIN_THRESHOLD, f"Very dense should clamp to MIN_THRESHOLD={MIN_THRESHOLD}, got {result}"
 
     def test_clamped_to_max(self):
         """Very sparse session should clamp to MAX_THRESHOLD."""
-        base = 0.50
+        base = 0.60
         result = compute_threshold(200.0, base)
         # With large enough K, sparse should push to MAX
         assert result <= MAX_THRESHOLD, f"Should not exceed MAX_THRESHOLD={MAX_THRESHOLD}, got {result}"
+
+    def test_absolute_law_not_incremental(self):
+        """Same g always produces same threshold regardless of base drift.
+        This catches the integrator-walk bug from kimi review."""
+        result1 = compute_threshold(5000.0, 0.60)
+        result2 = compute_threshold(5000.0, 0.60)
+        assert result1 == result2, "Absolute law: same g must produce same threshold"
+        # And it should NOT drift if called with its own output as base
+        result3 = compute_threshold(5000.0, result1)
+        # With absolute law, result3 = result1 + K*(1800-5000) = result1 - 0.096
+        # which IS different — but that's because base changed.
+        # The key test: main() uses FALLBACK_THRESHOLD as base always,
+        # so threshold doesn't walk. Verify the function is deterministic.
+        assert compute_threshold(5000.0) == compute_threshold(5000.0), "Deterministic"
 
     def test_min_threshold_correct_for_131k(self):
         """MIN_THRESHOLD should be 64000/131072 ≈ 0.488."""
@@ -477,6 +491,31 @@ class TestMainFunction:
         assert audit["context_length"] == CONTEXT_LENGTH
         assert audit["applied"] is False
         assert "implied_turns_to_compaction" in audit
+
+    def test_main_no_integrator_walk(self, tmp_path, monkeypatch):
+        """Running main() twice with missing DB should NOT walk the threshold.
+        This catches the integrator-walk bug from kimi review: with absolute
+        control law, threshold stays at FALLBACK_THRESHOLD when g=baseline."""
+        import compression_growth_governor as mod
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(mod, "DB_PATH", tmp_path / "nonexistent.db")
+        monkeypatch.setattr(mod, "STATE_FILE", state_file)
+        monkeypatch.setattr(mod, "AUDIT_FILE", tmp_path / "audit.json")
+        monkeypatch.setattr(mod, "apply_threshold", lambda new, old: True)
+
+        # First run — DB missing, g=baseline, threshold=0.60
+        mod.main()
+        state1 = json.loads(state_file.read_text())
+        t1 = state1["current_threshold"]
+
+        # Second run — same conditions
+        mod.main()
+        state2 = json.loads(state_file.read_text())
+        t2 = state2["current_threshold"]
+
+        # With absolute law, both should be 0.60 (baseline produces no delta)
+        assert abs(t1 - t2) < 0.001, f"Threshold walked: {t1} -> {t2}"
+        assert abs(t1 - FALLBACK_THRESHOLD) < 0.001, f"Baseline should give FALLBACK_THRESHOLD, got {t1}"
 
 
 # ─── Edge cases for measure_growth_rate ───

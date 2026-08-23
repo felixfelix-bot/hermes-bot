@@ -145,6 +145,7 @@ def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
             WHERE ts >= ? AND status_code = 200
               AND session_id IS NOT NULL
               AND task_type IS NULL
+              AND prompt_tokens IS NOT NULL
             ORDER BY session_id, ts
         """, (cutoff,)).fetchall()
         conn.close()
@@ -159,14 +160,17 @@ def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
     current_sid = None
     prev_tokens = None
 
-    for sid, pt, ts in rows:
-        if sid != current_sid:
-            current_sid = sid
+    try:
+        for sid, pt, ts in rows:
+            if sid != current_sid:
+                current_sid = sid
+                prev_tokens = pt
+                continue
+            if pt is not None and prev_tokens is not None and pt > prev_tokens:
+                deltas.append(pt - prev_tokens)
             prev_tokens = pt
-            continue
-        if pt > prev_tokens:  # Only positive growth (exclude post-compression resets)
-            deltas.append(pt - prev_tokens)
-        prev_tokens = pt
+    except Exception:
+        return G_BASELINE
 
     if not deltas:
         return G_BASELINE
@@ -177,16 +181,21 @@ def measure_growth_rate(db_path: Path, hours: int = WINDOW_HOURS) -> float:
     return float(median)
 
 
-def compute_threshold(g_estimate: float, current_config_threshold: float) -> float:
-    """Compute adjusted threshold from growth rate estimate.
+def compute_threshold(g_estimate: float, base_threshold: float = FALLBACK_THRESHOLD) -> float:
+    """Compute absolute threshold from growth rate estimate.
 
-    Control law: dense sessions (high g) -> lower threshold -> compact sooner.
-    Sparse sessions (low g) -> raise threshold -> preserve context longer.
+    Control law (absolute, NOT incremental): dense sessions (high g) -> lower
+    threshold -> compact sooner.  Sparse sessions (low g) -> raise threshold
+    -> preserve context longer.
 
-    threshold = current + K * (g_baseline - g_estimate), clamped to [MIN, MAX]
+    threshold = base + K * (g_baseline - g_estimate), clamped to [MIN, MAX]
+
+    This is an absolute law: the same g always produces the same threshold
+    regardless of how many times the governor has run.  The hysteresis in
+    apply_threshold prevents churn when g is near baseline.
     """
     delta = K_SENSITIVITY * (G_BASELINE - g_estimate)
-    new_threshold = current_config_threshold + delta
+    new_threshold = base_threshold + delta
     return max(MIN_THRESHOLD, min(MAX_THRESHOLD, new_threshold))
 
 
@@ -221,13 +230,19 @@ def main():
 
     # Measure current growth rate
     measured_g = measure_growth_rate(DB_PATH)
-    g_estimate = kf.update(measured_g)
 
-    # Read current config threshold from state
+    # Skip Kalman update when DB fallback returns G_BASELINE (fake measurement)
+    if measured_g == G_BASELINE and not DB_PATH.exists():
+        g_estimate = kf.x  # Keep last estimate, don't update
+    else:
+        g_estimate = kf.update(measured_g)
+
+    # Absolute control law: compute from FALLBACK_THRESHOLD as base
+    # (NOT incremental — same g always produces same threshold)
+    new_threshold = compute_threshold(g_estimate, FALLBACK_THRESHOLD)
+
+    # Compare against last-applied threshold for hysteresis
     current_threshold = state.get("current_threshold", FALLBACK_THRESHOLD)
-
-    # Compute new threshold
-    new_threshold = compute_threshold(g_estimate, current_threshold)
 
     # Apply with hysteresis
     applied = apply_threshold(new_threshold, current_threshold)
@@ -241,7 +256,10 @@ def main():
     state["kalman"] = kf.to_dict()
     state["last_measurement"] = measured_g
     state["last_ts"] = time.time()
-    save_state(state)
+    try:
+        save_state(state)
+    except Exception as e:
+        print(f"[growth-governor] save_state failed: {e}")
 
     # Write audit file
     audit = {
@@ -260,7 +278,10 @@ def main():
         "k_sensitivity": K_SENSITIVITY,
         "updated_at": time.time(),
     }
-    AUDIT_FILE.write_text(json.dumps(audit, indent=2))
+    try:
+        AUDIT_FILE.write_text(json.dumps(audit, indent=2))
+    except Exception as e:
+        print(f"[growth-governor] audit write failed: {e}")
 
     tag = "ADJUSTED" if applied else "stable"
     print(f"[growth-governor] g={measured_g:.0f} est={g_estimate:.0f} "

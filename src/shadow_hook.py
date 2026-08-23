@@ -64,20 +64,26 @@ __all__ = ["ShadowHook"]
 # routing_shadow_decisions with ~4.8k un-actionable disagreements/24h.
 # Live key handling (live_router.py, providers.yaml) is untouched.
 _SEED_COSTS = {
-    "friend":       0.001,    # shared z.ai subscription → marginal $0
-    "ollama_cloud": 0.0155,   # measured included rate (pre-RP-3)
-    "ppq":          0.14,     # known list price
-    "openrouter":   0.135,    # known list price
-    "deepinfra":    1.30,     # known list price
+    "friend":          0.001,    # shared z.ai subscription → marginal $0
+    "ollama_cloud":    0.0155,   # measured included rate (pre-RP-3)
+    "ollama_cloud_2":  0.0155,   # second subscription, same economics as #1
+    "opencode_go":     0.0155,   # $10/mo flat-rate → marginal $0, floored
+    "neuralwatt":      0.21,     # deepseek-v4-flash blended: (0.14+0.28)/2 ≈ 0.21
+    "ppq":             0.14,     # known list price
+    "openrouter":      0.135,    # known list price
+    "deepinfra":       1.30,     # known list price
 }
 
 # Quota totals (approximate, for scarcity factor)
 _QUOTA_TOTALS = {
-    "friend":       2_000_000,
-    "ollama_cloud": 500_000_000,  # 500M tokens per 5h session window
-    "ppq":          float("inf"),  # pay-per-token, no hard quota
-    "openrouter":   float("inf"),
-    "deepinfra":    float("inf"),  # pay-per-token, no hard quota
+    "friend":          2_000_000,
+    "ollama_cloud":     500_000_000,  # 500M tokens per 5h session window
+    "ollama_cloud_2":  500_000_000,  # same plan as #1
+    "opencode_go":     500_000_000,  # estimated (unknown real quota)
+    "neuralwatt":      float("inf"),  # pay-per-token, no hard quota
+    "ppq":             float("inf"),
+    "openrouter":      float("inf"),
+    "deepinfra":       float("inf"),  # pay-per-token, no hard quota
 }
 
 # z.ai peak hours (UTC) — Ollama/PPQ/OpenRouter/DeepInfra have no peak

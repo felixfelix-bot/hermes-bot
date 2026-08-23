@@ -77,6 +77,54 @@ external:
         cost_per_1m_input: 0.09    # LEGACY: tracker is source of truth (RP-4)
         cost_per_1m_output: 0.19   # LEGACY: tracker is source of truth (RP-4)
 
+# ── oxalpha (PROMO tier — stealth/ox-alpha free promo on OpenRouter) ────────
+# ADDITIVE entry (OX-1, docs/PLAN-oxalpha-promo-2026-08-21.md §2.1, Felix
+# approved 2026-08-21 D1–D6). Nothing above this block changes. Delete this
+# block + restart proxy to fully remove the tier (plan §6). Guard logic lives
+# in src/promo_tier.py (pure, tested). OX-2 STATUS (2026-08-22): the generic
+# FAILOVER path is now wired per the EMERGENCY operator directive (task
+# t_2ed46556) — free bleed-stop candidate in front of the paid chain; the
+# alias/opt-in paths stay disabled pending OX-3b rung-1 flip + Felix D7.
+oxalpha:
+  base_url: "https://openrouter.ai/api/v1"
+  key_env: "OPENROUTER_OXALPHA_KEY"     # NEW $0-spend-limit key (plan §2.4/D6); main OPENROUTER_API_KEY stays dormant
+  headers: { HTTP-Referer: "https://hermes.local", X-Title: "Hermes Agent" }
+  pricing_model: promo_zero
+  promo:
+    expires_at: "2026-08-28T00:00:00Z"  # conservative hard deadline (D3; community: Aug 26–28 fuzzy)
+    post_promo_pessimistic_per_m: { input: 10.0, output: 30.0 }  # safety flip — priced OUT, not a market estimate
+    verified_rate: { input: 0.0, output: 0.0 }   # observed 2026-08-21 (plan §0.3 probe)
+  budget_usd: 0                          # ANY nonzero charge → tier disable + anomaly_events row (plan §2.4)
+  data_sensitivity: allowlist            # plan §2.5
+  allowlist_task_types: [vision, bulk_summarize, shadow_eval]
+  rate_limit_backoff_s: [60, 120, 300]   # 429 backoff, then circuit breaker 5 fails / 300 s (plan §2.6)
+
+  # ── OX-2 proxy wiring (2026-08-22, task t_2ed46556) ──────────────────────
+  # EMERGENCY directive (2026-08-22 ~16:00): the proxy failover chain burns
+  # PAID openrouter tokens whenever z.ai 429s. oxalpha now serves as a FREE
+  # failover candidate AFTER the z.ai keys and BEFORE any paid provider.
+  # PromoTierGuard-wrapped; fail-closed on absent/invalid key (401 -> fall
+  # through to the paid chain, zero regression). Decision logic:
+  # src/oxalpha_tier.py (pure, contract-tested).
+  failover:
+    enabled: true           # EMERGENCY: live. false -> proxy skips tier entirely.
+    model: "stealth/ox-alpha"
+    reasoning_effort: low
+    max_completion_tokens: 8192
+    upstream_timeout_s: 90
+    single_attempt: true    # never internally retried; falls through on error
+  # Acceleration plan §4 (armed, NOT live until the OX-3b rung-1 flip):
+  preferred_for:
+    enabled: false          # OX-3b flips true + names rung-1 digester lanes
+    models: [glm-4.5-flash] # §5.2: glm-5.2/glm-5.3 are hard-excluded in CODE — never list them here
+    task_types: [bulk_summarize]
+    effort: low
+    max_completion_tokens: 8192
+    upstream_timeout_s: 90
+  # kill-switch (§4.2): touch ~/.hermes/bot/.oxalpha_alias_off to disable the
+  # ALIAS only; failover/opt-in unaffected. Delete this whole block +
+  # restart to remove the tier completely (plan §6).
+
 # ── Strategy configuration ─────────────────────────────────────────────────
 strategy:
   # Minimum effective price — never zero, even for free providers (ADR-004)
@@ -95,7 +143,9 @@ strategy:
     low: low
 
   # Fallback model when all z.ai keys exhausted
-  fallback_model: "deepseek/deepseek-v4-flash"
+  # Updated 2026-08-23: deepseek-v4-flash removed from z.ai; glm-4.5-flash is
+  # available, cheap, and sufficient for fallback dispatch.
+  fallback_model: "glm-4.5-flash"
 
   # ── Model mapping: (provider, task_type) → model_name ────────────────────
   # provider is the *service* name: zai (covers ours/friend/manager/worker),

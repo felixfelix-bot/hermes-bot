@@ -2279,8 +2279,10 @@ _FALLBACK_OLLAMA_CLOUD_EXTRA = 0.15     # above-quota rate
 _FALLBACK_RATES: dict[str, float] = {
     "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
     "ollama_cloud_2": _FALLBACK_OLLAMA_CLOUD_BASE,
-    "friend":       0.001,    # shared z.ai subscription → marginal $0
-    "ours":         0.001,    # z.ai subscription → marginal $0
+    "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
+    "neuralwatt":   0.21,     # deepseek-v4-flash blended
+    "friend":       0.015,    # z.ai $300/yr amortized seed
+    "ours":         0.03,     # z.ai $960/yr amortized seed
     "deepinfra":    1.30,
     "telnyx":       1.50,     # blended fallback (was 5.40 — 100x too high)
 }
@@ -2599,7 +2601,8 @@ def _spend_tier(key_name: str | None) -> str:
         return key_name
     elif key_name == "deepinfra":
         return "deepinfra"
-    elif key_name in ("telnyx", "ppq", "openrouter", "routstr", "routstrd", "neuralwatt", "opencode_go"):
+    elif key_name in ("telnyx", "ppq", "openrouter", "routstr", "routstrd",
+                      "opencode_go", "neuralwatt"):
         return key_name
     return "unknown"
 
@@ -3192,6 +3195,9 @@ _init_spend_table()
 #   TOKENS_LIMIT unit=3 (hour),   number=N → N-hour token window
 #   TOKENS_LIMIT unit=6 (week),   number=N → N-week token window (168 h each)
 #   TIME_LIMIT   unit=5 (month),  number=N → N-month tool-call window (720 h each)
+# As of 2026-08-23, z.ai renamed TOKENS_LIMIT → CREDIT_LIMIT (same unit codes).
+#   CREDIT_LIMIT unit=3, number=5 → 5-hour credit window
+#   CREDIT_LIMIT unit=6, number=1 → weekly credit window (168 h)
 _UNIT_META = {
     # (type, unit) → (label_for_single, hours_per_unit)
     # z.ai renamed TOKENS_LIMIT → CREDIT_LIMIT (observed 2026-08-23).
@@ -4499,7 +4505,7 @@ class Handler(BaseHTTPRequestHandler):
         # Step 1c-3: Non-z.ai models (deepseek, qwen, etc.) — skip z.ai
         # entirely and go straight to external failover. z.ai returns 400
         # for any model not in its catalog, wasting a round-trip.
-        if original_model.startswith(("deepseek/", "qwen", "minimax", "mimo")):
+        if original_model and original_model.startswith(("deepseek/", "qwen", "minimax", "mimo")):
             response_buffer = bytearray()
             if OPENCODE_GO_KEY and self._try_opencode_go(body, original_model, response_buffer, t0):
                 return
@@ -5733,14 +5739,17 @@ def _build_kalman_pricing_json() -> dict:
 
         available = healthy and not locked
 
-        # Safety: if all windows are "unknown" (sentinel from _fetch_quota_windows
-        # when the API returned no parseable limits), we have NO real quota data.
-        # Treat the key as unavailable — do NOT publish "available" on false 0%.
-        if wins and all(w.get("name") == "unknown" for w in wins):
+        # Safety: if there are NO quota windows at all (empty list from the
+        # API or cache miss), we are blind — do NOT publish "available" on
+        # the false 0% that _max_pct([]) returns. Also guard the "unknown"
+        # sentinel case where the API returned no parseable limits.
+        quota_data_unavailable = bool(
+            not wins or all(w.get("name") == "unknown" for w in wins)
+        )
+        if quota_data_unavailable:
             available = False
             locked = True
-            lwin = "unknown_quota_data"
-            zai_providers[f"zai_{key}"]["_quota_data_unavailable"] = True
+            lwin = "no_quota_data" if not wins else "unknown_quota_data"
 
         zai_providers[f"zai_{key}"] = {
             "base_rate_usd_per_m": round(base, 6),
@@ -5757,6 +5766,7 @@ def _build_kalman_pricing_json() -> dict:
             "hours_until_exhaustion": round(hours_until, 1) if hours_until else None,
             "burn_rate_tph": round(burn_rate, 1),
             "available": available,
+            "quota_data_unavailable": quota_data_unavailable,
         }
         if available:
             available_zai.append((key, effective))

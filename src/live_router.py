@@ -418,10 +418,15 @@ _QUOTA_TOTALS: dict[str, float] = {
     "ours":         2_000_000,    # ~2M tokens per 5h window
     "friend":       2_000_000,
     "ollama_cloud": 500_000_000,  # 500M tokens per 5h session (EUv2-4)
+    "ollama_cloud_2": 500_000_000,  # second subscription, own quota window
+    "opencode_go":  500_000_000,  # $10/mo flat-rate, seed same as ollama
+    "neuralwatt":   float("inf"),  # pay-per-token, no hard quota
     "ppq":          float("inf"),  # pay-per-token, no hard quota
     "openrouter":   float("inf"),
     "deepinfra":    float("inf"),  # pay-per-token, no hard quota
     "telnyx":       float("inf"),  # credit-based, no hard quota
+    "routstr":      float("inf"),  # Cashu wallet, balance-probed
+    "routstrd":     float("inf"),  # local daemon, Cashu wallet balance-probed
 }
 
 # z.ai peak hours (UTC) — Ollama/PPQ/OpenRouter/DeepInfra have no peak
@@ -673,7 +678,7 @@ def _compute_credit_pressure(
 
 
 # All providers that are NOT z.ai — these are the failover candidates
-_EXTERNAL_PROVIDERS = ("ollama_cloud", "ppq", "openrouter", "deepinfra", "telnyx")
+_EXTERNAL_PROVIDERS = ("ollama_cloud", "ollama_cloud_2", "opencode_go", "neuralwatt", "ppq", "openrouter", "deepinfra", "telnyx", "routstr", "routstrd")
 
 # ── CPVO cache (Phase 2.5.4) ─────────────────────────────────────────────────
 # Effective-rate lookups query the telemetry DB; cache them so a hot failover
@@ -1335,7 +1340,12 @@ class LiveRouter:
 
             # Determine model tier and peak config
             if name in ("ours", "friend"):
-                tier = "high"
+                # Tier "medium" — z.ai competes on price with ollama_cloud
+                # and paid externals rather than being structurally preferred.
+                # When z.ai quota pressure inflates its effective price past
+                # a paid alternative (e.g. NeuralWatt $0.21/M), the optimizer
+                # can switch without waiting for full exhaustion.
+                tier = "medium"
                 prov_model = "glm-5.2"
                 prov_peak = _ZAI_PEAK
                 prov_peak_mult = 3.0

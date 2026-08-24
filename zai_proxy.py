@@ -4115,6 +4115,133 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    # ── z.ai key dispatch (Phase 3 flat router) ───────────────────────────
+    # Extracted from the old inline retry loop in _proxy(). This method
+    # proxies a single request to the z.ai upstream using a specific key.
+    # It handles: path stripping, auth, response buffering, empty/error
+    # detection, reasoning-content injection, and key health marking.
+    # Returns True on success (response sent to client), False on failure.
+
+    def _try_zai_key(self, key_name: str, body: bytes, model: str | None,
+                     response_buffer: bytearray, t0: float) -> bool:
+        """Proxy a single request to z.ai upstream using the named key.
+
+        Args:
+            key_name: "ours" or "friend"
+            body: request body bytes
+            model: model name (for logging, may be rewritten by tier routing)
+            response_buffer: bytearray to extend with response bytes
+            t0: request start time
+
+        Returns True on success (response already sent to client),
+        False on failure (caller should try next candidate).
+        """
+        key = KEYS.get(key_name)
+        if not key:
+            return False
+        try:
+            path = self.path
+            if path.startswith("/v1/"):
+                path = path[3:]
+            if not path.endswith("/chat/completions"):
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"only /chat/completions is proxied"}')
+                return True  # response sent (404), not a failure to retry
+            url = UPSTREAM + path
+            hdrs = {k: v for k, v in self.headers.items()
+                    if k.lower() not in ("host", "authorization", "connection", "content-length")}
+            hdrs["Authorization"] = f"Bearer {key}"
+            hdrs["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=body, method=self.command, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                full_body = resp.read()
+
+                # Check for empty or error response
+                resp_text = full_body.decode('utf-8', errors='ignore').strip()
+                is_empty = (not resp_text or resp_text == "data: [DONE]")
+
+                is_error_response = False
+                is_truncated = False
+                if not is_empty:
+                    try:
+                        resp_json = json.loads(resp_text)
+                        if "error" in resp_json and "choices" not in resp_json:
+                            is_error_response = True
+                        else:
+                            choices = resp_json.get("choices", [])
+                            if choices:
+                                msg_obj = choices[0].get("message", {})
+                                content = msg_obj.get("content", "")
+                                finish_reason = choices[0].get("finish_reason", "")
+                                if finish_reason == "length":
+                                    is_truncated = True
+                                if not content or not content.strip():
+                                    reasoning = msg_obj.get("reasoning_content", "")
+                                    if reasoning and reasoning.strip():
+                                        msg_obj["content"] = reasoning
+                                        full_body = json.dumps(resp_json).encode()
+                                        is_empty = False
+                                    else:
+                                        is_empty = True
+                    except Exception:
+                        pass
+
+                if is_error_response:
+                    # Transient error — don't mark key exhausted, just failover
+                    return False
+
+                if is_empty:
+                    # Key produced nothing — don't mark exhausted, just failover
+                    return False
+
+                # Non-empty response — send to client
+                _mark_key_healthy(key_name)
+                try:
+                    self.send_response(resp.status)
+                    for h, v in resp.headers.items():
+                        if h.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(h, v)
+                    self.send_header("X-Provider", f"zai:{key_name}")
+                    if is_truncated:
+                        self.send_header("X-Response-Truncated", "true")
+                    self.end_headers()
+                    response_buffer.extend(full_body)
+                    self.wfile.write(full_body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client vanished — upstream succeeded, key stays healthy
+                    pass
+                # Success — reset rate limit predictor
+                if _rate_limit_predictor is not None:
+                    _rate_limit_predictor.record_success()
+                return True
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _mark_key_exhausted(key_name)
+            elif e.code in (401, 403):
+                _body_403 = b""
+                try:
+                    _body_403 = e.read()
+                except Exception:
+                    pass
+                _body_403_lower = _body_403.decode(errors="ignore").lower()
+                if any(_kw in _body_403_lower for _kw in
+                       ("quota", "exhaust", "limit", "rate", "exceed",
+                        "insufficient", "weekly", "session")):
+                    _mark_key_exhausted(key_name)
+                else:
+                    _mark_key_dead(key_name)
+            elif e.code in (500, 502, 503, 504):
+                _mark_key_server_error(key_name)
+            return False
+
+        except Exception:
+            _mark_key_server_error(key_name)
+            return False
+
     # ── Ollama Cloud multi-key dispatcher (2026-08-23) ─────────────────────
     # Tries each registered Ollama Cloud key in order. Key #1 (existing) is
     # tried first; if it's paywalled/unhealthy, key #2 (new subscription)
@@ -4809,6 +4936,185 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(f'{{"error":"all external providers failed for non-z.ai model {original_model}"}}'.encode())
             return
+
+        # ── Phase 3: Flat router full cutover ──────────────────────────────
+        # When .disable_flat_router does NOT exist, use select_provider() as
+        # the primary router. When it DOES exist, fall through to the old
+        # best_key() + failover chain (rollback path, unchanged).
+        #
+        # The flat router:
+        #   1. Calls select_provider(model) → ordered candidate list (cheapest first)
+        #   2. Iterates candidates: try each via _dispatch_to_provider()
+        #   3. On success: update Kalman filters, log, return
+        #   4. On failure: mark key failure, try next candidate
+        #   5. If all candidates fail: send 503
+        #
+        # Special cases handled before this point:
+        #   - Ollama-only models (kimi-k2.7-code, etc.) → routed to ollama above
+        #   - Telnyx-direct models (kimi-k3) → routed to telnyx above
+        #   - Non-z.ai models (deepseek/*, qwen, etc.) → routed to external above
+        # The flat router handles these naturally via PROVIDER_MODELS, but the
+        # early exits above are kept for backward compatibility (they skip the
+        # candidate evaluation overhead for these known-special cases).
+
+        _FLAT_ROUTER_DISABLE_FLAG = os.path.expanduser(
+            "~/.hermes/bot/.disable_flat_router")
+
+        if not os.path.exists(_FLAT_ROUTER_DISABLE_FLAG):
+            # ── FLAT ROUTER PATH (Phase 3) ─────────────────────────────
+            try:
+                from flat_router import (
+                    select_provider as _flat_select_provider,
+                    _dispatch_to_provider as _flat_dispatch,
+                    _update_kalman_after_request as _flat_kalman_update,
+                    shadow_compare as _flat_router_shadow_compare,
+                )
+            except Exception:
+                # Import failed — fall through to old path as safety net
+                _flat_select_provider = None
+
+            if _flat_select_provider is not None:
+                # Get ordered candidate list from the flat router
+                _candidates = _flat_select_provider(model=original_model)
+
+                # Shadow log: record what the flat router chose
+                try:
+                    _flat_router_shadow_compare(None, original_model)
+                except Exception:
+                    pass
+
+                # Log the candidate list for observability
+                _cand_names = [c.name for c in _candidates
+                               if c.name != "fallback"]
+                if _cand_names:
+                    _log_key_decision(
+                        chosen_key=_cand_names[0] if _cand_names else "",
+                        reason=f"flat_router: {' -> '.join(_cand_names[:5])}"[:120])
+
+                _flat_response_buffer = bytearray()
+                _flat_key_used: str | None = None
+                _flat_status_code = None
+                _flat_error_text = None
+                _flat_served = False
+
+                for _cand in _candidates:
+                    if _cand.name == "fallback" or _cand.dispatch_fn is None:
+                        continue
+
+                    _flat_key_used = _cand.name
+
+                    # Apply model name translation for this candidate
+                    _cand_body = body
+                    if _cand.model and _cand.model != original_model:
+                        try:
+                            _body_json = json.loads(body)
+                            _body_json["model"] = _cand.model
+                            _cand_body = json.dumps(_body_json).encode()
+                        except Exception:
+                            pass
+
+                    # Dispatch to this provider
+                    _cand_buffer = bytearray()
+                    try:
+                        _success = _flat_dispatch(
+                            self, _cand.name, _cand_body, _cand.model,
+                            _cand_buffer, t0)
+                    except Exception:
+                        _success = False
+
+                    if _success:
+                        # Success — update Kalman filters with real cost data
+                        _flat_served = True
+                        _flat_response_buffer.extend(_cand_buffer)
+
+                        # Extract cost and tokens for Kalman update
+                        try:
+                            _usage = _parse_usage(bytes(_cand_buffer))
+                            _total_tokens = int(_usage.get("total_tokens") or 0)
+                            _cost_usd, _cost_src = _extract_cost(
+                                _cand.name, bytes(_cand_buffer), _total_tokens)
+                            _flat_kalman_update(
+                                provider=_cand.name,
+                                cost_usd=_cost_usd,
+                                total_tokens=_total_tokens,
+                            )
+                        except Exception:
+                            pass
+
+                        # Log the API call
+                        try:
+                            _suffix = None
+                            if _cand.name in KEYS and KEYS.get(_cand.name):
+                                _suffix = KEYS[_cand.name][-4:]
+                            elif _cand.name in _EXTERNAL_KEYS:
+                                _ext_key = _EXTERNAL_KEYS.get(_cand.name, {})
+                                _ext_k = _ext_key.get("key", "") if isinstance(_ext_key, dict) else ""
+                                if _ext_k:
+                                    _suffix = _ext_k[-4:]
+                            _latency_ms = int((time.time() - t0) * 1000)
+                            _log_api_call(
+                                key_name=_cand.name,
+                                key_suffix=_suffix,
+                                model=_cand.model or original_model,
+                                prompt_tokens=int(_usage.get("prompt_tokens") or 0) if '_usage' in dir() else 0,
+                                completion_tokens=int(_usage.get("completion_tokens") or 0) if '_usage' in dir() else 0,
+                                total_tokens=_total_tokens if '_total_tokens' in dir() else 0,
+                                tier="flat_router",
+                                status_code=200,
+                                error=None,
+                                duration_ms=_latency_ms,
+                                cost_usd=_cost_usd if '_cost_usd' in dir() else None,
+                                cost_source=_cost_src if '_cost_src' in dir() else None,
+                                session_id=getattr(self, "_session_id", None),
+                                task_type=getattr(self, "_task_type", None),
+                            )
+                        except Exception:
+                            pass
+
+                        # Record spend
+                        try:
+                            if not getattr(self, '_spend_recorded', False):
+                                _record_spend(_cand.name, _cand.model or original_model,
+                                              _total_tokens if '_total_tokens' in dir() else 0)
+                        except Exception:
+                            pass
+
+                        # LiveRouter consumption tracking
+                        if _LIVE_ROUTER is not None:
+                            try:
+                                _LIVE_ROUTER.record_request(
+                                    provider=_cand.name,
+                                    tokens=_total_tokens if '_total_tokens' in dir() else 0,
+                                )
+                            except Exception:
+                                pass
+
+                        return
+                    else:
+                        # Failure — mark key and try next candidate
+                        try:
+                            _mark_key_failure(_cand.name, "flat_router_dispatch_fail")
+                        except Exception:
+                            pass
+                        continue
+
+                # All candidates failed — send 503
+                if not _flat_served:
+                    _err = json.dumps({
+                        "error": "all providers exhausted (flat router)",
+                        "candidates_tried": _cand_names,
+                    }).encode()
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(_err)))
+                    self.send_header("X-Provider", "none")
+                    self.end_headers()
+                    self.wfile.write(_err)
+                    return
+
+        # ── OLD PATH (rollback when .disable_flat_router exists) ────────
+        # The code below is the ORIGINAL routing path, unchanged.
+        # It runs when .disable_flat_router flag file exists.
 
         # Step 1d + Step 2 — choose a routing key.
         #

@@ -5085,33 +5085,39 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
 
-                        # Log the API call
+                        # Log the API call — skip if _try_external_failover
+                        # already logged it (sets _spend_recorded=True at the
+                        # same time it calls _log_api_call internally).
+                        # Without this guard, a failover from e.g. routstr→
+                        # neuralwatt produces a phantom flat_router row in
+                        # addition to the real neuralwatt row.
                         try:
-                            _suffix = None
-                            if _cand.name in KEYS and KEYS.get(_cand.name):
-                                _suffix = KEYS[_cand.name][-4:]
-                            elif _cand.name in _EXTERNAL_KEYS:
-                                _ext_key = _EXTERNAL_KEYS.get(_cand.name, {})
-                                _ext_k = _ext_key.get("key", "") if isinstance(_ext_key, dict) else ""
-                                if _ext_k:
-                                    _suffix = _ext_k[-4:]
-                            _latency_ms = int((time.time() - t0) * 1000)
-                            _log_api_call(
-                                key_name=_cand.name,
-                                key_suffix=_suffix,
-                                model=_cand.model or original_model,
-                                prompt_tokens=int(_usage.get("prompt_tokens") or 0) if '_usage' in dir() else 0,
-                                completion_tokens=int(_usage.get("completion_tokens") or 0) if '_usage' in dir() else 0,
-                                total_tokens=_total_tokens if '_total_tokens' in dir() else 0,
-                                tier="flat_router",
-                                status_code=200,
-                                error=None,
-                                duration_ms=_latency_ms,
-                                cost_usd=_cost_usd if '_cost_usd' in dir() else None,
-                                cost_source=_cost_src if '_cost_src' in dir() else None,
-                                session_id=getattr(self, "_session_id", None),
-                                task_type=getattr(self, "_task_type", None),
-                            )
+                            if not getattr(self, '_spend_recorded', False):
+                                _suffix = None
+                                if _cand.name in KEYS and KEYS.get(_cand.name):
+                                    _suffix = KEYS[_cand.name][-4:]
+                                elif _cand.name in _EXTERNAL_KEYS:
+                                    _ext_key = _EXTERNAL_KEYS.get(_cand.name, {})
+                                    _ext_k = _ext_key.get("key", "") if isinstance(_ext_key, dict) else ""
+                                    if _ext_k:
+                                        _suffix = _ext_k[-4:]
+                                _latency_ms = int((time.time() - t0) * 1000)
+                                _log_api_call(
+                                    key_name=_cand.name,
+                                    key_suffix=_suffix,
+                                    model=_cand.model or original_model,
+                                    prompt_tokens=int(_usage.get("prompt_tokens") or 0) if '_usage' in dir() else 0,
+                                    completion_tokens=int(_usage.get("completion_tokens") or 0) if '_usage' in dir() else 0,
+                                    total_tokens=_total_tokens if '_total_tokens' in dir() else 0,
+                                    tier="flat_router",
+                                    status_code=200,
+                                    error=None,
+                                    duration_ms=_latency_ms,
+                                    cost_usd=_cost_usd if '_cost_usd' in dir() else None,
+                                    cost_source=_cost_src if '_cost_src' in dir() else None,
+                                    session_id=getattr(self, "_session_id", None),
+                                    task_type=getattr(self, "_task_type", None),
+                                )
                         except Exception:
                             pass
 

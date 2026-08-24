@@ -1359,7 +1359,302 @@ This simplifies the implementation significantly:
 
 ---
 
-## 12. Open Questions for Felix
+## 12. External Sell Pricing (Dual Pricing Surface)
+
+### 12.1 The Problem: Internal Routing Price ≠ External Sell Price
+
+Felix's concern (2026-08-24):
+
+> "There is a risk that we run at a loss for an entire month if we expose these prices on routstr. Expose these prices to our live router which always chooses the cheapest endpoint, but lets make sure that the prices that the live router exposes to real users on routstr are high enough to ensure that we always make a profit when selling the tokens to a third party over routstr."
+
+The capacity-aware pricing model in this doc (§1–§11) defines **internal routing prices** — the prices `select_provider()` uses to pick the cheapest upstream provider. These prices are **artificially low** for sunk-cost providers:
+
+- T1 (z.ai): $0.001/M × time_decay — as low as $0.000006/M near quota reset
+- T2 (NeuralWatt Phase A): $0.001/M — prepaid kWh treated as sunk cost
+- T3 (opencode_go): $0.001/M — $10/mo flat, marginal cost $0
+- T4 (ollama_cloud): $0.001/M — included in subscription, marginal cost $0
+- T5 (per-token): Kalman-measured actual rate
+
+**These routing prices are CORRECT for internal routing** — we want to attract traffic to sunk-cost providers. But they are **WRONG for external sell prices**. If we charge a third party $0.001/M for z.ai tokens, we lose money on the subscription cost because $0.001/M doesn't cover the real amortized cost ($20/mo ÷ monthly quota).
+
+**Solution: Two independent price surfaces.**
+
+### 12.2 The Two Price Surfaces
+
+```
+                    ┌──────────────────────────────────┐
+                    │         PROVIDER TIER            │
+                    │  (T1-T5 economic classification) │
+                    └────────────┬─────────────────────┘
+                                 │
+                ┌────────────────┴────────────────┐
+                │                                  │
+                ▼                                  ▼
+  ┌──────────────────────┐          ┌──────────────────────┐
+  │  SURFACE 1: INTERNAL  │          │  SURFACE 2: EXTERNAL │
+  │    ROUTING PRICE      │          │    SELL PRICE        │
+  ├──────────────────────┤          ├──────────────────────┤
+  │ Used by:              │          │ Used by:              │
+  │  flat_router.py       │          │  routstr API          │
+  │  select_provider()    │          │  (sats/token rate     │
+  │  → cheapest wins      │          │   exposed to third     │
+  │                       │          │   parties)             │
+  │ Formula:              │          │ Formula:               │
+  │  compute_effective_   │          │  compute_sell_price()  │
+  │  price() [§1-§11]     │          │  [§12.4 below]        │
+  │                       │          │                        │
+  │ Purpose:              │          │ Purpose:               │
+  │  Attract traffic to   │          │  Charge third parties  │
+  │  sunk-cost providers  │          │  at REAL cost + margin │
+  │  (artificially low)   │          │  (always profitable)    │
+  │                       │          │                        │
+  │ Exposed to:           │          │ Exposed to:            │
+  │  INTERNAL ONLY        │          │  EXTERNAL USERS        │
+  │  (never on routstr)   │          │  (on routstr only)     │
+  └──────────────────────┘          └──────────────────────┘
+```
+
+**Key invariant**: The external sell price is ALWAYS ≥ actual cost × (1 + profit_margin). The internal routing price can be below actual cost (it's a sunk-cost optimization, not a billing rate).
+
+### 12.3 Actual Cost per Tier (for Sell Pricing)
+
+The "actual cost" for sell pricing is **different** from the routing price. It reflects what we actually pay per token, not the artificial routing incentive.
+
+| Tier | Provider | Actual Cost Formula | Notes |
+|------|----------|---------------------|-------|
+| T1 (quota) | z.ai ours, z.ai friend | `subscription_cost / monthly_quota_tokens` | E.g., $20/mo ÷ 200M × 4.33 = $0.023/M. This is the amortized real cost. |
+| T2 (balance) | NeuralWatt | Phase A: `subscription_cost / typical_monthly_usage`<br>Phase B: `measured_rate` (Kalman) | Phase A: $100/mo ÷ historic usage. Phase B: per-token rate when kWh exhausted. |
+| T3 (flat) | opencode_go | `subscription_cost / historic_avg_monthly_usage` | $10/mo ÷ expected usage. If no history: conservative estimate (e.g., 50M/mo → $0.20/M). |
+| T4 (included) | ollama_cloud | `subscription_cost / historic_avg_monthly_usage` | Included in subscription — allocate subscription cost proportionally. |
+| T5 (per-token) | routstr, ppq, deepinfra, openrouter, telnyx | `measured_rate` (from Kalman filter) | Straightforward — we pay per token, sell at markup. |
+
+**Important**: For T1-T4, the "actual cost" is based on subscription economics, NOT marginal cost. Marginal cost is $0 (sunk cost) — but the actual cost per token is NOT $0, because we paid a subscription fee. The sell price must recover the subscription cost plus margin.
+
+### 12.4 Sell Price Formula
+
+```python
+def compute_sell_price(
+    provider: str,
+    model: str | None,
+    context: dict | None = None,
+) -> float:
+    """Compute the external sell price ($/M) for a provider.
+
+    This is the price we charge third parties on routstr.
+    It is ALWAYS >= actual_cost × (1 + min_profit_margin).
+
+    This is SEPARATE from compute_effective_price() which is the
+    internal routing price used by select_provider().
+    """
+    tier = PROVIDER_TIER.get(provider, "per_token")
+    margin = PROFIT_MARGIN.get(provider, DEFAULT_PROFIT_MARGIN)  # 0.20
+
+    actual_cost = _compute_actual_cost(provider, tier, model, context)
+
+    sell_price = actual_cost * (1.0 + margin)
+
+    # Safeguard: never sell below minimum margin
+    min_sell = actual_cost * (1.0 + MIN_PROFIT_MARGIN)  # 1.1x
+    return max(sell_price, min_sell)
+```
+
+### 12.5 Profit Margin Configuration
+
+```python
+# Default profit margins per provider (configurable)
+DEFAULT_PROFIT_MARGIN = 0.20   # 20% — standard markup
+MIN_PROFIT_MARGIN = 0.10       # 10% — hard floor, never sell below 1.1x cost
+
+PROFIT_MARGIN: dict[str, float] = {
+    # T1: quota providers — standard margin
+    "ours":         0.20,
+    "friend":       0.20,
+
+    # T2: NeuralWatt — standard margin (premium models get more)
+    "neuralwatt":   0.20,
+
+    # T3: opencode_go — slightly higher (unknown capacity = risk premium)
+    "opencode_go":  0.30,
+
+    # T4: ollama_cloud — standard
+    "ollama_cloud": 0.20,
+
+    # T5: per-token — thin margin (competitive market)
+    "routstr":      0.15,
+    "routstrd":     0.15,
+    "deepinfra":    0.15,
+    "ppq":          0.20,
+    "openrouter":   0.15,
+    "telnyx":       0.20,
+
+    # Premium models can override:
+    # "neuralwatt:kimi-k3": 0.50,
+}
+```
+
+**Rules:**
+- Default margin: 20% (configurable per provider)
+- Hard minimum: 10% — `sell_price ≥ actual_cost × 1.1` always
+- Premium models (e.g., kimi-k3, heavy reasoning): up to 50% margin
+- Per-token providers in competitive markets: 15% (thin margin to stay competitive)
+
+### 12.6 Determining "Actual Cost" for Sell Pricing
+
+The `_compute_actual_cost()` function determines the real cost per token for sell pricing:
+
+```python
+def _compute_actual_cost(
+    provider: str,
+    tier: str,
+    model: str | None,
+    context: dict | None = None,
+) -> float:
+    """Determine the actual cost per token ($/M) for sell pricing.
+
+    This is DIFFERENT from the routing price. It reflects real
+    subscription economics, not sunk-cost optimization.
+    """
+    if tier == "quota":
+        # T1: subscription_cost / monthly_quota_tokens
+        # E.g., $20/mo ÷ (200M × 4.33 weeks) = $0.023/M
+        sub_cost = SUBSCRIPTION_COST.get(provider, 20.0)  # $/mo
+        monthly_quota = _get_monthly_quota_tokens(provider)  # tokens
+        if monthly_quota > 0:
+            return sub_cost / (monthly_quota / 1_000_000)  # $/M
+        # Fallback: no quota known
+        return max(_get_measured_rate(provider, model), FALLBACK_RATE)
+
+    elif tier == "balance":
+        # T2: Phase A → sub_cost / typical_monthly_usage
+        #     Phase B → measured_rate (Kalman)
+        if _is_neuralwatt_phase_b(provider):
+            return _get_measured_rate(provider, model)  # per-token
+        else:
+            sub_cost = SUBSCRIPTION_COST.get(provider, 100.0)
+            typical_usage = _get_historic_monthly_usage(provider)  # tokens
+            if typical_usage > 0:
+                return sub_cost / (typical_usage / 1_000_000)
+            return max(_get_measured_rate(provider, model), FALLBACK_RATE)
+
+    elif tier == "flat":
+        # T3: sub_cost / historic_avg_monthly_usage
+        sub_cost = SUBSCRIPTION_COST.get(provider, 10.0)
+        avg_usage = _get_historic_monthly_usage(provider)
+        if avg_usage > 0:
+            return sub_cost / (avg_usage / 1_000_000)
+        # No history → conservative estimate
+        return sub_cost / (CONSERVATIVE_USAGE_ESTIMATE / 1_000_000)
+
+    elif tier == "included":
+        # T4: same as T3 — allocate subscription cost
+        sub_cost = SUBSCRIPTION_COST.get(provider, 0.0)  # may be $0
+        if sub_cost == 0:
+            # Truly free — use a nominal rate
+            return FALLBACK_RATE
+        avg_usage = _get_historic_monthly_usage(provider)
+        if avg_usage > 0:
+            return sub_cost / (avg_usage / 1_000_000)
+        return FALLBACK_RATE
+
+    else:
+        # T5: per-token — measured rate from Kalman
+        measured = _get_measured_rate(provider, model)
+        if measured > 0:
+            return measured
+        return FALLBACK_RATE
+```
+
+**Constants:**
+
+```python
+FALLBACK_RATE = 0.50          # $/M — used when actual cost can't be determined
+CONSERVATIVE_USAGE_ESTIMATE = 50_000_000  # 50M tokens/month — conservative for flat-rate
+
+SUBSCRIPTION_COST: dict[str, float] = {
+    "ours":         20.0,   # z.ai subscription $20/mo
+    "friend":       0.0,    # friend's key — we don't pay for it
+    "neuralwatt":  100.0,   # NeuralWatt $100/mo
+    "opencode_go": 10.0,    # opencode.go $10/mo
+    "ollama_cloud": 0.0,    # included in other subscription
+    # T5 providers: no subscription (pay per token)
+}
+```
+
+### 12.7 Safeguards
+
+1. **Unknown cost fallback**: If actual_cost cannot be determined (no historic usage, no known quota):
+   ```
+   sell_price = max(measured_rate, FALLBACK_RATE) × (1 + margin)
+   ```
+   The `FALLBACK_RATE` ($0.50/M) is deliberately conservative — it's better to overcharge than to lose money.
+
+2. **Never-used provider**: If a provider has never been used (no Kalman signal, no history):
+   ```
+   sell_price = CONSERVATIVE_ESTIMATE × (1 + margin)
+   ```
+
+3. **Minimum margin enforcement**: The sell price is clamped to `≥ actual_cost × 1.1`. No configuration can override this floor. If the margin config is set to 5%, the actual margin applied is 10% (the minimum).
+
+4. **Monthly profitability check** (alert, not block):
+   ```
+   At end of each billing period:
+     For each provider:
+       sell_revenue = sum(sell_price × tokens_sold) for all routstr traffic
+       actual_cost_total = subscription_cost + per_token_costs
+       if sell_revenue < actual_cost_total:
+         ALERT("Provider {X} ran at a loss: revenue={rev}, cost={cost}")
+   ```
+   This is a reporting metric, not a blocking mechanism. If a provider consistently runs at a loss, the margin should be increased or the provider removed from routstr.
+
+5. **Friend's key (zero subscription cost)**: For `friend` (z.ai friend's key), `subscription_cost = $0`. The actual_cost is $0, so `sell_price = $0 × (1 + margin) = $0`. This is correct — we don't pay for it, so we can sell it at any price. But for external pricing consistency, we should still charge at least the `FALLBACK_RATE` to avoid undercutting our own paid providers. The sell price for zero-cost providers is:
+   ```
+   sell_price = max(FALLBACK_RATE, actual_cost) × (1 + margin)
+   ```
+
+### 12.8 Implementation Plan
+
+**DESIGN ONLY — no code changes yet.**
+
+When implemented:
+
+1. **New module**: `sell_pricing.py` (or function in `flat_router.py`)
+   - `compute_sell_price(provider, model, context)` — the external sell price
+   - `_compute_actual_cost(provider, tier, model, context)` — actual cost lookup
+   - Constants: `PROFIT_MARGIN`, `SUBSCRIPTION_COST`, `FALLBACK_RATE`
+
+2. **Routstr integration**: The routstr API endpoint exposes `compute_sell_price()` as the sats/token rate. The internal `compute_effective_price()` is never exposed.
+
+3. **No change to flat_router.py routing**: `select_provider()` continues to use `compute_effective_price()` (Surface 1). The sell price (Surface 2) is computed independently and only used for billing.
+
+4. **Monthly profitability report**: A cron job queries `api_calls` for routstr traffic per provider, computes `sell_revenue` vs `actual_cost`, and alerts if any provider ran at a loss.
+
+### 12.9 Relationship to §5 (Profitability Tracking)
+
+The profitability tracker in §5 tracks actual usage vs subscription cost for **monthly renewal decisions** (should we keep paying for this subscription?). The sell price safeguard in §12.7 tracks whether we're **charging enough** on routstr.
+
+These are complementary:
+- §5 answers: "Is this subscription worth keeping?" (cost vs value)
+- §12 answers: "Are we charging enough to cover our costs?" (revenue vs cost)
+
+Both use the same `subscription_cost` and `historic_usage` data, but for different purposes.
+
+### 12.10 Summary
+
+| Aspect | Surface 1 (Internal Routing) | Surface 2 (External Sell) |
+|--------|-------------------------------|---------------------------|
+| Function | `compute_effective_price()` | `compute_sell_price()` |
+| Used by | `select_provider()` (flat router) | routstr API (billing) |
+| Formula | Tier-specific (§1-§11) | actual_cost × (1 + margin) |
+| T1 price | $0.001 × time_decay (as low as $0.000006) | $0.023/M × 1.2 = $0.028/M |
+| T3 price | $0.001/M | $0.20/M × 1.3 = $0.26/M (if 50M/mo usage) |
+| T5 price | measured_rate | measured_rate × 1.15 |
+| Purpose | Attract traffic to sunk-cost | Always profitable |
+| Exposed to | Internal only | External (routstr) |
+| Can be below cost? | YES (sunk cost optimization) | NO (minimum 1.1× actual cost) |
+
+---
+
+## 13. Open Questions for Felix
 
 1. **T3/T4 controller**: Should we run the controller on opencode_go and ollama_cloud, or treat them as unlimited ($0.001 floor)? My recommendation: ollama_cloud YES (has known quota), opencode_go NO (treat as unlimited until we see throttling).
 

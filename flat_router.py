@@ -162,6 +162,41 @@ _PROXY_TO_OPTIMIZER_NAME = {
     "ppq": "ppq_external",
 }
 
+# ── PROVIDER_TIER: 5-tier classification (time-aware pricing design §2) ──────
+# T1 quota:   z.ai keys with weekly reset — unused quota is wasted
+# T2 balance: NeuralWatt prepaid balance — depletes, then per-token overage
+# T3 flat:    opencode_go $10/mo — marginal cost $0
+# T4 included: ollama_cloud subscriptions — marginal cost $0
+# T5 per-token: pay per token — standard Kalman discovery
+PROVIDER_TIER: dict[str, str] = {
+    "ours":           "quota",
+    "friend":         "quota",
+    "neuralwatt":     "balance",
+    "opencode_go":    "flat",
+    "ollama_cloud":   "included",
+    "ollama_cloud_2": "included",
+    "deepinfra":      "per_token",
+    "ppq":            "per_token",
+    "telnyx":         "per_token",
+    "openrouter":     "per_token",
+    "routstr":        "per_token",
+    "routstrd":       "per_token",
+}
+
+# ── Tier-specific constants ──────────────────────────────────────────────────
+MIN_EFFECTIVE_PRICE = 0.001           # $/M floor (T3/T4, and global min)
+NW_CORRECTION_FACTOR = 0.2762         # NeuralWatt 3.6× overcounting fix
+NW_MAX_DEPLETION_PENALTY = 2.0        # At 0 balance, price triples
+NW_INITIAL_BALANCE = 100.0            # NeuralWatt $100/mo Pro plan
+QUOTA_WEEK_DAYS = 7.0                 # z.ai weekly quota window
+OFF_PEAK_FACTOR = 0.5                 # Price multiplier during off-peak hours
+# Off-peak hours: UTC 10:00–6:00 next day (i.e. not 06:00–10:00 peak)
+_OFF_PEAK_HOURS = set(range(10, 24)) | set(range(0, 6))
+
+# Kill switch flag files
+_TIME_DECAY_FLAG = os.path.expanduser("~/.hermes/bot/.disable_time_decay")
+_DEPLETION_FLAG = os.path.expanduser("~/.hermes/bot/.disable_depletion_penalty")
+
 
 # ── _ALL_PROVIDERS: runtime registry of provider Kalman state ───────────────
 # Populated at module init from the shadow optimizer (if available).
@@ -282,13 +317,203 @@ def _is_provider_healthy(name: str) -> bool:
         return True
 
 
+# ── Tier-specific helper functions (time-aware pricing design §2) ────────────
+
+def _is_time_decay_disabled() -> bool:
+    """Check if the time-decay kill switch is active."""
+    return os.path.exists(_TIME_DECAY_FLAG)
+
+
+def _is_depletion_disabled() -> bool:
+    """Check if the depletion penalty kill switch is active."""
+    return os.path.exists(_DEPLETION_FLAG)
+
+
+def _get_off_peak_factor() -> float:
+    """Return peak_factor: 0.5 during off-peak hours, 1.0 during peak (UTC 6-10)."""
+    try:
+        hour = time.gmtime().tm_hour
+        if hour in _OFF_PEAK_HOURS:
+            return OFF_PEAK_FACTOR
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _get_quota_windows(name: str) -> list[dict]:
+    """Get quota windows for a z.ai key from quota_cache (via zai_proxy)."""
+    try:
+        qc = _resolve("quota_cache")
+        if qc is not None:
+            entry = qc.get(name)
+            if entry is not None:
+                return entry[0]  # (windows, timestamp)
+    except Exception:
+        pass
+    return []
+
+
+def _compute_time_decay(name: str) -> float:
+    """Compute time_decay for a quota provider.
+
+    time_decay = days_to_reset / 7.0
+    - At 7 days to reset: 1.0 (full price, quota is fresh)
+    - At 0 days to reset: 0.0 (use-it-or-lose-it, price drops to zero)
+    - Unknown reset time: 1.0 (no decay, safe default)
+
+    Returns a value in [0.01, 1.0] — never quite zero so the floor in
+    effective_price() prevents always-wins.
+    """
+    windows = _get_quota_windows(name)
+    weekly = next((w for w in windows if w.get("name") == "weekly"), None)
+    if weekly and weekly.get("resets_at"):
+        seconds_to_reset = weekly["resets_at"] - time.time()
+        days_to_reset = max(0.0, seconds_to_reset / 86400.0)
+        return max(0.01, days_to_reset / QUOTA_WEEK_DAYS)
+    # Check if it's a "1w" or "7d" window as fallback
+    if weekly and weekly.get("window_hours", 0) >= 168:
+        # Has a weekly window but no reset time → no decay
+        return 1.0
+    return 1.0  # unknown → no decay
+
+
+def _compute_quota_health(name: str) -> float:
+    """Compute quota_health for a quota provider.
+
+    quota_health = 1.0 - used_pct / 100.0
+    - 0% used: 1.0 (healthy, full quota available)
+    - 100% used: 0.0 (exhausted — provider should be excluded by health gate)
+
+    Returns a value in [0.0, 1.0].
+    """
+    windows = _get_quota_windows(name)
+    weekly = next((w for w in windows if w.get("name") == "weekly"), None)
+    if weekly:
+        used_pct = float(weekly.get("used_pct", 0))
+        return max(0.0, 1.0 - used_pct / 100.0)
+    # Fallback: use max across all windows
+    if windows:
+        max_pct = max(w.get("used_pct", 0) for w in windows)
+        return max(0.0, 1.0 - max_pct / 100.0)
+    return 1.0  # unknown → optimistic
+
+
+def _compute_depletion_penalty(name: str) -> float:
+    """Compute depletion penalty for a balance-based provider (NeuralWatt).
+
+    depletion_penalty = (1 - remaining_balance / initial_balance) × max_penalty
+    - At 100% balance: 0.0 (no penalty)
+    - At 0% balance: max_penalty (2.0 — price triples)
+
+    Returns 0.0 if the kill switch is active.
+    """
+    if _is_depletion_disabled():
+        return 0.0
+
+    try:
+        snap_fn = _resolve("_neuralwatt_quota_snapshot")
+        if snap_fn is not None:
+            entry = snap_fn()
+            remaining = float(entry.get("remaining_usd", 0.0))
+            initial = float(entry.get("total_credits_usd", NW_INITIAL_BALANCE))
+            if initial <= 0:
+                return NW_MAX_DEPLETION_PENALTY  # conservative
+            depletion = max(0.0, 1.0 - remaining / initial)
+            return depletion * NW_MAX_DEPLETION_PENALTY
+    except Exception:
+        pass
+
+    # Bridge disabled or error → conservative (treat as depleted)
+    return NW_MAX_DEPLETION_PENALTY
+
+
+def compute_effective_price(
+    provider: str,
+    base_rate: float,
+    context: dict | None = None,
+) -> float:
+    """Compute the effective $/M price for a provider based on its tier.
+
+    This applies the tier-specific formula from the time-aware pricing design:
+
+    T1 (quota): base × (days_to_reset/7) × (1 - used_pct/100) × peak_factor × health_factor
+    T2 (balance): base × (1 + depletion_penalty) × correction_factor
+    T3 (flat): MIN_EFFECTIVE_PRICE ($0.001/M)
+    T4 (included): MIN_EFFECTIVE_PRICE ($0.001/M)
+    T5 (per_token): base_rate (Kalman-measured, no time decay or balance factor)
+
+    The Kalman filter CONTINUES measuring real $/M from traffic. The tier formula
+    adjusts the EFFECTIVE cost for routing decisions only.
+
+    Args:
+        provider: provider name (e.g., "ours", "neuralwatt", "ppq")
+        base_rate: Kalman-measured base $/M rate for this provider
+        context: optional dict with pre-computed values:
+            - "quota_windows": list of window dicts (for T1)
+            - "depletion_penalty": float (for T2, overrides computation)
+            - "health_factor": float (for T1, overrides computation)
+            - "peak_factor": float (for T1, overrides computation)
+
+    Returns:
+        Effective $/M price, always >= MIN_EFFECTIVE_PRICE.
+        Returns float('inf') if the provider is exhausted/unavailable.
+    """
+    ctx = context or {}
+    tier = PROVIDER_TIER.get(provider, "per_token")  # default to per-token
+
+    try:
+        if tier == "quota":
+            # T1: z.ai keys — time-decay + quota-health + peak + health
+            if _is_time_decay_disabled():
+                # Kill switch: skip time-decay, use base × peak × health
+                peak_factor = ctx.get("peak_factor", _get_off_peak_factor())
+                health_factor = ctx.get("health_factor", 1.0)
+                effective = base_rate * peak_factor * health_factor
+            else:
+                time_decay = ctx.get("time_decay", _compute_time_decay(provider))
+                quota_health = ctx.get("quota_health", _compute_quota_health(provider))
+
+                # If quota exhausted, provider is unavailable
+                if quota_health <= 0.0:
+                    return float("inf")
+
+                peak_factor = ctx.get("peak_factor", _get_off_peak_factor())
+                health_factor = ctx.get("health_factor", 1.0)
+
+                if health_factor <= 0:
+                    return float("inf")
+
+                effective = base_rate * time_decay * quota_health * peak_factor * health_factor
+
+        elif tier == "balance":
+            # T2: NeuralWatt — depletion penalty + correction factor
+            depletion_penalty = ctx.get("depletion_penalty", _compute_depletion_penalty(provider))
+            effective = base_rate * (1.0 + depletion_penalty) * NW_CORRECTION_FACTOR
+
+        elif tier in ("flat", "included"):
+            # T3/T4: flat-rate / included — $0.001/M floor
+            effective = MIN_EFFECTIVE_PRICE
+
+        else:
+            # T5: per-token — Kalman-measured rate, no time decay
+            effective = base_rate
+
+        return max(MIN_EFFECTIVE_PRICE, effective)
+
+    except Exception:
+        # Never crash — return base_rate as safe fallback
+        return max(MIN_EFFECTIVE_PRICE, base_rate)
+
+
 # ── Cost evaluation ─────────────────────────────────────────────────────────
 
 def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium") -> float:
     """Get the effective $/M cost for a provider.
 
-    Uses the shadow optimizer's PriceKalman if available, falls back to
-    _get_provider_cost from zai_proxy, then to seed rates.
+    Uses the shadow optimizer's PriceKalman to get the base rate, then applies
+    the 5-tier time-aware pricing formula via compute_effective_price().
+
+    Falls back to seed rate with tier formula, then to raw seed rate.
     """
     try:
         # Try shadow optimizer first
@@ -301,7 +526,6 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
                 prov = shadow_opt._providers.get(name)
             if prov is not None:
                 pk = prov.get("price_kalman")
-                ck = prov.get("consumption_kalman")
                 quota_remaining = prov.get("quota_remaining", float("inf"))
                 quota_total = prov.get("quota_total")
                 failure_count = _get_failure_count(name)
@@ -330,19 +554,37 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
                 if math.isinf(health):
                     return float("inf")
 
-                effective = pk.effective_price(
-                    peak_mult=prov_peak, scarcity=scarcity,
-                    health=health, pace_mult=1.0)
+                # Get the Kalman-measured base rate ($/M)
+                base_rate = float(pk.predict())
+
+                # Build context for tier-specific computation
+                tier = PROVIDER_TIER.get(name, "per_token")
+                context: dict[str, Any] = {
+                    "health_factor": health if not math.isinf(health) else 0.0,
+                    "peak_factor": prov_peak,
+                }
+
+                # For per-token providers (T5), apply the existing Kalman
+                # effective_price multipliers (peak, scarcity, health) on top
+                # of the base rate — this preserves the original behavior.
+                if tier == "per_token":
+                    effective = pk.effective_price(
+                        peak_mult=prov_peak, scarcity=scarcity,
+                        health=health, pace_mult=1.0)
+                    return float(effective)
+
+                # For all other tiers, use compute_effective_price() which
+                # applies the tier-specific formula on top of the Kalman base.
+                effective = compute_effective_price(name, base_rate, context)
                 return float(effective)
     except Exception:
         pass
 
-    # Fall back to _get_provider_cost from zai_proxy
+    # Fall back: use seed rate with tier formula
     try:
-        cost_fn = _resolve("_get_provider_cost")
-        if cost_fn is not None:
-            model_id = model or "glm-5.2"
-            return float(cost_fn(name, model_id))
+        base_rate = _SEED_RATES.get(name, 999.0)
+        effective = compute_effective_price(name, base_rate)
+        return float(effective)
     except Exception:
         pass
 

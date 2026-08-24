@@ -1,9 +1,33 @@
 # Time-Aware Pricing Model for the Flat Router
 
-**Status:** DESIGN ONLY — awaiting Felix's review before implementation  
+**Status:** IMPLEMENTED — 5-tier pricing model live in flat_router.py  
 **Date:** 2026-08-24  
 **Author:** Hermes Agent (manager profile)  
 **Felix's insight:** "The ones with a quota have a reset at the end of the week and that any quota we don't burn gets wasted. So as we approach the end of the week, the price has to drop and we have to prefer that over the ones that don't have a quota. NeuralWatt doesn't have a quota, and once we've burnt that up, we need to pay per request. So, we need to price that in as well."
+
+## Implementation Notes (2026-08-24)
+
+### What was implemented
+- `PROVIDER_TIER` dict mapping each of 12 providers to their tier (`quota`, `balance`, `flat`, `included`, `per_token`)
+- `compute_effective_price(provider, base_rate, context)` function applying the tier-specific formula
+- `_compute_time_decay(name)` — reads `quota_cache` weekly window `resets_at` from zai_proxy
+- `_compute_quota_health(name)` — reads `used_pct` from weekly quota window
+- `_compute_depletion_penalty(name)` — reads `_neuralwatt_quota_snapshot()` for `remaining_usd` / `total_credits_usd`
+- `_get_off_peak_factor()` — returns 0.5 during off-peak hours (UTC 10:00–06:00), 1.0 during peak (UTC 06:00–10:00)
+- `_get_effective_cost()` modified to call `compute_effective_price()` for T1–T4 providers; T5 (per-token) retains original Kalman `effective_price()` path
+- Kill switches: `.disable_time_decay` and `.disable_depletion_penalty` flag files
+- Constants: `MIN_EFFECTIVE_PRICE=0.001`, `NW_CORRECTION_FACTOR=0.2762`, `NW_MAX_DEPLETION_PENALTY=2.0`
+
+### What was NOT changed
+- `select_provider()` core logic (still sorts by `effective_cost` ascending)
+- PriceKalman class (still measures real $/M from traffic)
+- Failover chain (candidate list IS the chain)
+- No caps or blocks (alert only — pricing changes routing preference, never blocks)
+
+### Test coverage
+- 60 new tests in `test_time_aware_pricing.py` covering all 5 tiers, helper functions, edge cases
+- 45 existing tests in `test_flat_router.py` continue to pass
+- Total: 105 tests pass
 
 ---
 

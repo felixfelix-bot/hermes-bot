@@ -1187,7 +1187,81 @@ decision = f(effective_rate, tasks_completed, profitability_ratio)
 
 ---
 
-## 11. Open Questions for Felix
+## 11. Per-Tier Pricing Approach (Felix's Clarification)
+
+Felix clarified that the LQG Kalman controller described in §2-3 is **ONLY for T1 (quota providers)**. Other provider types need different, simpler approaches — most of which are already implemented and correct as-is.
+
+The key insight: the controller's objective (exhaust quota just before reset) only makes sense when there's a hard capacity limit with a known reset time. Providers without that structure need different mechanisms — or none at all.
+
+### 11.1 T1 (quota — z.ai ours, friend): LQG CONTROLLER
+
+- **Hard capacity** (weekly quota from API), known reset time
+- **Objective**: exhaust quota just before reset (use-it-or-lose-it)
+- **Kalman as CONTROLLER**: adjusts price multiplier to steer consumption
+- **State**: `[burn_rate, velocity, acceleration]` from existing `ConsumptionKalman`
+- **Control**: `price_multiplier = LQR(burn_rate, remaining_quota, time_to_reset)`
+- **This is the ONLY tier where the controller runs**
+- **Status**: NOT yet shipped — needs Phase 0-2 implementation (§7)
+- **Current interim** (commit `7220cd3`): `$0.001 × max(0.0001, days_to_reset/7)` — sunk cost with time decay, no controller
+
+### 11.2 T2 (balance — NeuralWatt $100/mo): DEPLETION-AWARE PRICING (no controller)
+
+- **Known balance**, no weekly reset — once depleted, pay per token
+- **Price should INCREASE as balance depletes** (preserve remaining for high-value work)
+- **Formula**: `effective = base × (1 + depletion_penalty) × correction_factor`
+- **Already implemented** (commit `db88e0f`) — this is correct as-is
+- **No LQG controller needed** — no reset to optimize toward
+- **The question**: should we prefer NeuralWatt early in the month (balance fresh) and avoid it later (balance depleting)? **Yes** — the depletion penalty already handles this naturally. As balance depletes, price rises, traffic diverts to cheaper providers, and remaining balance is preserved for high-value requests that explicitly choose NeuralWatt.
+- **Correction factor**: 0.2762 (empirically calibrated, commit `db88e0f`)
+
+### 11.3 T3 (flat-rate — opencode_go $10/mo): STATIC FLOOR
+
+- **Unlimited (or unknown capacity)**, marginal cost $0
+- `effective = $0.001` always (when healthy)
+- **No controller, no time decay, no balance tracking**
+- **Health drops on 429/rate-limit** — that's the only signal that matters
+- **Already implemented** (commit `db88e0f`) — correct as-is
+
+### 11.4 T4 (included — ollama_cloud): STATIC FLOOR
+
+- Same as T3. Marginal cost $0, included in subscription.
+- `effective = $0.001` always (when healthy)
+- **Already implemented** (commit `db88e0f`) — correct as-is
+
+### 11.5 T5 (per-token — routstr, openrouter, deepinfra, ppq, telnyx): KALMAN OBSERVER
+
+- **No capacity, no reset, no balance**
+- **Price = measured actual cost per token** from traffic
+- **Kalman as OBSERVER** (current behavior) — tracks real $/M
+- **No controller needed** — no capacity to exhaust
+- **Already implemented** (commit `db88e0f`) — correct as-is
+
+### 11.6 Summary Table
+
+| Tier | Provider | Approach | Controller? | Already Shipped? |
+|------|----------|----------|-------------|-----------------|
+| T1 | z.ai | LQG controller | YES | No — needs Phase 0-2 |
+| T2 | NeuralWatt | Depletion penalty | No | Yes (db88e0f) |
+| T3 | opencode_go | Static $0.001 floor | No | Yes (db88e0f) |
+| T4 | ollama_cloud | Static $0.001 floor | No | Yes (db88e0f) |
+| T5 | routstr, etc. | Kalman observer | No | Yes (db88e0f) |
+
+### 11.7 Conclusion
+
+**Only T1 needs the new LQG controller.** T2-T5 are already correctly implemented with tonight's work (commit `db88e0f`). The transition plan (Phase 0-2, §7) should be scoped to **T1 only**.
+
+This simplifies the implementation significantly:
+- No controller logic needed for T2 (depletion penalty handles it)
+- No controller logic needed for T3/T4 (static floor is correct — unlimited or unknown capacity)
+- No controller logic needed for T5 (observer-only is correct — no capacity to exhaust)
+- The `CapacityController` class (§7.3) only needs to handle the T1 case
+- The profitability tracker (§5) still applies to all subscription providers (T1-T4)
+
+**Open Question §11.7 (old #7)**: The T2 "maximize value per token" question is now answered: the depletion penalty IS the mechanism. It naturally makes NeuralWatt more expensive as balance depletes, preserving remaining balance for high-value work. No separate controller needed.
+
+---
+
+## 12. Open Questions for Felix
 
 1. **T3/T4 controller**: Should we run the controller on opencode_go and ollama_cloud, or treat them as unlimited ($0.001 floor)? My recommendation: ollama_cloud YES (has known quota), opencode_go NO (treat as unlimited until we see throttling).
 
@@ -1201,7 +1275,7 @@ decision = f(effective_rate, tasks_completed, profitability_ratio)
 
 6. **Per-model profitability**: Should the profitability report break down by model within each provider? (e.g., "opencode_go served 400M tokens of glm-5.2 and 87M tokens of kimi-k3")? This would require joining `api_calls` on model.
 
-7. **Controller for NeuralWatt (T2)**: The controller's objective for T2 is different from T1. For T1, we want to exhaust the quota (it's free). For T2, we want to *not waste* the balance (it's prepaid, but we don't want to burn it on low-value tasks). Should the T2 controller optimize for "maximize value per token" rather than "exhaust balance by period end"?
+7. **Controller for NeuralWatt (T2)**: ~~The controller's objective for T2 is different from T1. For T1, we want to exhaust the quota (it's free). For T2, we want to *not waste* the balance (it's prepaid, but we don't want to burn it on low-value tasks). Should the T2 controller optimize for "maximize value per token" rather than "exhaust balance by period end"?~~ **ANSWERED in §11.2/§11.7**: No controller needed. The depletion penalty already handles this — as balance depletes, price rises, preserving remaining balance for high-value work.
 
 ---
 

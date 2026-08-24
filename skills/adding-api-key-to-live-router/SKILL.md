@@ -24,7 +24,7 @@ Documents the complete process of adding a new API provider to the flat routing 
 - The provider's model catalog and pricing information
 - The provider's model name mappings (if different from canonical names)
 
-## The 11 Steps
+## The Steps (11 + Step 2.5)
 
 ### Step 1: Add env vars
 
@@ -44,6 +44,60 @@ Add a loader branch in `_load_external_keys()` (line 505) for the new env var:
 elif line.startswith("NEWPROVIDER_API_KEY=") and "newprovider" not in keys:
     keys["newprovider"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
 ```
+
+### Step 2.5: Determine pricing model
+
+Before registering the provider, determine its pricing model by answering these questions. The answers determine which pricing tier (T1-T5) the provider gets and how the router prices it.
+
+**Questions to ask about the new provider:**
+
+1. **Is there a fixed quota or capacity?** (weekly / monthly / unlimited)
+   - z.ai: yes, weekly quota (T1)
+   - NeuralWatt: yes, monthly kWh (T2)
+   - opencode_go: no, unlimited (T3)
+   - ollama_cloud: yes, session + weekly (T4)
+   - PPQ, DeepInfra, OpenRouter: no, pay per token (T5)
+
+2. **Does unused capacity carry over to the next period?**
+   - z.ai: no, resets weekly
+   - NeuralWatt: unknown — DEFAULT: no carry-over (most prepaid plans don't)
+   - If yes → no time decay needed (use it whenever, it doesn't expire)
+   - If no → time decay applies (use-it-or-lose-it urgency, like T1)
+
+3. **What happens when capacity is exhausted?**
+   - z.ai: unavailable (health gate returns inf)
+   - NeuralWatt: pay-per-token at same rate (Phase B)
+   - opencode_go: rate-limited / 429
+   - ollama_cloud: unavailable until session/weekly reset
+
+4. **Is there a price increase after exhaustion?**
+   - NeuralWatt: NO — same rate, just not prepaid anymore
+   - If yes → depletion penalty model (old T2, now deprecated)
+   - If no → two-phase state machine (new T2): Phase A prepaid ($0.001), Phase B measured rate
+
+5. **What is the subscription cost?** (for profitability tracking)
+   - opencode_go: $10/mo
+   - NeuralWatt: $100/mo
+   - z.ai: $20/mo
+   - per-token providers: $0 (no subscription)
+   - This goes into `SUBSCRIPTION_COSTS` dict for the monthly profitability report
+
+6. **Is there a measured rate from the API?** (for cost tracking correction)
+   - NeuralWatt: yes, 0.2762 correction factor (API overcounts 3.6×)
+   - This applies to `_extract_cost()` (cost tracking), NOT to routing price
+   - The router should see the REAL marginal cost, not the overcounted cost
+
+**Decision matrix:**
+
+| Quota? | Carry-over? | After exhaustion | Tier | Pricing |
+|--------|-------------|-----------------|------|---------|
+| Weekly | No | Unavailable | T1 | $0.001 × time_decay (weekly) |
+| Monthly | No | Pay-per-token (same rate) | T2 | Phase A: $0.001 × time_decay (monthly), Phase B: measured rate |
+| Monthly | Yes | Pay-per-token (same rate) | T2 | Phase A: $0.001, Phase B: measured rate |
+| None | N/A | N/A | T3/T5 | $0.001 (flat) or measured rate (per-token) |
+| Session | No | Unavailable | T4 | $0.001 × time_decay (session) |
+
+Record the answers in the provider's config and proceed to Step 3.
 
 ### Step 3: Register in `EXTERNAL_PROVIDERS` dict
 

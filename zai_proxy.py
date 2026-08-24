@@ -3303,6 +3303,17 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 # Exhausted regime — no meaningful cost; let it stay NULL.
                 return (None, None)
             return ((total_tokens / 1_000_000) * rate, "estimated")
+        # 3b. opencode_go — flat-rate $10/mo Go plan. Responses have no cost
+        # field, but the opencode.ai dashboard meters usage at roughly
+        # $0.43/M blended equivalent (derived from dashboard Nutzungsverlauf:
+        # ~3M tokens ≈ $1.30 across mixed glm-5.3 sessions). Track the
+        # equivalent cost so burn is visible in daily_spend and the Kalman
+        # PriceKalman gets a real signal. Marginal cash cost remains $0
+        # (included in plan); this is the metered-equivalent burn against
+        # the plan's usage limits.
+        if provider == "opencode_go":
+            og_rate = 0.43  # $/M blended equivalent (dashboard-derived)
+            return ((total_tokens / 1_000_000) * og_rate, "estimated")
         # 4. telnyx — if no in-body cost was found (step 1), derive from
         # per-model rates × token breakdown so the balance collector (which
         # sums cost_usd) has a non-zero signal. Source = 'rate_derived'.

@@ -85,7 +85,7 @@ The governor now manages ALL profiles, not just `manager`:
 | `compression_growth_state.json` | Persisted Kalman state (auto-created on first run) |
 | `compression_growth_override.json` | Audit record of threshold decisions |
 | `compression_growth_health.py` | Health check / status report |
-| `test_compression_growth_governor.py` | Test suite (39 tests, 94% coverage) |
+| `test_compression_growth_governor.py` | Test suite (52 tests, 95% coverage) |
 
 ## Constants
 
@@ -95,7 +95,7 @@ The governor now manages ALL profiles, not just `manager`:
 | `G_BASELINE` | 1800 | Measured average growth rate (tokens/call) |
 | `G_MIN` / `G_MAX` | 200 / 20000 | Clamp bounds for growth estimate |
 | `K_SENSITIVITY` | 0.00004 | Control law gain |
-| `FALLBACK_THRESHOLD` | 0.40 | Base threshold; also used on any failure |
+| `FALLBACK_THRESHOLD` | 0.60 | Base threshold; also used on any failure (matches the 0.6 default in config.yaml) |
 | `MAX_THRESHOLD` | 0.70 | Upper clamp for threshold |
 | `MIN_THRESHOLD` | `64000 / context_length` | Dynamic floor (MINIMUM_CONTEXT_LENGTH) |
 | `HYSTERESIS` | 0.02 | Minimum delta to trigger config change |
@@ -122,13 +122,13 @@ threshold = FALLBACK_THRESHOLD + K_SENSITIVITY × (G_BASELINE − g_estimate)
 Clamped to `[MIN_THRESHOLD, MAX_THRESHOLD]` where
 `MIN_THRESHOLD = 64000 / context_length`.
 
-### Example outputs (context_length=200000, MIN=0.32)
+### Example outputs (context_length=200000, MIN=0.32, base=FALLBACK 0.60)
 
 | Growth rate | Description | Threshold |
 |-------------|-------------|-----------|
-| 200 | Sparse (Q&A) | 0.464 |
-| 1800 | Normal (baseline) | 0.400 |
-| 5000 | Dense (tool-heavy) | 0.328 |
+| 200 | Sparse (Q&A) | 0.664 |
+| 1800 | Normal (baseline) | 0.600 |
+| 5000 | Dense (tool-heavy) | 0.472 |
 | 10000+ | Very dense | 0.320 (floor) |
 
 ## Fallback Cascade

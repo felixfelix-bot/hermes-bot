@@ -2,11 +2,21 @@
 """Tests for the 5-tier time-aware pricing model in flat_router.py.
 
 Tests verify compute_effective_price() for each tier:
-  T1 (quota):   time-decay + quota-health + peak + health
+  T1 (quota):   SUNK COST model — $0.001 floor × time_decay × peak × health
+                quota_health GATES availability but does NOT multiply price.
   T2 (balance): depletion penalty + correction factor
   T3 (flat):    MIN_EFFECTIVE_PRICE floor
   T4 (included): MIN_EFFECTIVE_PRICE floor
   T5 (per_token): base rate, no time decay
+
+T1 corrected formula (Felix's insight):
+  - z.ai quota is a SUNK COST (already paid for) → marginal cost = $0
+  - effective = MIN_EFFECTIVE_PRICE × max(0.0001, days_to_reset/7) × peak × health
+  - At 7 days:  $0.001 × 1.0 = $0.001 (same as T3/T4)
+  - At 3 days:  $0.001 × 0.43 = $0.00043 (prefer z.ai over per-token)
+  - At 1 day:   $0.001 × 0.14 = $0.00014 (strongly prefer z.ai)
+  - At 100% used: inf (unavailable, failover)
+  - After reset: back to $0.001 (fresh quota)
 """
 import os
 import sys
@@ -39,51 +49,87 @@ from flat_router import (
 )
 
 
-# ── T1: Quota-Based Providers (ours, friend) ───────────────────────────────
+# ── T1: Quota-Based Providers (ours, friend) — SUNK COST MODEL ─────────────
 
-class TestTier1Quota:
-    """Test T1 quota-based pricing: ours, friend."""
+class TestTier1QuotaSunkCost:
+    """Test T1 quota-based pricing with the CORRECTED sunk-cost formula.
 
-    def test_full_quota_full_week(self):
-        """7 days to reset, 0% used → full price × peak × health."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
-            "time_decay": 1.0,
+    effective = MIN_EFFECTIVE_PRICE × max(0.0001, time_decay) × peak × health
+    quota_health GATES availability (inf) but does NOT multiply price.
+    """
+
+    def test_start_of_week_full_quota(self):
+        """7 days to reset, 0% used → effective = $0.001 (same as T3/T4).
+
+        At the start of the week, z.ai quota is fresh and available.
+        The price is $0.001/M — same as flat-rate providers.
+        This is CORRECT: z.ai is NOT expensive (sunk cost), but not preferential
+        over other free providers either.
+        """
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": 1.0,      # 7 days / 7
+            "quota_health": 1.0,    # 0% used (gates only, not multiplier)
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        assert result == pytest.approx(MIN_EFFECTIVE_PRICE, rel=1e-6)
+
+    def test_3_days_to_reset(self):
+        """3 days to reset → effective = $0.001 × 0.43 = $0.00043.
+
+        As reset approaches, z.ai becomes CHEAPER than T3/T4 ($0.001).
+        This is the use-it-or-lose-it urgency: prefer z.ai over paying providers.
+        """
+        time_decay = 3.0 / 7.0  # ~0.4286
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": time_decay,
             "quota_health": 1.0,
             "peak_factor": 1.0,
             "health_factor": 1.0,
         })
-        assert result == pytest.approx(base, rel=1e-6)
-
-    def test_half_week_half_used(self):
-        """3.5 days to reset, 50% used → base × 0.5 × 0.5 = 0.25 × base."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
-            "time_decay": 0.5,
-            "quota_health": 0.5,
-            "peak_factor": 1.0,
-            "health_factor": 1.0,
-        })
-        assert result == pytest.approx(base * 0.25, rel=1e-6)
-
-    def test_near_reset_low_usage(self):
-        """1 day to reset, 20% used → aggressive discount."""
-        base = 0.068
-        time_decay = 1.0 / 7.0  # ~0.143
-        quota_health = 0.8
-        result = compute_effective_price("ours", base, context={
-            "time_decay": time_decay,
-            "quota_health": quota_health,
-            "peak_factor": 1.0,
-            "health_factor": 1.0,
-        })
-        expected = base * time_decay * quota_health
+        expected = MIN_EFFECTIVE_PRICE * time_decay
         assert result == pytest.approx(expected, rel=1e-6)
+        assert result < MIN_EFFECTIVE_PRICE, "3 days to reset should be cheaper than T3/T4"
+
+    def test_1_day_to_reset(self):
+        """1 day to reset → effective ≈ $0.00014 (strongly prefer z.ai)."""
+        time_decay = 1.0 / 7.0  # ~0.1429
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": time_decay,
+            "quota_health": 1.0,
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        expected = MIN_EFFECTIVE_PRICE * time_decay
+        assert result == pytest.approx(expected, rel=1e-6)
+        assert result < MIN_EFFECTIVE_PRICE * 0.2, "1 day to reset should be < 20% of floor"
+
+    def test_1_hour_to_reset(self):
+        """1 hour to reset → effective ≈ $0.000006 (aggressively burn remaining quota)."""
+        time_decay = (1.0 / 24.0) / 7.0  # ~0.00595
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": time_decay,
+            "quota_health": 1.0,
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        expected = MIN_EFFECTIVE_PRICE * time_decay
+        assert result == pytest.approx(expected, rel=1e-4)
+        assert result < 0.00001, "1 hour to reset should be near-zero"
+
+    def test_after_reset_back_to_floor(self):
+        """After reset (7 fresh days) → back to $0.001 (fresh quota)."""
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": 1.0,      # 7 days to reset (fresh)
+            "quota_health": 1.0,
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        assert result == pytest.approx(MIN_EFFECTIVE_PRICE, rel=1e-6)
 
     def test_quota_exhausted_returns_inf(self):
         """100% used → quota_health = 0 → inf (unavailable)."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
+        result = compute_effective_price("ours", 0.068, context={
             "time_decay": 0.5,
             "quota_health": 0.0,
             "peak_factor": 1.0,
@@ -93,8 +139,7 @@ class TestTier1Quota:
 
     def test_health_zero_returns_inf(self):
         """health_factor = 0 → inf (unavailable)."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
+        result = compute_effective_price("ours", 0.068, context={
             "time_decay": 1.0,
             "quota_health": 1.0,
             "peak_factor": 1.0,
@@ -104,36 +149,102 @@ class TestTier1Quota:
 
     def test_off_peak_reduces_price(self):
         """Off-peak factor 0.5 should halve the effective price."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
+        result = compute_effective_price("ours", 0.068, context={
             "time_decay": 1.0,
             "quota_health": 1.0,
-            "peak_factor": 0.5,  # off-peak
-            "health_factor": 1.0,
-        })
-        assert result == pytest.approx(base * 0.5, rel=1e-6)
-
-    def test_friend_same_formula(self):
-        """friend should use same formula as ours (different base rate)."""
-        base = 0.082
-        result = compute_effective_price("friend", base, context={
-            "time_decay": 0.5,
-            "quota_health": 0.5,
-            "peak_factor": 1.0,
-            "health_factor": 1.0,
-        })
-        assert result == pytest.approx(base * 0.25, rel=1e-6)
-
-    def test_floor_applied(self):
-        """Result should never go below MIN_EFFECTIVE_PRICE."""
-        base = 0.068
-        result = compute_effective_price("ours", base, context={
-            "time_decay": 0.01,
-            "quota_health": 0.01,
             "peak_factor": 0.5,
             "health_factor": 1.0,
         })
-        assert result >= MIN_EFFECTIVE_PRICE
+        assert result == pytest.approx(MIN_EFFECTIVE_PRICE * 0.5, rel=1e-6)
+
+    def test_friend_same_formula(self):
+        """friend should use same formula as ours (same floor, same decay)."""
+        result = compute_effective_price("friend", 0.082, context={
+            "time_decay": 0.5,
+            "quota_health": 1.0,
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        expected = MIN_EFFECTIVE_PRICE * 0.5
+        assert result == pytest.approx(expected, rel=1e-6)
+
+    def test_base_rate_irrelevant(self):
+        """The base_rate should NOT affect T1 pricing (sunk cost = $0)."""
+        r1 = compute_effective_price("ours", 0.001, context={
+            "time_decay": 1.0, "quota_health": 1.0,
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        r2 = compute_effective_price("ours", 999.0, context={
+            "time_decay": 1.0, "quota_health": 1.0,
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        assert r1 == pytest.approx(r2, rel=1e-6), "Base rate must not affect T1 price"
+
+    def test_quota_health_does_not_penalize(self):
+        """Using quota should NOT increase price (no conservation penalty).
+
+        50% used and 0% used at same time_decay should have the SAME price.
+        quota_health only gates availability (0 → inf), not price.
+        """
+        r_fresh = compute_effective_price("ours", 0.068, context={
+            "time_decay": 0.5, "quota_health": 1.0,  # 0% used
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        r_half = compute_effective_price("ours", 0.068, context={
+            "time_decay": 0.5, "quota_health": 0.5,  # 50% used
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        assert r_fresh == pytest.approx(r_half, rel=1e-6), \
+            "Using quota must NOT penalize price (no conservation)"
+
+    def test_cheaper_than_per_token_providers(self):
+        """T1 at any time_decay < 1.0 should be cheaper than T5 per-token ($0.80+)."""
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": 0.5, "quota_health": 1.0,
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        ppq_cost = compute_effective_price("ppq", 0.80)
+        assert result < ppq_cost, "z.ai should be cheaper than PPQ ($0.80/M)"
+
+    def test_at_floor_same_as_t3_t4(self):
+        """At start of week, T1 should cost the same as T3/T4 ($0.001)."""
+        t1 = compute_effective_price("ours", 0.068, context={
+            "time_decay": 1.0, "quota_health": 1.0,
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        t3 = compute_effective_price("opencode_go", 0.43)
+        t4 = compute_effective_price("ollama_cloud", 0.40)
+        assert t1 == pytest.approx(t3, rel=1e-6)
+        assert t1 == pytest.approx(t4, rel=1e-6)
+
+    def test_decay_floor_prevents_zero(self):
+        """Time-decay floor of 0.0001 should prevent true $0."""
+        result = compute_effective_price("ours", 0.068, context={
+            "time_decay": 0.0,  # 0 days to reset
+            "quota_health": 1.0,
+            "peak_factor": 1.0,
+            "health_factor": 1.0,
+        })
+        assert result > 0, "Effective price must never be exactly $0"
+        assert result == pytest.approx(MIN_EFFECTIVE_PRICE * 0.0001, rel=1e-6)
+
+    def test_kill_switch_returns_floor(self):
+        """Kill switch (time-decay disabled) should return $0.001 floor."""
+        with patch("flat_router._is_time_decay_disabled", return_value=True):
+            result = compute_effective_price("ours", 0.068, context={
+                "peak_factor": 1.0,
+                "health_factor": 1.0,
+            })
+            assert result == pytest.approx(MIN_EFFECTIVE_PRICE, rel=1e-6)
+
+    def test_kill_switch_health_zero(self):
+        """Kill switch with health=0 should return inf."""
+        with patch("flat_router._is_time_decay_disabled", return_value=True):
+            result = compute_effective_price("ours", 0.068, context={
+                "peak_factor": 1.0,
+                "health_factor": 0.0,
+            })
+            assert math.isinf(result)
 
 
 # ── T2: Balance-Based Provider (neuralwatt) ────────────────────────────────
@@ -460,6 +571,52 @@ class TestGetEffectiveCostWithTiers:
         """Unknown provider should default to per-token tier."""
         result = compute_effective_price("unknown_provider", 1.5)
         assert result == pytest.approx(1.5, rel=1e-6)
+
+
+# ── T1 Sunk-Cost Model: Before/After comparison tests ──────────────────────
+
+class TestTier1SunkCostComparison:
+    """Verify the corrected T1 formula matches Felix's intent.
+
+    OLD (WRONG): base_rate × time_decay × quota_health × peak × health
+        At start of week: 0.068 × 1.0 × 1.0 = $0.068/M (EXPENSIVE — router avoids z.ai!)
+
+    NEW (CORRECT): MIN_EFFECTIVE_PRICE × max(0.0001, time_decay) × peak × health
+        At start of week: 0.001 × 1.0 = $0.001/M (CHEAP — same as T3/T4, sunk cost)
+    """
+
+    def test_old_formula_was_expensive_at_start_of_week(self):
+        """OLD formula: base × 1.0 × 1.0 = $0.068/M — MORE expensive than PPQ ($0.80).
+
+        This test documents WHY the old formula was wrong:
+        z.ai at $0.068/M would lose to opencode_go ($0.001) AND be close to PPQ ($0.80).
+        The router would avoid z.ai at the start of the week — backwards!
+        """
+        old_formula = 0.068 * 1.0 * 1.0 * 1.0 * 1.0  # base × decay × health × peak × health
+        new_formula = MIN_EFFECTIVE_PRICE * 1.0 * 1.0 * 1.0  # floor × decay × peak × health
+        assert old_formula > new_formula, "New formula should be cheaper at start of week"
+        assert old_formula > MIN_EFFECTIVE_PRICE, "Old formula was more expensive than T3/T4 floor"
+
+    def test_new_formula_cheaper_than_per_token(self):
+        """NEW formula: z.ai is ALWAYS cheaper than per-token providers when available."""
+        # Even at start of week (time_decay = 1.0)
+        zai_cost = compute_effective_price("ours", 0.068, context={
+            "time_decay": 1.0, "quota_health": 1.0,
+            "peak_factor": 1.0, "health_factor": 1.0,
+        })
+        ppq_cost = compute_effective_price("ppq", 0.80)
+        assert zai_cost < ppq_cost, "z.ai should always be cheaper than PPQ"
+
+    def test_new_formula_uses_001_floor_not_base_rate(self):
+        """The corrected formula uses $0.001 as the base, NOT the Kalman base_rate."""
+        # With time_decay=1.0, effective should be exactly $0.001 regardless of base_rate
+        for base in [0.001, 0.068, 1.0, 100.0]:
+            result = compute_effective_price("ours", base, context={
+                "time_decay": 1.0, "quota_health": 1.0,
+                "peak_factor": 1.0, "health_factor": 1.0,
+            })
+            assert result == pytest.approx(MIN_EFFECTIVE_PRICE, rel=1e-6), \
+                f"base_rate={base} should not affect T1 price"
 
 
 if __name__ == "__main__":

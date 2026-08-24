@@ -436,7 +436,11 @@ def compute_effective_price(
 
     This applies the tier-specific formula from the time-aware pricing design:
 
-    T1 (quota): base × (days_to_reset/7) × (1 - used_pct/100) × peak_factor × health_factor
+    T1 (quota): MIN_EFFECTIVE_PRICE × max(0.0001, time_decay) × peak_factor × health_factor
+                — SUNK COST model: quota is already paid for, marginal cost = $0.
+                time_decay = days_to_reset / 7 (use-it-or-lose-it urgency).
+                quota_health GATES availability (inf when exhausted) but does NOT
+                multiply the price — using quota should never be penalized.
     T2 (balance): base × (1 + depletion_penalty) × correction_factor
     T3 (flat): MIN_EFFECTIVE_PRICE ($0.001/M)
     T4 (included): MIN_EFFECTIVE_PRICE ($0.001/M)
@@ -453,9 +457,12 @@ def compute_effective_price(
             - "depletion_penalty": float (for T2, overrides computation)
             - "health_factor": float (for T1, overrides computation)
             - "peak_factor": float (for T1, overrides computation)
+            - "time_decay": float (for T1, overrides computation)
+            - "quota_health": float (for T1, overrides computation)
 
     Returns:
-        Effective $/M price, always >= MIN_EFFECTIVE_PRICE.
+        Effective $/M price. T1 can go below MIN_EFFECTIVE_PRICE (time-decay).
+        T2-T5 are always >= MIN_EFFECTIVE_PRICE.
         Returns float('inf') if the provider is exhausted/unavailable.
     """
     ctx = context or {}
@@ -463,12 +470,27 @@ def compute_effective_price(
 
     try:
         if tier == "quota":
-            # T1: z.ai keys — time-decay + quota-health + peak + health
+            # T1: z.ai keys — SUNK COST model with time-decay on $0 floor
+            #
+            # Quota is already paid for → marginal cost = $0 when available.
+            # effective_price = MIN_EFFECTIVE_PRICE × max(0.0001, time_decay) × peak × health
+            #
+            # time_decay = days_to_reset / 7 (use-it-or-lose-it urgency):
+            #   - 7 days to reset: 1.0 → effective = $0.001 (same as T3/T4)
+            #   - 3 days:         0.43 → effective = $0.00043 (prefer z.ai)
+            #   - 1 day:          0.14 → effective = $0.00014 (strongly prefer)
+            #   - 1 hour:         0.006 → effective = $0.000006 (aggressively burn)
+            #   - At reset: jumps back to 1.0 (fresh quota, new week)
+            #
+            # quota_health GATES availability (inf when exhausted) but does NOT
+            # multiply the price — using quota should never be penalized.
             if _is_time_decay_disabled():
-                # Kill switch: skip time-decay, use base × peak × health
+                # Kill switch: flat $0.001 floor (same as T3/T4)
                 peak_factor = ctx.get("peak_factor", _get_off_peak_factor())
                 health_factor = ctx.get("health_factor", 1.0)
-                effective = base_rate * peak_factor * health_factor
+                if health_factor <= 0:
+                    return float("inf")
+                effective = MIN_EFFECTIVE_PRICE * peak_factor * health_factor
             else:
                 time_decay = ctx.get("time_decay", _compute_time_decay(provider))
                 quota_health = ctx.get("quota_health", _compute_quota_health(provider))
@@ -483,7 +505,11 @@ def compute_effective_price(
                 if health_factor <= 0:
                     return float("inf")
 
-                effective = base_rate * time_decay * quota_health * peak_factor * health_factor
+                # SUNK COST: $0.001 floor × time-decay × peak × health
+                # NOT: base_rate × time_decay × quota_health × ...
+                # Using quota is FREE (sunk cost) — time_decay creates urgency.
+                decay_floor = max(0.0001, time_decay)
+                effective = MIN_EFFECTIVE_PRICE * decay_floor * peak_factor * health_factor
 
         elif tier == "balance":
             # T2: NeuralWatt — depletion penalty + correction factor
@@ -498,6 +524,12 @@ def compute_effective_price(
             # T5: per-token — Kalman-measured rate, no time decay
             effective = base_rate
 
+        # T1 (quota): NO global floor — time-decay can go below MIN_EFFECTIVE_PRICE.
+        # The decay_floor = max(0.0001, time_decay) already prevents true $0.
+        if tier == "quota":
+            return effective
+
+        # T2-T5: apply global floor
         return max(MIN_EFFECTIVE_PRICE, effective)
 
     except Exception:

@@ -371,12 +371,10 @@ def _make_dispatch_fn(name: str) -> Callable | None:
     Returns a callable that, when invoked with (handler, body, model, buffer, t0),
     calls the right _try_* method on the handler.
     """
-    # z.ai keys → z.ai upstream proxy (handled by the retry loop in _proxy)
+    # z.ai keys → _try_zai_key (extracted from the old retry loop in _proxy)
     if name in ("ours", "friend"):
         def _dispatch_zai(handler, body, model, buffer, t0):
-            # z.ai keys are handled by the existing retry loop, not a _try_* method.
-            # Return False here — the actual dispatch happens in _proxy's retry loop.
-            return False
+            return handler._try_zai_key(name, body, model, buffer, t0)
         return _dispatch_zai
 
     # ollama_cloud → _try_ollama_cloud_any

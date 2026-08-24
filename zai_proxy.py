@@ -4318,6 +4318,16 @@ class Handler(BaseHTTPRequestHandler):
 
         # OpenCode Go uses bare model IDs (glm-5.2, glm-5.3, kimi-k3, etc.)
         og_model = model or "glm-5.2"
+        # MODEL-TRANSLATION: Translate prefixed model names to bare IDs that
+        # opencode.ai expects. The early-exit path at line ~4939 passes the raw
+        # model name (e.g. "deepseek/deepseek-v4-flash") but opencode.ai only
+        # accepts the bare form ("deepseek-v4-flash"). Without this translation,
+        # opencode.ai rejects the request and it falls through to NeuralWatt
+        # ($1.43/M) instead of opencode_go ($0 marginal). The flat router's
+        # _resolve_model_for_provider() already does this correctly, but the
+        # early-exit path bypasses it. See design doc §9.
+        _oc_model_map = _PROVIDER_MODEL_NAMES.get("opencode_go", {})
+        og_model = _oc_model_map.get(og_model, og_model)
         # glm-5.3 stays as glm-5.3 — OpenCode Go serves it natively.
 
         try:

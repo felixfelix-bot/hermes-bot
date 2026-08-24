@@ -3402,36 +3402,23 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                     + completion_toks * output_rate
                 ) / 1_000_000
                 cost_source = "cached_rate_derived" if cached_toks > 0 else "rate_derived"
-                # NW-CORRECTION: Apply the NeuralWatt cost correction factor
-                # (3.6x overcounting fix). NeuralWatt uses energy-based pricing
-                # with ~94% cached prompt tokens at 5x discount; our per-token
-                # estimate overcounts by ~3.6x. The correction factor (~0.2762)
-                # is cached 10 min from /v1/usage/summary totals. This must be
-                # applied here (not just in _estimate_cost_usd) so that
-                # api_calls.cost_usd, daily_spend, and Kalman measurements are
-                # all corrected. Without this, recorded spend is inflated 3.6x
-                # and the Kalman learns an artificially high base_rate.
-                # See design doc §8.
-                if _neuralwatt_cost_correction_fn is not None:
-                    try:
-                        nw_correction = float(_neuralwatt_cost_correction_fn() or 1.0)
-                        raw_cost = raw_cost * nw_correction
-                    except Exception:
-                        pass
+                # NW-CORRECTION: NeuralWatt overcounts usage by 3.6x (energy-based
+                # pricing with cached token discounts not reflected in per-token
+                # model). Hardcoded 0.2762 correction (1/3.6) — the lazy-loaded
+                # function approach failed at runtime due to import scope /
+                # threading issues. See design doc §8.
+                nw_correction = 0.2762
+                raw_cost = raw_cost * nw_correction
                 return (raw_cost, cost_source)
             # Fallback: blended rate for the provider (still better than NULL)
             rate = _rpt_rate("neuralwatt")
             if rate == float("inf") or rate <= 0:
                 return (None, None)
             raw_cost = (total_tokens / 1_000_000) * rate
-            # NW-CORRECTION: Also apply correction to the fallback blended rate
-            # path for consistency (see comment above).
-            if _neuralwatt_cost_correction_fn is not None:
-                try:
-                    nw_correction = float(_neuralwatt_cost_correction_fn() or 1.0)
-                    raw_cost = raw_cost * nw_correction
-                except Exception:
-                    pass
+            # NW-CORRECTION: Also apply hardcoded correction to the fallback
+            # blended rate path for consistency (see comment above).
+            nw_correction = 0.2762
+            raw_cost = raw_cost * nw_correction
             return (raw_cost, "rate_derived")
         # 4c. Catch-all fallback — for ANY provider without a specific branch
         # above (e.g. routstr, routstrd, deepinfra, ppq, openrouter,

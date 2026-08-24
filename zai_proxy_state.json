@@ -1,36 +1,23 @@
 {
   "ours": {
-    "max_pct": 0,
+    "max_pct": 100,
     "windows": [
-      {
-        "name": "unknown",
-        "type": "TOKENS_LIMIT",
-        "used_pct": 0,
-        "resets_at": 0,
-        "window_hours": 0
-      }
-    ],
-    "age_s": 0
-  },
-  "friend": {
-    "max_pct": 41,
-    "windows": [
-      {
-        "name": "monthly",
-        "type": "TIME_LIMIT",
-        "used_pct": 1,
-        "resets_at": 1787055492,
-        "window_hours": 720
-      },
       {
         "name": "5-hour",
-        "type": "TOKENS_LIMIT",
-        "used_pct": 41,
-        "resets_at": 1785319048,
+        "type": "CREDIT_LIMIT",
+        "used_pct": 0,
+        "resets_at": 0,
         "window_hours": 5
+      },
+      {
+        "name": "weekly",
+        "type": "CREDIT_LIMIT",
+        "used_pct": 100,
+        "resets_at": 1787838478,
+        "window_hours": 168
       }
     ],
     "age_s": 0
   },
-  "active": "ours"
+  "active": "friend"
 }

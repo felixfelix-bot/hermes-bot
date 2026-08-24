@@ -3433,6 +3433,18 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 except Exception:
                     pass
             return (raw_cost, "rate_derived")
+        # 4c. Catch-all fallback — for ANY provider without a specific branch
+        # above (e.g. routstr, routstrd, deepinfra, ppq, openrouter,
+        # ollama_cloud_2, and any future provider), derive cost from the
+        # Kalman-measured $/M rate × total_tokens. These providers don't
+        # return a cost field in their response body (so step 1 misses them)
+        # and don't have a dedicated extraction branch, so without this they
+        # fell through to (None, None) → api_calls.cost_usd stayed NULL →
+        # invisible burn. This prevents that for ALL current and future
+        # no-branch providers. Source = 'rate_derived_fallback'.
+        rate = _rpt_rate(provider)
+        if rate is not None and rate > 0 and rate != float("inf"):
+            return ((total_tokens / 1_000_000) * rate, "rate_derived_fallback")
         # 5. Unknown / unhandled provider.
         return (None, None)
     except Exception:

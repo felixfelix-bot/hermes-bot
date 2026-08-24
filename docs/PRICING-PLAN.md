@@ -70,6 +70,7 @@ Three critical issues were discovered on 2026-08-24:
 | NeuralWatt correction in _extract_cost | `dcb648c` |
 | deepseek model translation in _try_opencode_go | `a346900` |
 | Catch-all cost extraction fallback | `a41ed60` |
+| _log_api_call cost safety net | THIS COMMIT |
 | Provider onboarding Step 2.5 (pricing questions) | `fd61800` (skill) |
 
 ---
@@ -87,7 +88,7 @@ Three critical issues were discovered on 2026-08-24:
 
 ## 5. Known Issues Remaining
 
-1. **Streaming SSE total_tokens=0** — Streaming responses pass `total_tokens=0` to `_extract_cost`, causing 33% NULL for opencode_go and 99% NULL for ollama_cloud_2. Root cause of remaining invisible burn.
+1. **~~Streaming SSE total_tokens=0~~** — FIXED. `_log_api_call` now has a cost safety net: if cost_usd is None and key_name is a known provider, it computes an estimated cost via `_estimate_cost_usd()` before insert. This ensures cost_usd is NEVER NULL for known providers. Historical NULL rows were backfilled via `scripts/backfill_null_costs.py` (7550 rows, $120.06 recovered).
 
 2. **routstr_probe.py broken** — Daily cost probe fails: routstr returns 401 (stale key), routstrd returns 405 (daemon API changed). No measured rates for the Kalman to learn from for T5 providers.
 
@@ -136,3 +137,4 @@ Three critical issues were discovered on 2026-08-24:
 6. **LQG controller is T1-only** — Only quota providers have hard capacity + known reset time. T3/T4 (unlimited/included) and T5 (per-token) don't need a controller.
 7. **Profitability tracking is decoupled from pricing** — `subscription_profitability` table is a reporting metric for monthly renewal decisions, NOT a pricing input. This breaks the vicious circle.
 8. **Catch-all cost extraction** — Any provider without a specific `_extract_cost()` branch gets `cost = _rpt_rate(provider) × tokens`. Safety net against future invisible burn.
+9. **_log_api_call cost safety net** — Even when `_extract_cost()` returns (None, None) (parse failure, streaming SSE with zero tokens, missing model rate), `_log_api_call` computes an estimated cost via `_estimate_cost_usd()` before inserting. This is the FINAL safety net — it guarantees cost_usd is NEVER NULL for any known provider, regardless of upstream gaps. Source = 'estimated'.

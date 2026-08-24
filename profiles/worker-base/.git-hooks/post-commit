@@ -1,0 +1,27 @@
+#!/bin/bash
+# post-commit hook: advisory push reminder
+# Counts commits since last push and reminds if >5
+# This is advisory only — it does NOT block or auto-push
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ -z "$branch" ]; then
+    exit 0
+fi
+
+# Count commits on this branch that are not on any remote tracking branch
+remote_ref=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
+if [ -n "$remote_ref" ]; then
+    unpushed=$(git log --oneline "${remote_ref}..HEAD" 2>/dev/null | wc -l)
+else
+    # No upstream set — count all commits on this branch
+    unpushed=$(git log --oneline HEAD 2>/dev/null | wc -l)
+fi
+
+if [ "$unpushed" -gt 5 ]; then
+    echo "" >&2
+    echo "  reminder: you have ${unpushed} unpushed commits on branch '${branch}'" >&2
+    echo "  consider running: git push origin ${branch}" >&2
+    echo "" >&2
+fi
+
+exit 0

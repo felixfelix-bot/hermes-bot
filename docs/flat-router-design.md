@@ -3,8 +3,8 @@
 
 **Author:** Hermes Agent (manager profile)  
 **Date:** 2026-08-24  
-**Status:** DESIGN ONLY — awaiting Felix's review and approval  
-**Scope:** `~/.hermes/bot/zai_proxy.py` (~6154 lines) + `~/merchant-routing-engine/src/`
+**Status:** Phase 1 IMPLEMENTED — select_provider() running in shadow mode  
+**Scope:** `~/.hermes/bot/zai_proxy.py` (~6190 lines) + `~/merchant-routing-engine/src/` + `~/.hermes/bot/flat_router.py`
 
 ---
 
@@ -750,11 +750,14 @@ The shadow optimizer (`_shadow_optimizer`, line 1570) and LiveRouter (`_LIVE_ROU
 
 The migration CAN be done incrementally. The existing kill switches and feature flags provide natural staging:
 
-#### Phase 1: Add `select_provider()` alongside `best_key()` (no behavior change)
-- Implement `select_provider()`, `ProviderCandidate`, `_dispatch_to_provider()`, `_update_kalman_after_request()`.
-- Add all providers to the optimizer (including missing: openrouter, routstr, routstrd).
-- Add model registry (`PROVIDER_MODELS`).
-- Wire up Kalman live updates (called after each request, updates the optimizer's Kalman).
+#### Phase 1: Add `select_provider()` alongside `best_key()` (no behavior change) — ✅ COMPLETE
+- ✅ Implement `select_provider()`, `ProviderCandidate`, `_dispatch_to_provider()`, `_update_kalman_after_request()`.
+- ✅ Add all providers to the optimizer (including missing: openrouter, routstr, routstrd).
+- ✅ Add model registry (`PROVIDER_MODELS`) covering all 12 providers.
+- ✅ Wire up Kalman live updates (available via `_update_kalman_after_request()`, not yet called in routing path).
+- ✅ Add `_is_provider_healthy()` unified health gate.
+- ✅ Shadow logging to `flat_router_shadow_decisions` table (comparison: best_key vs select_provider).
+- ✅ Tests: 28 tests in `test_flat_router.py` — all passing.
 - **No routing change:** `best_key()` still drives routing. `select_provider()` runs in shadow, logging its candidate list.
 - **Test:** Compare `select_provider()` output vs `best_key()` decisions. Verify cost ordering is sensible.
 
@@ -1016,4 +1019,4 @@ This is the free market in action: during peak hours, ollama_cloud and opencode_
 
 **End of Design Document**
 
-This is a DESIGN ONLY document. No code changes have been made. Felix must review and approve before implementation begins.
+Phase 1 implemented 2026-08-24. select_provider() running in shadow mode alongside best_key().

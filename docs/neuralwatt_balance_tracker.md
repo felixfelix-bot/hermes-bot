@@ -422,3 +422,50 @@ All NeuralWatt bridge code in the proxy is revert-safe:
 - `TestDefaultUsageDbPath` — env resolution
 
 All HTTP is mocked — no live API calls in tests.
+
+---
+
+## Cost Tracking Fixes (2026-08-24)
+
+### Kalman Zero-Burn Guard
+
+**Problem:** `cost_outlier_detector.py` fired false "routing_inefficiency"
+alerts when `kalman_samples.burn_rate_tph == 0.0`. The ratio was
+`actual_spend / $0.0001` → 18x/61x/79x/16600x — pure noise from division
+by near-zero.
+
+**Fix:** Added a guard in `detect_cost_outliers()` — when
+`burn_rate_tph == 0.0`, the Kalman composition is skipped entirely.
+The `classify_discrepancy()` function is unchanged (the guard is upstream).
+
+**Files:** `src/cost_outlier_detector.py`, `tests/test_cost_outlier_detector.py`
+(+2 tests: `test_kalman_zero_burn_no_routing_inefficiency`,
+`test_classify_zero_expected_still_works`)
+
+### Escalation Check Zero-Burn Guard
+
+**Problem:** `cost-escalation-check.py` surfaced `inefficient_routing` alerts
+from `anomaly_events` without checking whether the Kalman burn rate was zero.
+
+**Fix:** Added a `burn_rate_tph` query before the anomaly_events section.
+When `burn_rate_tph == 0.0`, the section is skipped (same rationale as above).
+
+**File:** `~/.hermes/profiles/manager/scripts/cost-escalation-check.py`
+
+### Abnormal Burn Alert (NeuralWatt)
+
+**New:** If NeuralWatt real daily spend exceeds 3× the 7-day rolling average,
+an alert is surfaced: `🔥 ABNORMAL BURN: NeuralWatt ${X} today vs 7-day avg
+${Y} (Zx ratio)`. This is **ALERT ONLY** — no blocking, no capping.
+
+**File:** `~/.hermes/profiles/manager/scripts/cost-escalation-check.py`
+
+### Kalman Health — KEYS Tuple
+
+**Problem:** `kalman_health.py` only tracked the friend key
+(`KEYS = ("friend",)`), not ours. This caused Kalman predictions to be
+stale/zero for our primary key.
+
+**Fix:** Changed to `KEYS = ("friend", "ours")`.
+
+**File:** `~/.hermes/bot/kalman_health.py`

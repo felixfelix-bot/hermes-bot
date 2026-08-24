@@ -88,9 +88,9 @@ else:
     _IMPORT_ERR = None
 
 DB_PATH = os.path.expanduser("~/.hermes/bot/zai_usage.db")
-# 'ours' removed 2026-08-15: key deactivated at z.ai, zero usage rows ever since.
-# Scoring it only produced "insufficient_data" noise. Re-add if the key returns.
-KEYS = ("friend",)
+# 'ours' re-added 2026-08-24: key reactivated. Without tracking it,
+# Kalman predictions are stale/zero for our primary key.
+KEYS = ("friend", "ours")
 WARMUP = 3  # discard first N steps before scoring (filter needs to lock on)
 
 # ── convergence verdict thresholds ───────────────────────────────────────────

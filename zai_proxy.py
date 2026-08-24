@@ -1628,6 +1628,32 @@ try:
         model_tier="low",
         quota_total=TELNYX_STARTING_BALANCE * 1_000_000,
     )
+    # ── Flat router Phase 1: add missing providers to the shadow optimizer ──
+    # openrouter — per-token, low tier, rates vary by model (~$1.50/M est)
+    _shadow_optimizer.add_provider(
+        "openrouter", _shadow_pk(1.50), _ShadowConsumptionKalman(),
+        quota_remaining=10_000_000, model_tier="low",
+        quota_total=20_000_000,
+    )
+    # routstr — Cashu-metered, same model IDs as proxy (~$1.00/M est)
+    _shadow_optimizer.add_provider(
+        "routstr", _shadow_pk(1.00), _ShadowConsumptionKalman(),
+        quota_remaining=5_000_000, model_tier="low",
+        quota_total=10_000_000,
+    )
+    # routstrd — Cashu-metered, buys from cheapest network node (~$1.00/M est)
+    _shadow_optimizer.add_provider(
+        "routstrd", _shadow_pk(1.00), _ShadowConsumptionKalman(),
+        quota_remaining=5_000_000, model_tier="low",
+        quota_total=10_000_000,
+    )
+    # Re-add zai_ours if the key is present in KEYS dict
+    if "ours" in KEYS:
+        _shadow_optimizer.add_provider(
+            "zai_ours", _shadow_pk(0.068), _ShadowConsumptionKalman(),
+            quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,
+            peak_hours_utc=(6, 10), peak_mult=3.0,
+        )
     # Defaults to ~/.hermes/bot/zai_usage.db (config/providers.yaml :: shadow_mode.db_path)
     _shadow_logger = _ShadowLogger()
 except Exception:
@@ -4929,6 +4955,16 @@ class Handler(BaseHTTPRequestHandler):
                         )
             except Exception:
                 pass  # Shadow mode never blocks production
+
+        # ── Flat router shadow comparison (Phase 1) ──────────────────────
+        # Run select_provider() in shadow and log what it WOULD have chosen
+        # alongside the best_key() pick. NO routing change — best_key() still
+        # drives all routing. This is observability only.
+        try:
+            from flat_router import shadow_compare as _flat_router_shadow_compare
+            _flat_router_shadow_compare(chosen, original_model)
+        except Exception:
+            pass  # Flat router shadow never blocks production
 
         # If both z.ai keys exhausted, consult LiveRouter first (P3.4-fix),
         # then fall through to Ollama Cloud / PPQ hardcoded chain.

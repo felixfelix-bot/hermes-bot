@@ -2074,7 +2074,26 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
     type, from the X-Task-Type header (wins) or the body task_type field.
     NULL when unset/unknown — NEVER guessed. Threaded into EVERY logging
     site (z.ai primary, ollama_cloud, telnyx, external failover hops).
+
+    COST SAFETY NET: if cost_usd is None and key_name is a known provider,
+    an estimated cost is computed via _estimate_cost_usd() before insert.
+    This ensures cost_usd is NEVER NULL for known providers, even when
+    _extract_cost() returns (None, None) due to parse failures, missing
+    model rates, or unhandled provider branches. Source = 'estimated'.
     """
+    # ── Cost safety net: never insert NULL cost_usd for known providers ──
+    if cost_usd is None and key_name:
+        try:
+            _est = _estimate_cost_usd(key_name, total_tokens or 0,
+                                       model=model,
+                                       prompt_tokens=prompt_tokens,
+                                       completion_tokens=completion_tokens)
+            if _est is not None and _est != float('inf'):
+                cost_usd = _est
+                if cost_source is None:
+                    cost_source = 'estimated'
+        except Exception:
+            pass
     try:
         _usage_db().execute(
             "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "

@@ -697,7 +697,7 @@ The tier system (`PROVIDER_TIER` in `flat_router.py`) classifies providers by co
 | Tier | Providers | Cost Model | Current Pricing |
 |---|---|---|---|
 | T1 (quota) | z.ai keys | Sunk cost (subscription), hard quota | $0.001 × time_decay × peak × health |
-| T2 (balance) | NeuralWatt | Prepaid balance, depletes | base × (1 + depletion_penalty) × 0.2762 |
+| T2 (balance) | NeuralWatt | Prepaid kWh (monthly), then pay-per-token | **Phase A**: $0.001 × time_decay (monthly) \|\| **Phase B**: measured rate |
 | T3 (flat) | opencode_go | $10/mo, no stated limit | $0.001 (floor) |
 | T4 (included) | ollama_cloud | Included in subscription | $0.001 (floor) |
 | T5 (per-token) | PPQ, DeepInfra, etc. | Pay per token | Kalman-measured rate |
@@ -754,10 +754,13 @@ The Kalman controller adjusts the **effective price** within each tier to achiev
 - The controller IS the time_decay, but adaptive: it considers actual usage rate, not just time elapsed
 
 **T2 (balance — NeuralWatt)**:
-- Capacity: initial_balance / cost_per_token
-- Base price: cost_per_token (the real per-token cost)
-- Controller: adjusts multiplier to use balance efficiently before period end
-- **Replaces**: the current `depletion_penalty = (1 - remaining/initial) × 2.0` with a controller that also considers time_to_reset (don't burn the balance too fast, don't waste it either)
+- TWO-PHASE STATE MACHINE (see §11.2 for full design):
+  - Phase A (included kWh available): effective = $0.001 × time_decay (monthly, if kWh doesn't carry over) or $0.001 (if carries over)
+  - Phase B (kWh exhausted): effective = measured_rate (Kalman, like T5)
+- Transition: remaining_kWh ≤ 0 (from balance bridge API)
+- **Replaces**: the current `depletion_penalty = (1 - remaining/initial) × 2.0` — this was WRONG: price should NOT rise as balance drops. The included kWh is a sunk cost.
+- Correction factor (0.2762): measurement only (applied in `_extract_cost`, NOT to routing price)
+- kWh carry-over: configuration question (default: no carry-over → monthly time decay, like T1 but 30-day cycle)
 
 **T3 (flat — opencode_go)**:
 - Capacity: ∞ (treated as unlimited, see §4.2)
@@ -1204,15 +1207,110 @@ The key insight: the controller's objective (exhaust quota just before reset) on
 - **Status**: NOT yet shipped — needs Phase 0-2 implementation (§7)
 - **Current interim** (commit `7220cd3`): `$0.001 × max(0.0001, days_to_reset/7)` — sunk cost with time decay, no controller
 
-### 11.2 T2 (balance — NeuralWatt $100/mo): DEPLETION-AWARE PRICING (no controller)
+### 11.2 T2 (balance — NeuralWatt $100/mo): TWO-PHASE STATE MACHINE
 
-- **Known balance**, no weekly reset — once depleted, pay per token
-- **Price should INCREASE as balance depletes** (preserve remaining for high-value work)
-- **Formula**: `effective = base × (1 + depletion_penalty) × correction_factor`
-- **Already implemented** (commit `db88e0f`) — this is correct as-is
-- **No LQG controller needed** — no reset to optimize toward
-- **The question**: should we prefer NeuralWatt early in the month (balance fresh) and avoid it later (balance depleting)? **Yes** — the depletion penalty already handles this naturally. As balance depletes, price rises, traffic diverts to cheaper providers, and remaining balance is preserved for high-value requests that explicitly choose NeuralWatt.
-- **Correction factor**: 0.2762 (empirically calibrated, commit `db88e0f`)
+**Felix's clarification (2026-08-24)**:
+
+> "we get a fixed amount of kwh to burn through for the entire month on neuralwatt,
+> but we can always burn more at the same rates if we top up our balance, so we
+> don't get a hard cutoff where we have to pay higher rates after burning through
+> the fixed monthly amount"
+
+This means NeuralWatt has **TWO phases**, not a single depletion-aware model:
+
+#### Phase A — Prepaid (included kWh available)
+
+- **Marginal cost = $0** (the $100/mo is a sunk cost; included kWh is already paid for)
+- **Effective price = $0.001/M** (same as T3/T4 flat-rate floor)
+- **NO depletion penalty** — using included kWh is free at the margin
+- **NO rate increase as balance drops** — the included kWh is a sunk cost, not a depleting resource that should be "preserved"
+
+#### Phase B — Pay-per-token (included kWh exhausted)
+
+- **Marginal cost = measured per-token rate** (same rate as top-up, no increase)
+- **Effective price = Kalman-measured $/M** (like T5 per-token)
+- **NO rate increase** — Felix explicitly said "same rates", not higher rates
+- **Transition trigger**: remaining_kWh ≤ 0 (from balance bridge API)
+
+#### Why the current depletion penalty is WRONG
+
+The current implementation (commit `db88e0f`):
+```
+effective = base × (1 + depletion_penalty) × 0.2762
+depletion_penalty = (1 - remaining/initial) × 2.0  → price RISES as balance drops
+```
+
+This is incorrect because:
+1. **It creates a vicious circle**: price rises → router avoids NeuralWatt → less usage → balance "preserved" but wasted (use-it-or-lose-it if kWh doesn't carry over)
+2. **Felix said "no caps" and "same rates"** — the rate does NOT increase after exhaustion, so price should be STABLE, not rising
+3. **The included kWh is a sunk cost** — marginal cost is $0 during Phase A. Penalizing usage of a free resource is backwards
+4. **It discourages the exact behavior we want** — using the included kWh before it expires
+
+#### The correction factor (0.2762) is MEASUREMENT ONLY
+
+The 0.2762 correction factor compensates for NeuralWatt's API overcounting usage ~3.6×. It is a **measurement correction**, not a pricing adjustment:
+
+- **Applies to COST TRACKING**: `_extract_cost()` and `_record_spend()` — what we record as actual spend
+- **Does NOT apply to ROUTING PRICE**: the effective $/M the router sees should reflect REAL marginal cost
+- In Phase A: $0.001 (correction irrelevant — it's the floor, marginal cost is $0)
+- In Phase B: measured_rate from Kalman (the Kalman already incorporates the correction via corrected `_extract_cost()` observations)
+
+#### kWh carry-over question (CONFIGURATION — unknown)
+
+Whether unused kWh carries over to the next month is unknown. This must be a **configuration question during provider onboarding** (see Step 2.5 in the adding-api-key skill).
+
+**Default assumption: does NOT carry over** (most prepaid plans don't).
+
+If kWh does NOT carry over, Phase A gets **monthly time decay** (like T1 but with a monthly cycle instead of weekly):
+
+```python
+# Phase A with time decay (kWh does NOT carry over):
+days_to_reset = days_to_monthly_reset  # 30 for monthly cycle
+time_decay = max(0.0001, days_to_reset / 30)
+effective = MIN_EFFECTIVE_PRICE * time_decay  # $0.001 × decay
+# Same architecture as T1, different period (30 days vs 7 days)
+```
+
+If kWh DOES carry over, no time decay needed — use it whenever, it doesn't expire:
+```python
+# Phase A without time decay (kWh carries over):
+effective = MIN_EFFECTIVE_PRICE  # $0.001 flat, like T3
+```
+
+#### Pseudocode: T2 state machine
+
+```python
+def compute_t2_price(provider, base_rate, context):
+    remaining_kwh = _get_neuralwatt_remaining_kwh()
+
+    if remaining_kwh > 0:
+        # Phase A: prepaid kWh available — sunk cost, marginal $0
+        if NW_KWH_CARRIES_OVER:
+            # kWh doesn't expire → no urgency → flat floor
+            return MIN_EFFECTIVE_PRICE  # $0.001
+        else:
+            # kWh expires monthly → use-it-or-lose-it time decay
+            days_to_reset = _days_to_monthly_reset()
+            time_decay = max(0.0001, days_to_reset / 30.0)
+            return MIN_EFFECTIVE_PRICE * time_decay
+    else:
+        # Phase B: included kWh exhausted — pay per token at same rate
+        # The Kalman measures actual $/M from corrected cost observations
+        return max(MIN_EFFECTIVE_PRICE, base_rate)
+```
+
+#### What changes from the current implementation
+
+| Aspect | Old (db88e0f) | New (this design) |
+|--------|---------------|-------------------|
+| Phase A pricing | `base × (1 + penalty) × 0.2762` (rises with depletion) | `$0.001` (or `$0.001 × time_decay` if no carry-over) |
+| Phase B pricing | Same formula (just higher penalty) | `measured_rate` (Kalman, like T5) |
+| Depletion penalty | `(1 - remaining/initial) × 2.0` | **REMOVED** — no penalty for using prepaid kWh |
+| Correction factor (0.2762) | Applied to routing price | Applied to cost tracking only (`_extract_cost`) |
+| State model | Single formula, price rises monotonically | Two-phase state machine with transition at kWh = 0 |
+| Carry-over | Not considered | Configuration question (default: no carry-over → time decay) |
+
+**Status**: DESIGN ONLY — needs implementation to replace `_compute_depletion_penalty()` and the T2 branch of `compute_effective_price()`
 
 ### 11.3 T3 (flat-rate — opencode_go $10/mo): STATIC FLOOR
 
@@ -1241,23 +1339,23 @@ The key insight: the controller's objective (exhaust quota just before reset) on
 | Tier | Provider | Approach | Controller? | Already Shipped? |
 |------|----------|----------|-------------|-----------------|
 | T1 | z.ai | LQG controller | YES | No — needs Phase 0-2 |
-| T2 | NeuralWatt | Depletion penalty | No | Yes (db88e0f) |
+| T2 | NeuralWatt | Two-phase state machine (Phase A prepaid, Phase B per-token) | No | DESIGN ONLY — replaces db88e0f depletion penalty |
 | T3 | opencode_go | Static $0.001 floor | No | Yes (db88e0f) |
 | T4 | ollama_cloud | Static $0.001 floor | No | Yes (db88e0f) |
 | T5 | routstr, etc. | Kalman observer | No | Yes (db88e0f) |
 
 ### 11.7 Conclusion
 
-**Only T1 needs the new LQG controller.** T2-T5 are already correctly implemented with tonight's work (commit `db88e0f`). The transition plan (Phase 0-2, §7) should be scoped to **T1 only**.
+**Only T1 needs the new LQG controller.** T3-T5 are already correctly implemented with tonight's work (commit `db88e0f`). T2 (NeuralWatt) needs a redesign based on Felix's clarification — the depletion penalty is being replaced by a two-phase state machine (§11.2). The transition plan (Phase 0-2, §7) should be scoped to **T1 only**, with T2 as a separate design item.
 
 This simplifies the implementation significantly:
-- No controller logic needed for T2 (depletion penalty handles it)
-- No controller logic needed for T3/T4 (static floor is correct — unlimited or unknown capacity)
-- No controller logic needed for T5 (observer-only is correct — no capacity to exhaust)
+- No LQG controller needed for T2 — just a state machine with two branches (prepaid vs per-token)
+- No LQG controller needed for T3/T4 (static floor is correct — unlimited or unknown capacity)
+- No LQG controller needed for T5 (observer-only is correct — no capacity to exhaust)
 - The `CapacityController` class (§7.3) only needs to handle the T1 case
 - The profitability tracker (§5) still applies to all subscription providers (T1-T4)
 
-**Open Question §11.7 (old #7)**: The T2 "maximize value per token" question is now answered: the depletion penalty IS the mechanism. It naturally makes NeuralWatt more expensive as balance depletes, preserving remaining balance for high-value work. No separate controller needed.
+**Open Question §11.7 (old #7)**: The T2 "maximize value per token" question is now answered differently: NeuralWatt is a two-phase model (§11.2). In Phase A, marginal cost is $0 (sunk cost) — the router should prefer NeuralWatt aggressively. In Phase B, it's per-token cost — the router competes on measured rate. The depletion penalty was wrong because it made Phase A progressively MORE expensive (discouraging usage of a free resource). The correct model is: cheap in Phase A, measured rate in Phase B, NO transition penalty.
 
 ---
 
@@ -1275,7 +1373,7 @@ This simplifies the implementation significantly:
 
 6. **Per-model profitability**: Should the profitability report break down by model within each provider? (e.g., "opencode_go served 400M tokens of glm-5.2 and 87M tokens of kimi-k3")? This would require joining `api_calls` on model.
 
-7. **Controller for NeuralWatt (T2)**: ~~The controller's objective for T2 is different from T1. For T1, we want to exhaust the quota (it's free). For T2, we want to *not waste* the balance (it's prepaid, but we don't want to burn it on low-value tasks). Should the T2 controller optimize for "maximize value per token" rather than "exhaust balance by period end"?~~ **ANSWERED in §11.2/§11.7**: No controller needed. The depletion penalty already handles this — as balance depletes, price rises, preserving remaining balance for high-value work.
+7. **Controller for NeuralWatt (T2)**: ~~The controller's objective for T2 is different from T1. For T1, we want to exhaust the quota (it's free). For T2, we want to *not waste* the balance (it's prepaid, but we don't want to burn it on low-value tasks). Should the T2 controller optimize for "maximize value per token" rather than "exhaust balance by period end"?~~ **ANSWERED in §11.2**: NeuralWatt is a TWO-PHASE state machine, not a depletion model. Phase A (prepaid kWh): marginal cost $0, price = $0.001 (or $0.001 × monthly time_decay if kWh doesn't carry over). Phase B (kWh exhausted): price = measured rate. The depletion penalty was WRONG — it penalized using a sunk-cost resource. The correction factor (0.2762) is measurement-only (cost tracking), not a routing price modifier.
 
 ---
 

@@ -5,6 +5,8 @@ Extends the burn-rate Kalman filter to track multiple system resources:
 - tokens (existing API token burn rate)
 - cpu_load (1-minute load average)
 - memory_pct (memory used percentage)
+- swap_used_pct (swap used percentage)
+- disk_used_pct (disk used percentage)
 - worker_count (active Hermes workers)
 
 This enables:
@@ -30,23 +32,25 @@ except ImportError:
 
 
 class MultiResourceKalmanPredictor:
-    """4-state Kalman filter for multi-resource prediction.
+    """6-state Kalman filter for multi-resource prediction.
 
-    State vector:  x = [tokens, cpu_load, memory_pct, worker_count]
-                   (tokens/hour, load avg, % used, count)
+    State vector:  x = [tokens, cpu_load, memory_pct, swap_used_pct, disk_used_pct, worker_count]
+                   (tokens/hour, load avg, % used, % swap used, % disk used, count)
     
     Tracks system resources with uncertainty estimates and correlations.
     """
 
     # Resource names for indexing
-    RESOURCES = ['tokens', 'cpu_load', 'memory_pct', 'worker_count']
+    RESOURCES = ['tokens', 'cpu_load', 'memory_pct', 'swap_used_pct', 'disk_used_pct', 'worker_count']
     RESOURCE_IDX = {name: i for i, name in enumerate(RESOURCES)}
     
     # State indices
     TOKENS_IDX = 0
     CPU_IDX = 1
     MEMORY_IDX = 2
-    WORKER_IDX = 3
+    SWAP_IDX = 3
+    DISK_IDX = 4
+    WORKER_IDX = 5
 
     def __init__(self, 
                  process_noise: float = 1.0,
@@ -62,39 +66,43 @@ class MultiResourceKalmanPredictor:
         
         # Default measurement noise per resource (can be tuned per resource)
         default_noise = {
-            'tokens': 1e6,      # High variance for token burn rates
-            'cpu_load': 0.5,    # CPU load typically 0-10, noise ~0.5
-            'memory_pct': 5.0,  # Memory % typically 0-100, noise ~5%
-            'worker_count': 2.0 # Worker count typically 0-50, noise ~2
+            'tokens': 1e6,          # High variance for token burn rates
+            'cpu_load': 0.5,        # CPU load typically 0-10, noise ~0.5
+            'memory_pct': 5.0,      # Memory % typically 0-100, noise ~5%
+            'swap_used_pct': 10.0,  # Swap can jump significantly
+            'disk_used_pct': 2.0,   # Disk changes slowly
+            'worker_count': 2.0     # Worker count typically 0-50, noise ~2
         }
         
-        # State vector: [tokens, cpu_load, memory_pct, worker_count]
-        self.x = np.array([[0.0], [0.0], [0.0], [0.0]])
+        # State vector: [tokens, cpu_load, memory_pct, swap_used_pct, disk_used_pct, worker_count]
+        self.x = np.array([[0.0], [0.0], [0.0], [0.0], [0.0], [0.0]])
         
         # State transition matrix (assuming each resource persists with some velocity)
         # For simplicity, we assume each state persists to the next timestep
         # This is a simple model - could be enhanced with velocity terms
-        self.F = np.eye(4)
+        self.F = np.eye(6)
         
-        # Measurement matrix (we observe all 4 resources directly)
-        self.H = np.eye(4)
+        # Measurement matrix (we observe all 6 resources directly)
+        self.H = np.eye(6)
         
         # Covariance matrix (high initial uncertainty)
         base_noise = measurement_noise or default_noise
         self.P = np.diag([base_noise[r] for r in self.RESOURCES])
         
         # Process noise matrix (how erratic is each resource)
-        self.Q = np.eye(4) * process_noise
+        self.Q = np.eye(6) * process_noise
         
         # Measurement noise matrix (how noisy are observations)
         self.R = np.diag([base_noise[r] for r in self.RESOURCES])
         
         # Resource-specific constraints and thresholds
         self.thresholds = {
-            'tokens': 1e7,        # 10M tokens = dangerous level
-            'cpu_load': 8.0,      # 8.0 load = high CPU
-            'memory_pct': 85.0,   # 85% = high memory usage
-            'worker_count': 40    # 40 workers = high concurrent load
+            'tokens': 1e7,           # 10M tokens = dangerous level
+            'cpu_load': 8.0,         # 8.0 load = high CPU
+            'memory_pct': 70.0,      # 70% = high memory usage (lowered for earlier warning)
+            'swap_used_pct': 30.0,   # 30% swap used = warning
+            'disk_used_pct': 85.0,   # 85% disk used = warning
+            'worker_count': 40       # 40 workers = high concurrent load
         }
         
         self._initialized = False
@@ -135,7 +143,7 @@ class MultiResourceKalmanPredictor:
         self.x = self.x + K @ y
         
         # Covariance update: P = (I - K * H) * P
-        I = np.eye(4)
+        I = np.eye(6)
         self.P = (I - K @ self.H) @ self.P
         
         # Ensure P stays positive semi-definite
@@ -269,18 +277,18 @@ class MultiResourceKalmanPredictor:
         """Get the correlation matrix showing resource relationships.
         
         Returns:
-            4x4 correlation matrix (-1 to 1)
+            6x6 correlation matrix (-1 to 1)
         """
         if not self._initialized:
-            return np.eye(4)
+            return np.eye(6)
         
         # Convert covariance to correlation
         # corr(i,j) = cov(i,j) / sqrt(cov(i,i) * cov(j,j))
         std_devs = np.sqrt(np.diag(self.P))
-        correlation = np.zeros((4, 4))
+        correlation = np.zeros((6, 6))
         
-        for i in range(4):
-            for j in range(4):
+        for i in range(6):
+            for j in range(6):
                 if std_devs[i] > 0 and std_devs[j] > 0:
                     correlation[i, j] = self.P[i, j] / (std_devs[i] * std_devs[j])
                 else:
@@ -312,8 +320,8 @@ class MultiResourceKalmanPredictor:
             health = max(0, min(100, 100 * (1 - value / threshold)))
             health_scores[resource] = health
         
-        # Overall health: weighted average (tokens weighted more heavily)
-        weights = {'tokens': 0.5, 'cpu_load': 0.2, 'memory_pct': 0.2, 'worker_count': 0.1}
+        # Overall health: weighted average
+        weights = {'tokens': 0.3, 'cpu_load': 0.15, 'memory_pct': 0.2, 'swap_used_pct': 0.15, 'disk_used_pct': 0.1, 'worker_count': 0.1}
         overall = sum(health_scores[r] * weights[r] for r in self.RESOURCES) / sum(weights.values())
         
         return {
@@ -353,7 +361,7 @@ class MultiResourceKalmanPredictor:
     def from_dict(cls, data: Dict[str, Any]) -> 'MultiResourceKalmanPredictor':
         """Create predictor from serializable dict."""
         predictor = cls()
-        predictor.x = np.array(data['state_vector']).reshape(4, 1)
+        predictor.x = np.array(data['state_vector']).reshape(6, 1)
         predictor.P = np.array(data['covariance_matrix'])
         predictor.thresholds = data.get('thresholds', predictor.thresholds)
         predictor._update_count = data.get('update_count', 0)
@@ -389,7 +397,8 @@ def get_resource_history(hours: int = 12,
         cursor = conn.cursor()
         
         cursor.execute(
-            """SELECT ts, cpu_load_1m, memory_used_percent, worker_count
+            """SELECT ts, cpu_load_1m, memory_used_percent, swap_used_percent,
+                      disk_used_percent, worker_count
                FROM resource_metrics 
                WHERE ts >= ? 
                ORDER BY ts""",
@@ -410,6 +419,8 @@ def get_resource_history(hours: int = 12,
                 'tokens': tokens_per_hour,
                 'cpu_load': row['cpu_load_1m'] or 0.0,
                 'memory_pct': row['memory_used_percent'] or 0.0,
+                'swap_used_pct': row['swap_used_percent'] or 0.0,
+                'disk_used_pct': row['disk_used_percent'] or 0.0,
                 'worker_count': row['worker_count'] or 0
             })
         
@@ -476,6 +487,8 @@ def demo_multi_resource_predictor():
                 'tokens': 500000 + i * 10000,  # Increasing burn rate
                 'cpu_load': 2.0 + i * 0.1,    # Increasing CPU
                 'memory_pct': 60 + i * 0.5,   # Increasing memory
+                'swap_used_pct': 10 + i * 0.3, # Increasing swap
+                'disk_used_pct': 70 + i * 0.1, # Slowly increasing disk
                 'worker_count': 10 + (i // 4) # Workers every 20 minutes
             })
     
@@ -486,6 +499,8 @@ def demo_multi_resource_predictor():
             'tokens': 50000,
             'cpu_load': 0.3,
             'memory_pct': 3.0,
+            'swap_used_pct': 10.0,
+            'disk_used_pct': 2.0,
             'worker_count': 1.0
         }
     )
@@ -498,6 +513,8 @@ def demo_multi_resource_predictor():
             'tokens': point['tokens'],
             'cpu_load': point['cpu_load'],
             'memory_pct': point['memory_pct'],
+            'swap_used_pct': point.get('swap_used_pct', 0),
+            'disk_used_pct': point.get('disk_used_pct', 0),
             'worker_count': point['worker_count']
         }
         predictor.update(measurement)

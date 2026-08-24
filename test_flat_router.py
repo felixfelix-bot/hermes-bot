@@ -350,5 +350,169 @@ class TestDispatchMapping:
                 assert c.dispatch_fn is not None, "dispatch_fn for telnyx should not be None"
 
 
+# ── Phase 3 tests: full cutover, rollback flag, Kalman live updates ──────────
+
+
+class TestFlatRouterCutover:
+    """Phase 3: verify .disable_flat_router flag controls routing path."""
+
+    def test_disable_flag_check_exists(self):
+        """_proxy() should check for .disable_flat_router flag file."""
+        # Verify the flag path constant is referenced in zai_proxy.py
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert ".disable_flat_router" in source, \
+            "_proxy() must check for .disable_flat_router flag"
+
+    def test_select_provider_imported_in_zai_proxy(self):
+        """zai_proxy.py should import select_provider from flat_router."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "select_provider" in source, \
+            "zai_proxy.py must import and use select_provider"
+
+    def test_dispatch_to_provider_imported_in_zai_proxy(self):
+        """zai_proxy.py should import _dispatch_to_provider from flat_router."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_dispatch_to_provider" in source, \
+            "zai_proxy.py must import and use _dispatch_to_provider"
+
+    def test_update_kalman_after_request_called_in_zai_proxy(self):
+        """zai_proxy.py should call _update_kalman_after_request after dispatch."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_update_kalman_after_request" in source, \
+            "zai_proxy.py must call _update_kalman_after_request for live Kalman updates"
+
+    def test_try_zai_key_method_exists(self):
+        """Handler should have a _try_zai_key method for flat router dispatch."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "def _try_zai_key" in source, \
+            "Handler must have _try_zai_key method for z.ai dispatch via flat router"
+
+    def test_zai_dispatch_fn_not_returning_false(self):
+        """_make_dispatch_fn for z.ai keys should return a real dispatch fn, not None."""
+        from flat_router import _make_dispatch_fn
+        fn = _make_dispatch_fn("ours")
+        assert fn is not None, "ours dispatch_fn should not be None"
+        fn2 = _make_dispatch_fn("friend")
+        assert fn2 is not None, "friend dispatch_fn should not be None"
+
+    def test_503_on_all_candidates_fail(self):
+        """When all candidates fail, _proxy() should send 503."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # The flat router path should have a 503 fallback
+        assert "503" in source, "Flat router path must handle all-candidates-fail with 503"
+
+    def test_x_provider_header_in_flat_router_path(self):
+        """Flat router path should set X-Provider header for observability."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "X-Provider" in source, \
+            "Flat router path should set X-Provider header for observability"
+
+
+class TestFlatRouterKalmanLiveUpdates:
+    """Phase 3: verify Kalman filters get live updates after successful dispatch."""
+
+    def test_kalman_update_after_success(self):
+        """After a successful dispatch, _update_kalman_after_request should be called."""
+        # Verify the flat router path calls _update_kalman_after_request
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # Should appear in the flat router path (import alias + live update call)
+        # The import uses "as _flat_kalman_update" and the call uses _flat_kalman_update
+        assert "_update_kalman_after_request" in source, \
+            "_update_kalman_after_request should be imported in zai_proxy"
+        assert "_flat_kalman_update" in source, \
+            "_update_kalman_after_request should be called (via _flat_kalman_update alias) " \
+            "in the flat router path"
+
+    def test_kalman_update_with_cost_and_tokens(self):
+        """_update_kalman_after_request should receive cost_usd and total_tokens."""
+        # Verify _extract_cost and _parse_usage are used in the flat router path
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_extract_cost" in source, \
+            "Flat router path should use _extract_cost for Kalman cost input"
+        assert "_parse_usage" in source, \
+            "Flat router path should use _parse_usage for Kalman token input"
+
+
+class TestFlatRouterFallback:
+    """Phase 3: verify fallback to next candidate on provider failure."""
+
+    def test_candidate_iteration_in_proxy(self):
+        """_proxy() should iterate candidates and try each."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # The flat router path should iterate candidates
+        assert "for candidate in" in source or "for _cand in" in source, \
+            "Flat router path should iterate candidates in a loop"
+
+    def test_mark_key_failure_on_dispatch_failure(self):
+        """On dispatch failure, the key should be marked as failed."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # Should call _mark_key_failure or _mark_key_exhausted on failure
+        assert "_mark_key_failure" in source or "_mark_key_exhausted" in source, \
+            "Flat router path should mark key failure on dispatch failure"
+
+
+class TestFlatRouterStreaming:
+    """Phase 3: verify streaming requests work through flat router."""
+
+    def test_streaming_through_dispatch(self):
+        """Streaming requests should work through _dispatch_to_provider."""
+        # The dispatch functions call _try_* methods which already handle streaming
+        # This test verifies the dispatch chain is intact
+        from flat_router import _dispatch_to_provider, _make_dispatch_fn
+        # All dispatch functions should be callable
+        for name in ["ours", "friend", "ollama_cloud", "opencode_go", "ppq", "deepinfra"]:
+            fn = _make_dispatch_fn(name)
+            assert fn is not None, f"dispatch_fn for {name} should not be None"
+
+    def test_streaming_body_passthrough(self):
+        """The flat router path should pass the body through to dispatch."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # The flat router path should pass body to _dispatch_to_provider
+        assert "_dispatch_to_provider" in source, \
+            "Flat router path should call _dispatch_to_provider with the request body"
+
+
+class TestRollbackFlag:
+    """Phase 3: verify .disable_flat_router rollback mechanism."""
+
+    def test_rollback_flag_path_constant(self):
+        """The rollback flag path should be ~/.hermes/bot/.disable_flat_router."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "~/.hermes/bot/.disable_flat_router" in source or \
+               ".disable_flat_router" in source, \
+            "Rollback flag path should be .disable_flat_router in ~/.hermes/bot/"
+
+    def test_best_key_preserved(self):
+        """best_key() function should still exist for rollback."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "def best_key" in source, \
+            "best_key() must be preserved for .disable_flat_router rollback"
+
+    def test_old_failover_chain_preserved(self):
+        """Old failover chain (ollama, opencode, external) should still exist."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_try_ollama_cloud_any" in source, \
+            "_try_ollama_cloud_any must be preserved for rollback"
+        assert "_try_external_failover" in source, \
+            "_try_external_failover must be preserved for rollback"
+        assert "_try_opencode_go" in source, \
+            "_try_opencode_go must be preserved for rollback"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

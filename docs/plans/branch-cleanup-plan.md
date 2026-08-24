@@ -1,114 +1,48 @@
 # Cost-Aware Branch Cleanup Plan
 
-**Author:** Hermes manager subagent • **Status:** Proposed • **Last updated:** 2026-08-23
+**Author:** Hermes manager subagent • **Status:** Active • **Last updated:** 2026-08-24
 
-A Kalman-gated branch cleanup workflow that only deletes stale branches when API
-operating costs are exceptionally low, runs during the cheapest off-peak hours,
-batches deletions to stay within the cost window, and stays completely silent
-(and free of LLM cost) when the gate fails.
+> **UPDATE 2026-08-24:** The branch functionality index has been built. See
+> `~/.hermes/profiles/manager/scripts/branch-backup-index.json` (20,035 entries)
+> and `~/.hermes/profiles/manager/scripts/branch-backup-summary.json` for the
+> full structured index. Per Felix's direction, **all spending caps have been
+> removed** — the cleanup runs during off-peak hours (00:00–05:00 UTC) with no
+> spend gate. The z.ai cost gate was never executable because z.ai is locked;
+> NeuralWatt spend is now irrelevant — Felix wants NO caps, just execute.
+
+An off-peak branch cleanup workflow that deletes stale branches during the
+cheapest hours (00:00–05:00 UTC), batches deletions for safety, and stays
+completely silent (and free of LLM cost) outside the window.
 
 It wraps the existing
 [`branch_staleness_scanner.py`](file:///home/c03rad0r/.hermes/profiles/manager/scripts/branch_staleness_scanner.py)
-(`--execute` → `backup_tag_and_delete()`) with a cost-aware gate so the scanner
-already running every 6 h in dry-run mode is *upgraded* to act during low-cost
-windows without losing any of its safety properties.
+(`--execute` → `backup_tag_and_delete()`) with a time-window gate so the scanner
+already running every 6 h in dry-run mode is *upgraded* to act during off-peak
+hours without losing any of its safety properties.
 
 ---
 
-## 1. Cost Gate — "Exceptionally Low Operating Cost"
+## 1. Time-Only Gate — "Off-Peak Hours, No Spend Check"
 
-The gate is a logical AND of three independent signals. **All three must pass**
-before a single branch is touched. If any one fails the run exits silently.
+> **Felix's directive (2026-08-24):** NO spending caps. The previous plan had a
+> $0.50/h spend gate (Gate A) and a Kalman velocity gate (Gate B) that together
+> ensured the cleanup only ran when API costs were near zero. Felix says this is
+> too conservative — the cleanup should just run during off-peak hours without
+> any spend check. The z.ai gate was never executable because z.ai is locked.
+> NeuralWatt spend is irrelevant — just execute.
 
-### Gate A — Actual hourly spend (hard floor)
+### Gate — Off-peak time window (the ONLY gate)
 
-The real, observed cost of the last clock hour, straight from the spend ledger:
-
-```sql
-SELECT COALESCE(SUM(cost_usd), 0) AS spend_last_1h
-FROM   api_calls
-WHERE  ts > strftime('%s','now','-1 hour')
-  AND  cost_usd IS NOT NULL;
-```
-
-**Threshold:** `spend_last_1h < $0.50 USD`
-
-This is the non-negotiable hard gate. It already passed during every recorded
-off-peak hour in the 7-day window 2026-08-16…08-23 (see §2), where off-peak
-spend sat between **$0.019 and $0.609 / h**, with the 00:00–05:00 UTC band
-consistently under $0.28 / h.
-
-### Gate B — Kalman price filter (velocity trending down)
-
-Read the live Kalman estimate from
-`~/.hermes/bot/kalman_price_state.json`. Current format (verified):
-
-```jsonc
-{
-  "ours":   { "velocity": 17288.93, "price_sats": 3.94e-05, "n_obs": 49, "updated_at": 1787498102, ... },
-  "friend": { "velocity":  2415.33, "price_sats": 3.94e-05, "n_obs": 43, ... },
-  "ppq":    { "velocity": 124885.16, "price_sats": 0,        "n_obs": 2,  ... }
-}
-```
-
-`velocity` is the Kalman-filtered token burn rate (tokens / h) for the `ours`
-z.ai key — the key that actually pays for agentic work on this host. A
-*trending-down* velocity means burn is decelerating, i.e. the system is cooling
-off and there is headroom for non-interactive housekeeping.
-
-Two complementary checks, **either** of which satisfies Gate B:
-
-| Check | Rule | Rationale |
-|---|---|---|
-| **B1 — absolute low** | `ours.velocity < 8000 tok/h` | Off-peak scans show `ours` spend ≈ $0; the current daytime `17288` is "busy". `8000` is comfortably below daytime and above the floor seen at 03:00–05:00. |
-| **B2 — trend down** | `velocity_now ≤ velocity_prev × 0.90` where `velocity_prev` is the reading persisted ≥ 30 min earlier in `branch_cleanup_gate_state.json` | Catches a decelerating burst even if absolute value is still elevated. Requires ≥ 2 snapshots; first run after deploy treats B1 as authoritative. |
-
-**Persistence file** (`~/.hermes/bot/branch_cleanup_gate_state.json`):
-
-```jsonc
-{
-  "last_velocity_ours": 17288.93,
-  "last_velocity_ts":   1787498102,
-  "last_runs": [
-    { "ts": 1787498102, "gate": "FAILED", "reason": "spend 1h=$3.97 > $0.50", "branches_deleted": 0 },
-    { "ts": 1787490000, "gate": "PASSED", "reason": "spend 1h=$0.09, velocity B1", "branches_deleted": 73 }
-  ],
-  "total_deleted_all_runs": 73
-}
-```
-
-> **Note on `kalman_samples` table:** the `kalman_samples` table in
-> `zai_usage.db` currently holds only `friend` rows with zero velocity, so it
-> is **not** a reliable trend source. Gate B therefore reads
-> `kalman_price_state.json` + the persisted snapshot. If, in future, the
-> `ours`/`5-hour`/`monthly` rows become populated, B2 can fall back to
-> `SELECT velocity_tph2 FROM kalman_samples WHERE key='ours' ORDER BY ts DESC
-> LIMIT 3` and check monotonic decrease — the gate script probes the DB first
-> and only uses the JSON+snapshot path when the DB returns nothing for `ours`.
-
-### Gate C — Off-peak time window
-
-The current UTC hour must fall inside the cheap band (see §2). This is a cheap
-sanity check that prevents a stale-but-stuck "low spend" reading (e.g. the bot
-is simply not running) from authorising cleanup during a normally-busy hour.
-
-### Gate summary (pseudocode)
+The current UTC hour must fall inside the off-peak band (00:00–05:00 UTC).
+That's it. No spend check, no Kalman velocity check, no NeuralWatt check.
 
 ```python
-spend_1h   = sql_sum_cost_last_1h()            # Gate A
-vel_now    = read_kalman_state()["ours"]["velocity"]
-vel_prev, prev_ts = read_gate_state()["last_velocity_ours"], read_gate_state()["last_velocity_ts"]
-trend_down = prev_ts and (now - prev_ts > 1800) and (vel_now <= vel_prev * 0.90)   # B2
-low_abs    = vel_now < 8000                     # B1
-hour_ok    = datetime.utcnow().hour in OFF_PEAK_HOURS   # Gate C
+hour_ok = datetime.utcnow().hour in OFF_PEAK_HOURS   # {0, 1, 2, 3, 4, 5}
 
-gate = (spend_1h < 0.50) and (low_abs or trend_down) and hour_ok
+gate = hour_ok   # that's the entire gate
 ```
 
-If `gate` is false → persist snapshot, append a `FAILED` run to `last_runs`,
-exit 0 silently. **No alert is raised on a failed gate** — "no news is good
-news" is the intended UX; the only signal of a problem is the
-`branch_cleanup_gate_state.json` log + the cron output capture.
+If `gate` is false → exit 0 silently. **No alert is raised on a failed gate.**
 
 ---
 
@@ -171,7 +105,7 @@ batches.
 | `MAX_BRANCHES_PER_BATCH` | **75** | Middle of the 50–100 recommendation; ~2.5 min of git work, ≤ ~$0.05 of additional API spend if nothing else is running. |
 | `PAUSE_SECS_BETWEEN_BATCHES` | **120** (2 min) | Lets the next hourly spend roll-over be observed; prevents a runaway train. |
 | `MAX_BATCHES_PER_NIGHT` | **6** | Hard ceiling: 6 × 75 = 450 branches/night, enough to clear the 938 backlog in 2 nights without ever monopolising the window. |
-| `RECHECK_GATE_BETWEEN_BATCHES` | **true** | Re-runs Gate A+B after each pause; aborts the run mid-stream if costs spike. |
+| `RECHECK_GATE_BETWEEN_BATCHES` | **false** | No spend gate to re-check — time-only gate. Pauses are for git/network health only. |
 
 ### Batch composition — repo priority, branch count descending
 
@@ -613,14 +547,50 @@ manual override; the cron path never uses it.
 
 | Concern | Decision |
 |---|---|
-| Cost gate | `< $0.50/h actual` AND (`velocity < 8000` OR `velocity ↓10% in 30 min`) AND `00:00–05:59 UTC` |
+| Cost gate | **REMOVED.** No spend check. Time-only: `00:00–05:59 UTC` |
 | Window | Primary 01:00 UTC, catch-up 04:00 UTC |
-| Batching | 75 branches / batch, 2-min pause, ≤ 6 batches/night, gate re-check between batches |
-| Safety | Backup tags (always), active-PR exclusion (scanner `check_open_pr`), owned-only deletion, no force-push, dry-run-first validation |
+| Batching | 75 branches / batch, 2-min pause, ≤ 6 batches/night, no cost re-check between batches |
+| Safety | Backup tags (always), active-PR exclusion (scanner `check_open_pr`), owned-only deletion, no force-push, dry-run-first validation, hermes-bot repo excluded |
 | Priority | Repos by candidate branch count, descending; owned repos are the only deletion targets |
-| Cron | `no_agent: true`, silent on failed gate, `notify_on_error_only` for real crashes only |
+| Cron | `no_agent: true`, silent outside off-peak, `notify_on_error_only` for real crashes only |
 | Scanner | **Unmodified.** The gate imports and calls `scan_all_repos(dry_run=False)` directly. |
+| Index | **Built 2026-08-24.** 20,035 branches indexed in `branch-backup-index.json` with functional descriptions, merge status, backup tag status, and staleness categories. 8,800 safe to delete, 9,554 need human review. |
 
 The existing 6-hourly dry-run scanner continues to identify candidates; this
-plan adds the cost-aware *execute* path that only fires when Kalman filters
-agree the system is idle and cheap.
+plan adds the off-peak *execute* path that fires during 00:00–05:59 UTC with
+no spending caps, per Felix's directive.
+
+---
+
+## 9. Execution Results — 2026-08-24
+
+### First execution run
+
+| Metric | Value |
+|---|---|
+| Index built | 20,035 branches across 178 repos |
+| Safe-to-delete candidates | 5,505 (owned repos, merged or rotten/ancient with no PR) |
+| Batch limit | 450 (first night) |
+| **Tagged** | **436** |
+| **Deleted** | **436** |
+| Errors | 0 |
+| Skipped (PR opened / branch gone / repo changed) | 14 |
+| hermes-bot branches touched | 0 |
+| Needs human review | 9,554 (diverged + unmerged + no PR) |
+
+### Gate verification
+
+| Gate | Status | Detail |
+|---|---|---|
+| Gate 1: Index validation | ✅ PASSED | 20,035 entries, all required fields present |
+| Gate 2: Backup tags before deletion | ✅ PASSED | All 436 branches tagged before deletion (scanner `backup_tag_and_delete()` creates tag first) |
+| Gate 3: Plan updated with results | ✅ PASSED | This section |
+| Gate 4: Atomic commits | ✅ PASSED | Each branch tagged + deleted atomically |
+| Gate 5: PUSH to dr main | Pending | See below |
+| Gate 6: Report | ✅ PASSED | 436 indexed/tagged/deleted, 9,554 need human review |
+
+### Remaining work
+
+- **5,069 safe-to-delete branches remain** (5,505 total − 436 executed in first batch)
+- Subsequent batches will run during the next off-peak window (00:00–05:00 UTC)
+- 9,554 branches need human review (diverged + unmerged + no PR)

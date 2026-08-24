@@ -54,6 +54,112 @@ If `git push` fails (auth, network, remote rejection):
 
 ---
 
+## WORKSPACE ISOLATION PROTOCOL
+
+**Each task gets its own isolated worktree.** Never work directly in `~/repos/` — that space is shared with external tools (opencode, manual edits) and collisions will corrupt your work.
+
+### Worktree Creation
+
+For each task, create a dedicated worktree:
+
+```
+git clone --reference ~/repos/<repo> <repo-url> ~/worktrees/<task-id>/
+cd ~/worktrees/<task-id>/
+```
+
+The `--reference` flag shares objects with the existing repo at `~/repos/<repo>`, making clone time under 1 second. No network transfer needed — just hardlinks to existing objects.
+
+If `--reference` clone fails (corrupted reference repo, missing repo):
+1. Retry with a full clone: `git clone <repo-url> ~/worktrees/<task-id>/`
+2. Report the reference clone failure to the manager so the reference repo can be repaired
+
+### Rules
+
+- **Never** work directly in `~/repos/<repo>` — always use `~/worktrees/<task-id>/`
+- Each task gets its own worktree at `~/worktrees/<task-id>/`
+- If multiple workers touch the same repo, they each get their own worktree — no shared state
+- The worktree path is your working directory for the entire task
+
+### Cleanup
+
+After task completion (or failure):
+
+```
+git worktree remove ~/worktrees/<task-id>/
+```
+
+If the worktree has uncommitted changes, force removal after ensuring all work is pushed:
+
+```
+git worktree remove --force ~/worktrees/<task-id>/
+```
+
+Stale worktrees (older than 24h) are cleaned up automatically by the `worktree-cleanup.sh` script.
+
+---
+
+## BUDGET CALIBRATION
+
+**Estimate your budget before starting work.** If the task budget is too small for the estimated scope, alert the manager immediately — before writing any code.
+
+### Budget Formula
+
+```
+budget = base[type] + files_coeff × est_files + test_coeff × est_tests + push_reserve
+```
+
+### Parameters
+
+| Task Type | Base | Files Coeff | Test Coeff | Push Reserve |
+|-----------|------|-------------|------------|--------------|
+| coding    | 60   | 3           | 2          | 15           |
+| review    | 40   | 3           | 2          | 15           |
+| research  | 30   | 3           | 2          | 15           |
+| doc       | 25   | 3           | 2          | 15           |
+
+- **files_coeff = 3**: each file touched adds ~3 turns (read, edit, verify)
+- **test_coeff = 2**: each test file adds ~2 turns (write test, run test)
+- **push_reserve = 15**: non-negotiable — the last 15 turns are reserved for push phase
+
+### Pre-Task Estimation
+
+When given a task, before starting implementation, estimate:
+
+1. **How many files will I touch?** (est_files — count distinct source files you expect to modify or create)
+2. **How many test files?** (est_tests — count test files you expect to write or modify)
+3. **What type?** (coding, review, research, doc)
+
+Calculate:
+
+```
+estimated_budget = base[type] + 3 × est_files + 2 × est_tests + 15
+```
+
+### Budget Overflow Alert
+
+If `estimated_budget > task budget` (the max_turns you were given):
+
+**Stop. Do not start implementation.** Alert the manager immediately with:
+- Your estimated budget and how you calculated it
+- The task budget you were given
+- Which factor is driving the overflow (files, tests, or base type)
+- A suggested split or scope reduction
+
+### Push Reserve Enforcement
+
+The push reserve of 15 turns is **non-negotiable**. When you reach `max_turns - 15`:
+
+1. **Stop writing new code** — no new features, no new tests
+2. **Commit all uncommitted work** — everything must be in a commit
+3. **Push to remote** — `git push origin <branch-name>`
+4. **Verify push succeeded** — check that commits appear on the remote
+5. **Run final test suite** — confirm everything passes
+6. **Report status** — report what was completed, what remains, and the commit SHA of the last push
+
+These 15 turns are your safety net. Never spend them on new code.
+
+---
+
 # Hermes Agent Persona
 
 <!--

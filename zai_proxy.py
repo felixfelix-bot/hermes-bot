@@ -759,6 +759,45 @@ EXTERNAL_PROVIDERS = {
 MANAGER_FALLBACK_MODEL = "glm-5.2"
 WORKER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 
+# ── Known external model detection (FIX: silent substitution, 2026-08-25) ───
+# Models that are recognized by at least one external provider. If a model
+# is in this set (or starts with a known provider prefix), _try_external_failover
+# passes it through to the provider verbatim instead of silently substituting
+# WORKER_FALLBACK_MODEL. Unknown models cause failover to return False so the
+# caller sends a proper 404/503 — never HTTP 200 with a different model.
+_KNOWN_EXTERNAL_PREFIXES = ("deepseek/", "qwen", "minimax", "mimo")
+
+def _is_known_external_model(model: str | None) -> bool:
+    """Check if a model is known to at least one external provider.
+
+    A model is 'known' if:
+      1. It appears in _PROVIDER_MODEL_NAMES for any provider, OR
+      2. It starts with a known provider prefix (deepseek/, qwen, minimax, mimo), OR
+      3. It matches any model in the flat router's PROVIDER_MODELS sets.
+    """
+    if not model:
+        return False
+    # Check known prefixes
+    if model.startswith(_KNOWN_EXTERNAL_PREFIXES):
+        return True
+    # Check _PROVIDER_MODEL_NAMES (per-provider model mapping)
+    for _prov_map in _PROVIDER_MODEL_NAMES.values():
+        if model in _prov_map:
+            return True
+    # Check flat router PROVIDER_MODELS
+    try:
+        from flat_router import PROVIDER_MODELS
+        for _models in PROVIDER_MODELS.values():
+            if model in _models:
+                return True
+    except Exception:
+        pass
+    # Check z.ai native models (these are handled by z.ai keys, but if
+    # they reach failover, ollama_cloud can serve them)
+    if model in ("glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5"):
+        return True
+    return False
+
 # z.ai peak hours: Beijing 14:00-18:00 = UTC 6-10. During peak, z.ai burns 3x quota.
 # Ollama Cloud has no peak pricing — prefer it during these hours.
 _PEAK_HOURS_UTC = {6, 7, 8, 9, 10}
@@ -3104,7 +3143,7 @@ def _record_spend(key_name: str | None, model: str | None, total_tokens: int,
         cost = actual_cost if actual_cost is not None else _estimate_cost_usd(
             key_name, total_tokens, model=model,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-        today = _date.today().isoformat()
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')  # UTC, not local IST
         _usage_db().execute(
             "INSERT INTO daily_spend (date, tier, spend_usd, call_count, token_count) "
             "VALUES (?,?,?,1,?) ON CONFLICT(date, tier) "
@@ -3213,7 +3252,7 @@ def _ppq_hash_body(body: bytes) -> str:
 
 
 def _ppq_today() -> str:
-    return _date.today().isoformat()
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')  # UTC, not local IST
 
 
 def _ppq_hour_bucket() -> str:
@@ -5189,14 +5228,30 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             # oxalpha failed — fall through to paid chain below
 
-        # Choose failover model based on requesting profile's quality tier.
-        # Manager (glm-5.2/glm-5.3): quality floor at glm-5.2 externally
-        # (externals lack 5.3 until open weights land ~Aug 28).
-        # Workers (glm-4.5-flash): cheapest available (output gets vetted).
+        # ── FIX: Silent model substitution bug (2026-08-25) ──────────────────
+        # Previously, ANY non-glm-5.2/5.3 model was silently replaced with
+        # WORKER_FALLBACK_MODEL ("deepseek/deepseek-v4-flash") and returned
+        # HTTP 200 — customers got a cheaper model without knowing.
+        #
+        # New behavior:
+        #   1. glm-5.2/glm-5.3 → MANAGER_FALLBACK_MODEL (unchanged, intended)
+        #   2. Known external models (in _PROVIDER_MODEL_NAMES for any
+        #      provider, or starting with known prefixes like deepseek/,
+        #      qwen, minimax, mimo) → passed through verbatim. The provider
+        #      will either serve it or return 404, which we propagate.
+        #   3. Truly unknown models → return False immediately so the caller
+        #      sends a proper 503/404 error. NEVER return 200 with a
+        #      different model than what was requested.
         if model in ("glm-5.2", "glm-5.3"):
             ext_model = MANAGER_FALLBACK_MODEL
+        elif model is not None and _is_known_external_model(model):
+            ext_model = model  # pass through verbatim — provider handles 404
         else:
-            ext_model = WORKER_FALLBACK_MODEL
+            # Unknown model — don't silently substitute. Return False so
+            # the caller sends a proper error response.
+            print(f"[failover] rejecting unknown model={model!r} — "
+                  f"no silent substitution", flush=True)
+            return False
 
         # Collect funded providers with their cost
         candidates = []
@@ -6727,6 +6782,7 @@ class Handler(BaseHTTPRequestHandler):
                     _m("kimi-k2.7-code", "ollama"),
                     _m("kimi-k3:cloud", "ollama"),
                     _m("kimi-k3", "telnyx"),
+                    _m("minimax-m3:cloud", "ollama"),
                 ]
             }
             payload = json.dumps(models_data).encode()
@@ -6740,7 +6796,7 @@ class Handler(BaseHTTPRequestHandler):
             # Daily spend tracker — shows current spend vs caps
             self.close_connection = True
             try:
-                today = _date.today().isoformat()
+                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')  # UTC, not local IST
                 rows = _usage_db().execute(
                     "SELECT tier, spend_usd, call_count, token_count "
                     "FROM daily_spend WHERE date=?", (today,)).fetchall()

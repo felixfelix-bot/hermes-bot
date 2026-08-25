@@ -90,11 +90,13 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+        "minimax-m3:cloud",
     },
     "ollama_cloud_2": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+        "minimax-m3:cloud",
     },
     # OpenCode Go — flat-rate $10/mo, native glm-5.3, 29 models
     "opencode_go": {

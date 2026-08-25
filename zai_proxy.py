@@ -3954,7 +3954,7 @@ def _build_key_state_overview() -> str:
     import datetime as _dt
     lines = []
     now = time.time()
-    today = _dt.date.today().isoformat()
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     try:
         db = _usage_db()

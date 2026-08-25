@@ -123,6 +123,27 @@ _ollama_quota_cache: dict[str, dict] = {}
 _ollama_quota_cache_ts: dict[str, float] = {}
 _OLLAMA_QUOTA_CACHE_TTL = 30.0  # seconds
 
+# OpenCode Go allowance cache — parsed from response body's cost.allowance_remaining_usd.
+# Go is a $10/mo flat-rate subscription with an allowance that depletes; once it
+# hits $0, requests switch to pay-per-use. Tracking it lets the flat router apply
+# per-model pressure (models burning more of the allowance get penalized).
+_opencode_go_allowance: dict = {"remaining_usd": None, "ts": 0.0}
+_OPENCODE_GO_INITIAL_ALLOWANCE = 10.0  # $10/mo
+
+# Per-(provider, model) burn share cache. Updated from api_calls table by
+# _compute_model_burn_share(). Used by the flat router's effective price
+# formula to push high-burn models off scarce providers.
+_model_burn_cache: dict[str, dict[str, float]] = {}  # provider → {model → share}
+_model_burn_cache_ts: float = 0.0
+_MODEL_BURN_CACHE_TTL = 60.0  # seconds
+
+# Key-state transition tracking for sustained-down alerts.
+# _key_down_since[name] = timestamp when the key first went unhealthy.
+# _key_alerted[name] = True after the 15-min CRITICAL alert fires (once per down period).
+_key_down_since: dict[str, float] = {}
+_key_alerted: dict[str, bool] = {}
+_KEY_SUSTAINED_DOWN_THRESHOLD = 900.0  # 15 minutes
+
 def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
     """Get cached or fresh ollama_cloud quota status for a specific key.
     Thread-safe.
@@ -673,6 +694,14 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
         "deepseek/gemma-4-31b":        "gemma-4-31b",
     },
+    "ollama_cloud": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_2": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
 }
 
 # NeuralWatt per-model pricing ($/M tokens) for accurate cost_usd logging.
@@ -996,10 +1025,16 @@ def _mark_key_failure(name: str, error_type: str = "exhausted") -> None:
     try:
         now = time.time()
         prev = _zai_key_health.get(name, {})
+        prev_healthy = prev.get("healthy", True)
         failures = int(prev.get("consecutive_failures", 0)) + 1
+
+        # Track health transition: available → unavailable
+        if prev_healthy:
+            _key_down_since[name] = now
+            _key_alerted.pop(name, None)  # new down period, allow re-alert
         if error_type == "dead":
             backoff = _DEAD_KEY_BACKOFF_SECONDS
-        elif error_type == "server":
+        elif error_type in ("server", "dispatch_fail"):
             backoff = _SERVER_ERROR_BACKOFF_SECONDS
         else:  # "exhausted" — 429 / empty response
             backoff = _backoff_for_failure(failures)
@@ -1092,6 +1127,14 @@ def _mark_key_healthy(name: str) -> None:
             "retry_after": 0 if not disabled else prev.get("retry_after", 0),
         }
         _log_key_health(name, _zai_key_health[name])
+        # Track recovery transition: unavailable → available
+        if name in _key_down_since:
+            down_duration = time.time() - _key_down_since.pop(name)
+            _key_alerted.pop(name, None)
+            _log_anomaly("INFO", "KEY_RECOVERED",
+                         f"{name} recovered after {down_duration/60:.0f}min",
+                         f"down_since={time.ctime(_key_down_since.get(name, 0))}",
+                         key_name=name)
     except Exception:
         pass
 
@@ -1145,6 +1188,53 @@ def _get_measured_rate(provider: str, model: str) -> float | None:
         except Exception:
             return None
     return _measured_rate_cache["rates"].get((provider, model))
+
+
+def _compute_model_burn_share(provider: str, model: str,
+                               window_s: float = 3600.0) -> float:
+    """Compute model's share of a provider's token burn in the last window.
+
+    Returns a float in [0.0, 1.0]: what fraction of the provider's total
+    tokens in the window came from this model. Used by the flat router's
+    per-model pressure formula: when a provider's quota is depleting,
+    models contributing the most burn get penalized first (pushed to
+    alternative providers). Cached for _MODEL_BURN_CACHE_TTL seconds.
+    """
+    global _model_burn_cache, _model_burn_cache_ts
+    try:
+        now = time.time()
+        if now - _model_burn_cache_ts < _MODEL_BURN_CACHE_TTL:
+            prov_cache = _model_burn_cache.get(provider, {})
+            return prov_cache.get(model, 0.0)
+
+        # Query api_calls for per-model token counts in the window
+        since = now - window_s
+        rows = _usage_db().execute(
+            "SELECT model, SUM(total_tokens) as tokens "
+            "FROM api_calls WHERE key_name=? AND ts>? AND total_tokens>0 "
+            "GROUP BY model", (provider, since)).fetchall()
+        total = sum(r[1] for r in rows) if rows else 0
+        prov_cache = {}
+        if total > 0:
+            for r in rows:
+                prov_cache[r[0]] = r[1] / total
+        _model_burn_cache[provider] = prov_cache
+        _model_burn_cache_ts = now
+        return prov_cache.get(model, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _opencode_go_quota_fraction() -> float:
+    """Return Go allowance remaining as a fraction [0.0, 1.0].
+    1.0 = full allowance, 0.0 = depleted (pay-per-use mode)."""
+    try:
+        rem = _opencode_go_allowance.get("remaining_usd")
+        if rem is None:
+            return 1.0  # unknown → optimistic
+        return max(0.0, min(1.0, rem / _OPENCODE_GO_INITIAL_ALLOWANCE))
+    except Exception:
+        return 1.0
 
 
 def _get_provider_cost(name: str, model_id: str) -> float:
@@ -3814,6 +3904,167 @@ def _calibrate_telnyx_rates():
         pass  # calibration must never break the refresh loop
 
 
+def _build_key_state_overview() -> str:
+    """Build a comprehensive situation overview for the sustained-down alert.
+
+    Shows: today's burn per provider, last-1h burn, key states with failure
+    details, quota/allowance pressure, effective routing chains, and action hints.
+    """
+    import datetime as _dt
+    lines = []
+    now = time.time()
+    today = _dt.date.today().isoformat()
+
+    try:
+        db = _usage_db()
+
+        # Today's burn
+        spend_rows = db.execute(
+            "SELECT tier, spend_usd, call_count, token_count "
+            "FROM daily_spend WHERE date=?", (today,)).fetchall()
+        total_spend = sum(r[1] for r in spend_rows) if spend_rows else 0
+
+        # Last 1h burn
+        h1_ago = now - 3600
+        burn_rows = db.execute(
+            "SELECT key_name, COUNT(*), SUM(total_tokens), "
+            "AVG(duration_ms), MAX(duration_ms) "
+            "FROM api_calls WHERE ts>? GROUP BY key_name", (h1_ago,)).fetchall()
+    except Exception:
+        spend_rows, burn_rows, total_spend = [], [], 0
+
+    # Key states
+    health = _snapshot_health()
+    quota = _snapshot_quota()
+    all_keys = ["ours", "friend", "ollama_cloud", "ollama_cloud_2", "opencode_go",
+                "neuralwatt", "deepinfra", "telnyx", "ppq", "openrouter",
+                "routstr", "routstrd"]
+
+    lines.append("")
+    lines.append("═══ TODAY'S BURN ═══")
+    for r in sorted(spend_rows, key=lambda x: -x[1]) if spend_rows else []:
+        lines.append(f"  {r[0]:20s} ${r[1]:8.2f}  ({r[2]:5d} calls, {r[3]/1e6:.1f}M tokens)")
+    lines.append(f"  {'Total':20s} ${total_spend:8.2f}")
+
+    lines.append("")
+    lines.append("═══ KEY STATES ═══")
+    for name in all_keys:
+        h = health.get(name, None)
+        qh = _zai_key_health.get(name, {})
+        qp = quota.get(name, {})
+        key_present = bool(_EXTERNAL_KEYS.get(name) or KEYS.get(name))
+
+        if not key_present and name not in ("ours", "friend"):
+            status = "MISSING — no key configured"
+        elif h is False:
+            fail_count = qh.get("consecutive_failures", 0)
+            err_type = qh.get("last_error_type", "?")
+            backoff = qh.get("backoff_seconds", 0)
+            status = f"UNHEALTHY — {err_type}, {backoff}s backoff, {fail_count} failures"
+        elif h is True:
+            quota_pct = qp.get("used_pct", 0) if isinstance(qp, dict) else 0
+            regime = qp.get("regime", "") if isinstance(qp, dict) else ""
+            if isinstance(quota_pct, (int, float)) and quota_pct >= 100:
+                status = f"HEALTHY but quota locked ({quota_pct:.0f}% used)"
+            else:
+                status = "HEALTHY"
+        else:
+            status = "UNKNOWN"
+
+        # Add quota/allowance info
+        if name == "opencode_go":
+            allow = _opencode_go_allowance.get("remaining_usd")
+            if allow is not None:
+                status += f" (allowance ${allow:.2f} remaining)"
+        elif name in ("ollama_cloud", "ollama_cloud_2"):
+            sess = qp.get("session_used_pct", 0) if isinstance(qp, dict) else 0
+            wkly = qp.get("weekly_used_pct", 0) if isinstance(qp, dict) else 0
+            if isinstance(sess, (int, float)):
+                status += f" (session {sess:.0f}%, weekly {wkly:.0f}%)"
+
+        lines.append(f"  {name:20s} {status}")
+
+    # Effective routing for common models
+    lines.append("")
+    lines.append("═══ EFFECTIVE ROUTING ═══")
+    try:
+        from flat_router import select_provider as _sp
+        for model in ["glm-5.2", "deepseek/deepseek-v4-flash", "kimi-k3"]:
+            candidates = _sp(model=model)
+            chain = " → ".join(c.name for c in candidates[:6] if c.name != "fallback")
+            first_healthy = next((c.name for c in candidates if c.name != "fallback"
+                                  and health.get(c.name, True)), "NONE")
+            lines.append(f"  {model:35s} chain: {chain}")
+            lines.append(f"  {'':35s} first healthy: {first_healthy}")
+    except Exception:
+        lines.append("  (flat router unavailable)")
+
+    # Last 1h burn
+    lines.append("")
+    lines.append("═══ LAST 1H BURN ═══")
+    for r in sorted(burn_rows, key=lambda x: -x[2]) if burn_rows else []:
+        lines.append(f"  {r[0]:20s} {r[1]:4d} calls, {r[2]/1e6:6.1f}M tokens, "
+                     f"avg {r[3]:.0f}ms, max {r[4]}ms")
+
+    lines.append("")
+    lines.append("═══ ACTION NEEDED ═══")
+    for name in all_keys:
+        if health.get(name) is False and name in _key_down_since:
+            down_min = (now - _key_down_since[name]) / 60
+            qh = _zai_key_health.get(name, {})
+            err = qh.get("last_error_type", "?")
+            if err == "dead":
+                lines.append(f"  {name}: DEAD key (401/403) — rotate the API key")
+            elif err == "dispatch_fail":
+                lines.append(f"  {name}: transient dispatch failures ({down_min:.0f}min) — check network/provider status")
+            elif err == "exhausted":
+                lines.append(f"  {name}: quota exhausted — wait for reset or use a different provider")
+
+    return "\n".join(lines)
+
+
+def _check_sustained_down():
+    """Check for keys that have been unavailable for ≥15 min and fire alerts.
+
+    Called from _refresh_loop every CACHE_TTL (5 min). Fires ONCE per down
+    period (tracked by _key_alerted). Writes a CRITICAL anomaly + journald
+    print + espeak-ng voice notice.
+    """
+    try:
+        now = time.time()
+        for name, down_since in list(_key_down_since.items()):
+            if _key_alerted.get(name):
+                continue
+            down_duration = now - down_since
+            if down_duration >= _KEY_SUSTAINED_DOWN_THRESHOLD:
+                _key_alerted[name] = True
+                overview = _build_key_state_overview()
+                alert_text = (
+                    f"KEY SUSTAINED DOWN: \"{name}\" unavailable "
+                    f"{down_duration/60:.0f}min (since {time.ctime(down_since)})"
+                    f"{overview}"
+                )
+                # 1. Anomaly table (surfaced by anomaly-notify.sh cron)
+                _log_anomaly("CRITICAL", "KEY_SUSTAINED_DOWN",
+                             f"{name} unavailable {down_duration/60:.0f}min",
+                             alert_text, key_name=name)
+                # 2. Journald (immediate visibility)
+                print(f"\n{'='*60}", flush=True)
+                print(alert_text, flush=True)
+                print(f"{'='*60}\n", flush=True)
+                # 3. Voice notification
+                try:
+                    import subprocess as _sp
+                    _sp.Popen(["espeak-ng",
+                               f"Alert: key {name} has been unavailable for "
+                               f"{down_duration/60:.0f} minutes"],
+                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _refresh_loop():
     _refresh_iteration = 0
     while True:
@@ -3853,6 +4104,8 @@ def _refresh_loop():
         # calibration factor that corrects for prompt-caching discounts.
         if _refresh_iteration % 2 == 0:
             _calibrate_telnyx_rates()
+        # Check for keys that have been unavailable for ≥15 min
+        _check_sustained_down()
         time.sleep(CACHE_TTL)
 
 
@@ -4201,9 +4454,13 @@ class Handler(BaseHTTPRequestHandler):
         # (glm-5.2 → glm-5.2, no :cloud suffix needed for direct API).
         # glm-5.3 is NOT in Ollama Cloud's catalog — downgrade to glm-5.2
         # (same 743B base; externals only have 5.2 until open weights land).
+        # For deepseek models, translate to Ollama's tagged IDs via
+        # _PROVIDER_MODEL_NAMES (e.g. deepseek/deepseek-v4-flash → deepseek-v4-flash:0731).
         ollama_model = model or "glm-5.2"
         if ollama_model == "glm-5.3":
             ollama_model = "glm-5.2"
+        _oc_map = _PROVIDER_MODEL_NAMES.get(key_name, {})
+        ollama_model = _oc_map.get(ollama_model, ollama_model)
 
         try:
             body_json = json.loads(body) if body else {}
@@ -4502,6 +4759,18 @@ class Handler(BaseHTTPRequestHandler):
                 _record_spend("opencode_go", og_model, og_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy("opencode_go")
+
+                # Parse allowance_remaining_usd from Go response body for
+                # per-model pressure routing. The field is nested under
+                # cost.allowance_remaining_usd in the JSON response.
+                try:
+                    _og_resp = json.loads(bytes(response_buffer))
+                    _og_allow = _og_resp.get("cost", {}).get("allowance_remaining_usd")
+                    if _og_allow is not None:
+                        _opencode_go_allowance["remaining_usd"] = float(_og_allow)
+                        _opencode_go_allowance["ts"] = time.time()
+                except Exception:
+                    pass
                 if _LIVE_ROUTER is not None:
                     try:
                         _LIVE_ROUTER.record_request(provider="opencode_go", tokens=og_tokens)
@@ -4786,6 +5055,109 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[failover] oxalpha exception: {type(e).__name__}: {e} — trying next", flush=True)
             return False
 
+    def _try_external_single(self, provider_name: str, body: bytes,
+                              model: str | None,
+                              response_buffer: bytearray, t0: float) -> bool:
+        """Try a SINGLE external provider. Returns True on success (response
+        sent), False on failure (caller tries next candidate).
+
+        Unlike _try_external_failover which iterates ALL external providers,
+        this method contacts exactly ONE provider. Used by the flat router's
+        _dispatch_external so candidate ordering is respected.
+
+        On 401/403: marks the key as dead (1h backoff) — the key is likely
+        revoked. On 402: marks unfunded. Other errors: just return False.
+        """
+        prov = EXTERNAL_PROVIDERS.get(provider_name)
+        if not prov or not prov.get("key"):
+            return False
+
+        # Determine the model name for this provider
+        ext_model = model or "glm-5.2"
+        actual_model = _PROVIDER_MODEL_NAMES.get(provider_name, {}).get(ext_model, ext_model)
+
+        try:
+            body_json = json.loads(body) if body else {}
+            body_json["model"] = actual_model
+            if provider_name == "neuralwatt":
+                for _sk in ("reasoning", "task_type", "tier_hint",
+                            "X-Model-Tier", "X-Task-Type"):
+                    body_json.pop(_sk, None)
+            fwd_body = json.dumps(body_json).encode()
+
+            url = prov["base_url"] + "/chat/completions"
+            hdrs = {
+                "Authorization": f"Bearer {prov['key']}",
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0",
+            }
+            if provider_name == "openrouter":
+                hdrs["HTTP-Referer"] = "https://hermes.local"
+                hdrs["X-Title"] = "Hermes Agent"
+
+            print(f"[flat-router] trying {provider_name} model={actual_model}", flush=True)
+            req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    self.send_response(resp.status)
+                    for h, v in resp.headers.items():
+                        if h.lower() not in ("transfer-encoding", "connection"):
+                            self.send_header(h, v)
+                    self.send_header("X-Failover-Provider", provider_name)
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        response_buffer.extend(chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    _mark_funded(provider_name)
+                    _mark_key_healthy(provider_name)
+                    ext_usage = _parse_usage(bytes(response_buffer))
+                    ext_tokens = int(ext_usage.get("total_tokens") or 0)
+                    ext_cost, ext_src = _extract_cost(
+                        provider_name, bytes(response_buffer), ext_tokens)
+                    _record_spend(provider_name, actual_model, ext_tokens,
+                                  actual_cost=ext_cost,
+                                  prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                                  completion_tokens=int(ext_usage.get("completion_tokens") or 0))
+                    if _LIVE_ROUTER is not None:
+                        try:
+                            _LIVE_ROUTER.record_request(provider=provider_name, tokens=ext_tokens)
+                        except Exception:
+                            pass
+                    self._spend_recorded = True
+                    _log_api_call(
+                        key_name=provider_name, key_suffix=prov["key"][-4:],
+                        model=actual_model,
+                        prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                        completion_tokens=int(ext_usage.get("completion_tokens") or 0),
+                        total_tokens=ext_tokens,
+                        tier="flat_router", status_code=resp.status, error=None,
+                        duration_ms=int((time.time() - t0) * 1000),
+                        cost_usd=ext_cost, cost_source=ext_src,
+                        session_id=getattr(self, "_session_id", None),
+                        task_type=getattr(self, "_task_type", None),
+                    )
+                    return True
+            except urllib.error.HTTPError as he:
+                if he.code == 401 or he.code == 403:
+                    print(f"[flat-router] {provider_name} returned {he.code} — marking DEAD (1h backoff)", flush=True)
+                    _mark_key_failure(provider_name, "dead")
+                elif he.code == 402:
+                    print(f"[flat-router] {provider_name} returned 402 — marking unfunded", flush=True)
+                    _mark_unfunded(provider_name)
+                elif he.code == 429:
+                    print(f"[flat-router] {provider_name} returned 429 — marking exhausted", flush=True)
+                    _mark_key_exhausted(provider_name)
+                else:
+                    print(f"[flat-router] {provider_name} returned HTTP {he.code}", flush=True)
+                return False
+        except Exception as e:
+            print(f"[flat-router] {provider_name} exception: {type(e).__name__}: {e}", flush=True)
+            return False
+
     def _try_external_failover(self, body: bytes, model: str | None,
                                 response_buffer: bytearray, t0: float,
                                 preferred: str | None = None) -> bool:
@@ -5042,6 +5414,26 @@ class Handler(BaseHTTPRequestHandler):
         # respect to the body — the forwarded request is untouched.
         self._task_type = _resolve_task_type(self.headers, body)
 
+        # Early bail: model-only probe (no messages field) — return 400
+        # immediately. These are health-check/model-availability probes that
+        # every provider rejects with 422. Don't waste time cycling providers.
+        try:
+            _probe = json.loads(body) if body else {}
+            if not isinstance(_probe, dict) or not _probe.get("messages"):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "38")
+                self.end_headers()
+                self.wfile.write(b'{"error":"messages field required"}')
+                return
+        except Exception:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "33")
+            self.end_headers()
+            self.wfile.write(b'{"error":"invalid request body"}')
+            return
+
         # ── Pressure FSM shadow hook (S2b, t_4dfaf0d5) ────────────────────
         # Compute + log the pressure decision this request WOULD get.
         # READ-ONLY: `body`, `chosen` and every routing step below are
@@ -5075,50 +5467,6 @@ class Handler(BaseHTTPRequestHandler):
         # Ordered AFTER the global spend cap so enforcement can never
         # bypass the runaway-loop circuit breaker.
         if self._pressure_enforce(self._pressure_decision, body, t0):
-            return
-
-        # Step 1c: Ollama-only models — route directly to Ollama Cloud
-        # These models don't exist on z.ai, so skip z.ai entirely
-        _OLLAMA_ONLY_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud", "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b"}
-        if original_model in _OLLAMA_ONLY_MODELS and OLLAMA_CLOUD_KEY:
-            response_buffer = bytearray()
-            if self._try_ollama_cloud_any(body, original_model, response_buffer, t0):
-                return
-            # Try Telnyx fallback for Kimi models before returning 503
-            if original_model in _TELNYX_FALLBACK_MODELS:
-                telnyx_buffer = bytearray()
-                if self._try_telnyx(body, original_model, telnyx_buffer, t0):
-                    return
-            # If both Ollama Cloud and Telnyx fail, return 503
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(f'{{"error":"both ollama cloud and telnyx failed for ollama-only model {original_model}"}}'.encode())
-            return
-
-        # Step 1c-2: Telnyx-direct models — route directly to Telnyx.
-        # These models (e.g. kimi-k3) don't exist on z.ai or Ollama, so
-        # skip z.ai entirely and send straight to Telnyx's API.
-        if original_model in _TELNYX_DIRECT_MODELS and TELNYX_KEY:
-            response_buffer = bytearray()
-            if self._try_telnyx(body, original_model, response_buffer, t0):
-                return
-            # Telnyx failed — fall through to normal z.ai/failover chain
-            # (z.ai will also fail, but Ollama/external failover may work)
-
-        # Step 1c-3: Non-z.ai models (deepseek, qwen, etc.) — skip z.ai
-        # entirely and go straight to external failover. z.ai returns 400
-        # for any model not in its catalog, wasting a round-trip.
-        if original_model and original_model.startswith(("deepseek/", "qwen", "minimax", "mimo")):
-            response_buffer = bytearray()
-            if OPENCODE_GO_KEY and self._try_opencode_go(body, original_model, response_buffer, t0):
-                return
-            if self._try_external_failover(body, original_model, response_buffer, t0):
-                return
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(f'{{"error":"all external providers failed for non-z.ai model {original_model}"}}'.encode())
             return
 
         # ── Phase 3: Flat router full cutover ──────────────────────────────
@@ -5291,7 +5639,7 @@ class Handler(BaseHTTPRequestHandler):
                         # key is in backoff, making it never recover).
                         try:
                             if _is_key_healthy(_cand.name):
-                                _mark_key_failure(_cand.name, "flat_router_dispatch_fail")
+                                _mark_key_failure(_cand.name, "dispatch_fail")
                         except Exception:
                             pass
                         continue

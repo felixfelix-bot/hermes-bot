@@ -76,23 +76,25 @@ class ProviderCandidate:
 # NO CAPS on any provider — free market price discovery.
 
 PROVIDER_MODELS: dict[str, set[str]] = {
-    # z.ai keys — all z.ai models
+    # z.ai keys — z.ai catalog only (deepseek/qwen/minimax/mimo are NOT
+    # served by z.ai — they get 400. Excluded here so the flat router never
+    # tries z.ai for them; the key is NOT marked dead, just not a candidate.)
     "ours": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
-        "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
     },
     "friend": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
-        "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
     },
     # Ollama Cloud — included subscription, wide model catalog
     "ollama_cloud": {
         "glm-5.2", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
     },
     "ollama_cloud_2": {
         "glm-5.2", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
     },
     # OpenCode Go — flat-rate $10/mo, native glm-5.3, 29 models
     "opencode_go": {
@@ -431,6 +433,7 @@ def compute_effective_price(
     provider: str,
     base_rate: float,
     context: dict | None = None,
+    model: str | None = None,
 ) -> float:
     """Compute the effective $/M price for a provider based on its tier.
 
@@ -517,8 +520,32 @@ def compute_effective_price(
             effective = base_rate * (1.0 + depletion_penalty) * NW_CORRECTION_FACTOR
 
         elif tier in ("flat", "included"):
-            # T3/T4: flat-rate / included — $0.001/M floor
+            # T3/T4: flat-rate / included — $0.001/M floor + per-model pressure.
+            # When the provider's quota/allowance is depleting, models that
+            # contribute the most burn get a higher effective price (pushed
+            # to alternative providers). This implements per-model pressure:
+            # if glm-5.2 burn is high on opencode_go, glm-5.2's Go price rises
+            # above ollama_cloud's floor → glm-5.2 migrates to ollama_cloud.
             effective = MIN_EFFECTIVE_PRICE
+            if model:
+                try:
+                    import zai_proxy as _zp
+                    # Get provider scarcity (0 = full, 1 = depleted)
+                    if tier == "flat":
+                        scarcity = 1.0 - _zp._opencode_go_quota_fraction()
+                    else:
+                        # ollama_cloud: use session used_pct
+                        _oc_status = _zp._get_ollama_quota_status(provider)
+                        scarcity = max(_oc_status.get("session_used_pct", 0),
+                                       _oc_status.get("weekly_used_pct", 0)) / 100.0
+                    if scarcity > 0.01:
+                        burn_share = _zp._compute_model_burn_share(provider, model)
+                        # Burn premium: big burners on scarce providers pay more
+                        BURN_PREMIUM_FACTOR = 2.0
+                        effective = MIN_EFFECTIVE_PRICE * (1.0 + scarcity
+                                + burn_share * scarcity * BURN_PREMIUM_FACTOR)
+                except Exception:
+                    pass
 
         else:
             # T5: per-token — Kalman-measured rate, no time decay
@@ -607,7 +634,7 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
 
                 # For all other tiers, use compute_effective_price() which
                 # applies the tier-specific formula on top of the Kalman base.
-                effective = compute_effective_price(name, base_rate, context)
+                effective = compute_effective_price(name, base_rate, context, model=model_id)
                 return float(effective)
     except Exception:
         pass
@@ -615,7 +642,7 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
     # Fall back: use seed rate with tier formula
     try:
         base_rate = _SEED_RATES.get(name, 999.0)
-        effective = compute_effective_price(name, base_rate)
+        effective = compute_effective_price(name, base_rate, model=model_id)
         return float(effective)
     except Exception:
         pass
@@ -670,9 +697,9 @@ def _make_dispatch_fn(name: str) -> Callable | None:
         return _dispatch_telnyx
 
     # External providers (deepinfra, ppq, openrouter, neuralwatt, routstr, routstrd)
-    # → _try_external_failover with preferred=name
+    # → _try_external_single (contacts exactly ONE provider, not the whole chain)
     def _dispatch_external(handler, body, model, buffer, t0):
-        return handler._try_external_failover(body, model, buffer, t0, preferred=name)
+        return handler._try_external_single(name, body, model, buffer, t0)
     return _dispatch_external
 
 

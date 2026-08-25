@@ -1229,6 +1229,18 @@ USAGE_DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
 _usage_db_conn: sqlite3.Connection | None = None
 _usage_db_lock = threading.Lock()
 
+# ── CG-2 price-exposure state (written by collect_price_observations.py) ─────
+# JSON {generated_ts, kalman_verdict, capacity_estimates}. Read by
+# _build_v1_pricing() for the /v1/pricing endpoint's convergence gate and
+# per-key smoothed capacity denominators. Absent file → "unverified" gate.
+_PRICING_EXPOSURE_STATE = str(
+    Path.home() / ".hermes" / "bot" / ".pricing_exposure_state.json"
+)
+
+# ── CG-2 provider config (z.ai fees + entitlement). Points at the MRE repo's
+# providers.yaml; overridden in tests. Used by _build_v1_pricing().
+PROVIDERS_YAML = str(Path.home() / "merchant-routing-engine" / "config" / "providers.yaml")
+
 quota_cache: dict[str, tuple[list[dict], float]] = {}   # name → (windows, ts)
 
 # ── Phase 2.4: Pace windows for LiveRouter ──────────────────────────────────
@@ -2662,6 +2674,115 @@ def _get_routstrd_rates() -> dict:
         return _routstrd_rates_cache["rates"]
     base = _EXTERNAL_KEYS.get("routstrd_base", "http://localhost:8008")
     return _fetch_openrouter_style_rates(base, _routstrd_rates_cache)
+
+
+# ── CG-2 GET /v1/pricing (price exposure, plan v2.1 §2.1 / §0.5) ─────────────
+# Builds the price-exposure payload: z.ai subscription rows (fee ÷ entitlement
+# baseline × pressure × peak, plus a Kalman-gated forecast) and flat-tier rows
+# (routstrd / routstr catalog rates). Delegates to src.pricing_exposure so the
+# gate and the endpoint cannot drift. Never raises — degrades to a minimal
+# payload on any error so the endpoint stays responsive.
+def _build_v1_pricing(
+    model: str | None = None,
+    horizon_min: int | None = None,
+) -> dict:
+    # Lazy import: pull the pure builders from the MRE repo (already on
+    # sys.path via the shadow-hook bridge). Any failure degrades gracefully.
+    try:
+        from src.pricing_exposure import (
+            build_flat_row,
+            build_pricing_payload,
+            build_zai_pricing_row,
+            load_zai_fees,
+            trailing_usage_tokens,
+        )
+    except Exception:
+        return {
+            "error": "pricing_exposure unavailable",
+            "providers": {},
+            "kalman_convergence": {"green": False, "verdict": "unverified"},
+        }
+
+    now_ts = time.time()
+
+    # ── collector state: kalman verdict + smoothed capacity estimates ──────
+    kalman_verdict: str | None = None
+    capacity_estimates: dict[str, float] = {}
+    try:
+        with open(_PRICING_EXPOSURE_STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+        kalman_verdict = st.get("kalman_verdict") if isinstance(st, dict) else None
+        se = st.get("capacity_estimates") if isinstance(st, dict) else None
+        if isinstance(se, dict):
+            capacity_estimates = {str(k): float(v) for k, v in se.items() if v}
+    except Exception:
+        kalman_verdict = None  # missing/unreadable → unverified gate
+
+    rows: dict[str, dict] = {}
+
+    # ── z.ai subscription rows (per configured key) ─────────────────────────
+    try:
+        fees = load_zai_fees(PROVIDERS_YAML)
+    except Exception:
+        fees = {}
+
+    zai_keys = [k for k in KEYS if k in fees]
+    for key_name in zai_keys:
+        fee_cfg = fees.get(key_name) or {}
+        windows = quota_cache.get(key_name, ([], 0.0))[0]
+        try:
+            projections = _get_cached_predictions(key_name)
+        except Exception:
+            projections = []
+        try:
+            row = build_zai_pricing_row(
+                provider=key_name,
+                monthly_fee_usd=float(fee_cfg.get("monthly_fee_usd", 0.0) or 0.0),
+                entitlement_tokens_mo=float(
+                    fee_cfg.get("entitlement_tokens_mo", 18.45e9)
+                ),
+                capacity_estimate_tokens=capacity_estimates.get(key_name),
+                trailing_30d_tokens=float(trailing_usage_tokens(USAGE_DB, key_name, 30)),
+                windows=windows,
+                projections=projections,
+                now_ts=now_ts,
+                kalman_verdict=kalman_verdict,
+                extra_horizons_min=([int(horizon_min)] if horizon_min else ()),
+            )
+            if row.get("provider"):
+                rows[key_name] = row
+        except Exception as _e:
+            print(f"[v1/pricing] zai row failed for {key_name}: {_e}", flush=True)
+
+    # ── flat-tier rows (routstrd, routstr) from catalog rates ───────────────
+    for prov_name in ("routstrd", "routstr"):
+        try:
+            rates = (_get_routstrd_rates() if prov_name == "routstrd"
+                     else _get_routstr_rates()) or {}
+            usable = {k: v for k, v in rates.items() if isinstance(v, (int, float))}
+            if not usable:
+                continue
+            if model and model in usable:
+                catalog = float(usable[model])
+            else:
+                catalog = float(min(usable.values()))
+            rows[prov_name] = build_flat_row(
+                provider=prov_name,
+                catalog_price_usd_per_m=catalog,
+                measured=False,
+                now_ts=now_ts,
+            )
+        except Exception as _e:
+            print(f"[v1/pricing] flat row failed for {prov_name}: {_e}", flush=True)
+
+    payload = build_pricing_payload(
+        rows=rows,
+        kalman_verdict=kalman_verdict,
+        model=model,
+        horizon_min=int(horizon_min) if horizon_min else None,
+        now_ts=now_ts,
+    )
+    return payload
 
 
 # Balance snapshot cache for routstrd — fixes the 300s/300s race condition
@@ -5842,7 +5963,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self): self._proxy()
     def do_PUT(self):  self._proxy()
     def do_GET(self):
-        if self.path == "/quota":
+        if self.path == "/v1/pricing" or self.path.startswith("/v1/pricing?"):
+            # CG-2 price-exposure feed (plan v2.1 §2.1). Read-only snapshot.
+            # ?model= filters flat-tier catalog rates; ?horizon_min= appends a
+            # forecast horizon for task-duration pricing.
+            self.close_connection = True
+            try:
+                from urllib.parse import urlsplit, parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                _model = qs.get("model", [None])[0]
+                _h = qs.get("horizon_min", [None])[0]
+                _horizon = int(_h) if _h is not None and str(_h).lstrip("-").isdigit() else None
+                result = _build_v1_pricing(model=_model, horizon_min=_horizon)
+                payload = json.dumps(result, indent=2).encode()
+            except Exception as e:
+                payload = json.dumps(
+                    {"error": str(e), "hint": "v1/pricing endpoint failed"},
+                    indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/quota":
             with lock:
                 data = {}
                 for n, v in quota_cache.items():

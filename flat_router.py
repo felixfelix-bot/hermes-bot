@@ -87,12 +87,12 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     },
     # Ollama Cloud — included subscription, wide model catalog
     "ollama_cloud": {
-        "glm-5.2", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
+        "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
     },
     "ollama_cloud_2": {
-        "glm-5.2", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
+        "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
     },

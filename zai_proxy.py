@@ -695,10 +695,12 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/gemma-4-31b":        "gemma-4-31b",
     },
     "ollama_cloud": {
+        "glm-5.3":                    "glm-5.2",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
     "ollama_cloud_2": {
+        "glm-5.3":                    "glm-5.2",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },

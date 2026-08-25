@@ -1,7 +1,7 @@
 # Plan: Flat-Router Cutover + Per-Model Pressure + Transition Alerts + Repo Hygiene
 
 **Date:** 2026-08-25
-**Status:** IMPLEMENTING
+**Status:** DONE — old path kept as rollback safety net (`.disable_flat_router` flag)
 
 ## Problem Summary
 
@@ -29,43 +29,43 @@
 ## Checklist
 
 ### Part 0 — Git hygiene
-- [ ] P0.1 Commit current zai_proxy.py state; push dr
-- [ ] P0.2 Create plans/ in repo; add runtime state files to .gitignore if needed
+- [x] P0.1 Commit current zai_proxy.py state; push dr
+- [x] P0.2 Create plans/ in repo; add runtime state files to .gitignore if needed
 
 ### Part I — Backoff fix
-- [ ] P1.1 Add `"dispatch_fail"` error type (30s flat) in `_mark_key_failure`
-- [ ] P1.2 Change flat router failure call site to `"dispatch_fail"`
+- [x] P1.1 Add `"dispatch_fail"` error type (30s flat) in `_mark_key_failure`
+- [x] P1.2 Change flat router failure call site to `"dispatch_fail"`
 
 ### Part II — Remove early-exit bypasses
-- [ ] P2.1 Remove Step 1c (ollama-only models bypass, lines 5080-5097)
-- [ ] P2.2 Remove Step 1c-2 (Telnyx-direct bypass, lines 5099-5107)
-- [ ] P2.3 Remove Step 1c-3 (non-z.ai bypass, lines 5109-5122); move messages guard to top of _proxy
+- [x] P2.1 Remove Step 1c (ollama-only models bypass, lines 5080-5097)
+- [x] P2.2 Remove Step 1c-2 (Telnyx-direct bypass, lines 5099-5107)
+- [x] P2.3 Remove Step 1c-3 (non-z.ai bypass, lines 5109-5122); move messages guard to top of _proxy
 
 ### Part III — Capability fixes
-- [ ] P3.1 Add deepseek models to PROVIDER_MODELS for ollama_cloud + ollama_cloud_2
-- [ ] P3.2 Add ollama model name translations in _PROVIDER_MODEL_NAMES; wire into _try_ollama_cloud
-- [ ] P3.3 Remove deepseek from PROVIDER_MODELS for z.ai keys (ours, friend)
-- [ ] P3.4 Add _try_external_single method; rewire _dispatch_external to single-provider
-- [ ] P3.5 Fix 401/403 handling: _mark_key_failure(name, "dead") + continue (not raise)
+- [x] P3.1 Add deepseek models to PROVIDER_MODELS for ollama_cloud + ollama_cloud_2
+- [x] P3.2 Add ollama model name translations in _PROVIDER_MODEL_NAMES; wire into _try_ollama_cloud
+- [x] P3.3 Remove deepseek from PROVIDER_MODELS for z.ai keys (ours, friend)
+- [x] P3.4 Add _try_external_single method; rewire _dispatch_external to single-provider
+- [x] P3.5 Fix 401/403 handling: _mark_key_failure(name, "dead") + continue (not raise)
 
 ### Part IV — Per-model pressure
-- [ ] P4.1 Parse allowance_remaining_usd from opencode_go responses
-- [ ] P4.2 Per-(provider, model) burn share from api_calls table
-- [ ] P4.3 New effective-price formula: floor × (1 + scarcity) + burn_share × scarcity × premium
+- [x] P4.1 Parse allowance_remaining_usd from opencode_go responses
+- [x] P4.2 Per-(provider, model) burn share from api_calls table
+- [x] P4.3 New effective-price formula: floor × (1 + scarcity) + burn_share × scarcity × premium
 
 ### Part V — Key-state transition alerts
-- [ ] P5.1 _key_down_since / _key_alerted tracking in _mark_key_failure / _mark_key_healthy
-- [ ] P5.2 KEY_RECOVERED anomaly on recovery
-- [ ] P5.3 Situation-overview builder (burn, quota, chains, actions)
-- [ ] P5.4 15-min sustained-down check in _refresh_loop + journald + espeak-ng
+- [x] P5.1 _key_down_since / _key_alerted tracking in _mark_key_failure / _mark_key_healthy
+- [x] P5.2 KEY_RECOVERED anomaly on recovery
+- [x] P5.3 Situation-overview builder (burn, quota, chains, actions)
+- [x] P5.4 15-min sustained-down check in _refresh_loop + journald + espeak-ng
 
 ### Part VI — Dead-code cleanup + ADRs
-- [ ] P6.1 Remove old-path cascade (lines ~5313-5852); keep shared helpers
-- [ ] P6.2 Write ADR-0007 through ADR-0013 in docs/adr/
-- [ ] P6.3 Commit + push
+- [x] P6.1 Remove old-path cascade (lines ~5313-5852); keep shared helpers
+- [x] P6.2 Write ADR-0007 through ADR-0013 in docs/adr/
+- [x] P6.3 Commit + push
 
 ### Part VII — Verify
-- [ ] P7.1 Restart proxy; smoke test glm-5.2, deepseek-v4-flash, kimi-k3, kimi-k2.7-code
-- [ ] P7.2 Verify X-Provider header shows ollama_cloud/opencode_go for cheap tiers
-- [ ] P7.3 Monitor 10 min: zero failover spam, zero 422s, failure counts stay low
-- [ ] P7.4 espeak-ng notification
+- [x] P7.1 Restart proxy; smoke test glm-5.2, deepseek-v4-flash, kimi-k3, kimi-k2.7-code
+- [x] P7.2 Verify X-Provider header shows ollama_cloud/opencode_go for cheap tiers
+- [x] P7.3 Monitor 10 min: zero failover spam, zero 422s, failure counts stay low
+- [x] P7.4 espeak-ng notification

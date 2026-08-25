@@ -1724,19 +1724,23 @@ try:
         quota_remaining=1_000_000, model_tier="high", quota_total=2_000_000,
         peak_hours_utc=(6, 10), peak_mult=3.0,
     )
-    # ollama_cloud — flat-rate $100/mo, standard tier, NO peak window
+    # ollama_cloud — T4 included subscription: marginal cost $0, $0.001/M floor.
+    # NO peak window. Initial rate = MIN_EFFECTIVE_PRICE (not $0.40 which was
+    # the old per-token estimate). The Kalman filter will converge to the
+    # measured rate ($0.0155/M) from real traffic.
     _shadow_optimizer.add_provider(
-        "ollama_cloud", _shadow_pk(0.40), _ShadowConsumptionKalman(),
+        "ollama_cloud", _shadow_pk(0.001), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
-    # ollama_cloud_2 — second flat-rate subscription (2026-08-23), own Kalman
+    # ollama_cloud_2 — second T4 included subscription (2026-08-23)
     _shadow_optimizer.add_provider(
-        "ollama_cloud_2", _shadow_pk(0.40), _ShadowConsumptionKalman(),
+        "ollama_cloud_2", _shadow_pk(0.001), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
-    # opencode_go — flat-rate $10/mo subscription, standard tier, native glm-5.3
+    # opencode_go — T3 flat-rate $10/mo subscription: marginal cost $0,
+    # $0.001/M floor. Native glm-5.3. Initial rate = MIN_EFFECTIVE_PRICE.
     _shadow_optimizer.add_provider(
-        "opencode_go", _shadow_pk(0.40), _ShadowConsumptionKalman(),
+        "opencode_go", _shadow_pk(0.001), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
     # neuralwatt — per-token, standard tier (glm-5.2 primary model ~$2.21/M blended)

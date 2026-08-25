@@ -636,7 +636,7 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
 
                 # For all other tiers, use compute_effective_price() which
                 # applies the tier-specific formula on top of the Kalman base.
-                effective = compute_effective_price(name, base_rate, context, model=model_id)
+                effective = compute_effective_price(name, base_rate, context, model=model)
                 return float(effective)
     except Exception:
         pass
@@ -644,7 +644,7 @@ def _get_effective_cost(name: str, model: str | None, difficulty: str = "medium"
     # Fall back: use seed rate with tier formula
     try:
         base_rate = _SEED_RATES.get(name, 999.0)
-        effective = compute_effective_price(name, base_rate, model=model_id)
+        effective = compute_effective_price(name, base_rate, model=model)
         return float(effective)
     except Exception:
         pass

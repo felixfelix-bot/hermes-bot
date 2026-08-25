@@ -132,30 +132,83 @@ def load_realized_prices(hours_back: int = 168) -> dict[str, list[tuple[float, f
 
 
 def load_quota_series(hours_back: int = 48) -> dict[str, list[tuple[float, float]]]:
-    """Load quota usage_fraction over time from provider_balances.
+    """Load quota usage_fraction over time.
+
+    Primary source: ``provider_balances`` table (balance-style providers like
+    neuralwatt/openrouter/ppq/telnyx/routstr). Falls back to synthesizing a
+    time-series from ``api_calls`` token sums for quota-tier providers
+    (ours, friend, ollama_cloud, ollama_cloud_2, opencode_go) that don't write
+    rows to provider_balances.
 
     Returns {provider: [(ts, usage_fraction), ...]}.
     """
+    result: dict[str, list[tuple[float, float]]] = {}
+
+    db = _connect_api_burn_db()
+    db.row_factory = sqlite3.Row
+    now = time.time()
+    cutoff = now - hours_back * 3600
+
+    # --- Primary: provider_balances ---
     try:
-        db = _connect_api_burn_db()
-        db.row_factory = sqlite3.Row
-        now = time.time()
-        cutoff = now - hours_back * 3600
         rows = db.execute(
             "SELECT collected_at, provider, usage_fraction FROM provider_balances "
             "WHERE collected_at > ? ORDER BY collected_at",
             (cutoff,)
         ).fetchall()
-        db.close()
-        result: dict[str, list[tuple[float, float]]] = {}
         for r in rows:
             p = r["provider"]
             if p not in result:
                 result[p] = []
             result[p].append((r["collected_at"], r["usage_fraction"]))
-        return result
     except Exception:
-        return {}
+        pass
+
+    # --- Fallback: synthesize from api_calls for quota-tier providers ---
+    # Mirror load_current_quota_state's limits (2M/14M for ours+friend,
+    # 500M/3.5B for general quota/included/flat providers).
+    QUOTA_LIMITS = {
+        "ours":           (2_000_000,    14_000_000),
+        "friend":         (2_000_000,    14_000_000),
+        "ollama_cloud":   (500_000_000, 3_500_000_000),
+        "ollama_cloud_2": (500_000_000, 3_500_000_000),
+        "opencode_go":    (500_000_000, 3_500_000_000),
+    }
+    for prov in ("ours", "friend", "ollama_cloud", "ollama_cloud_2", "opencode_go"):
+        sess_limit, weekly_limit = QUOTA_LIMITS.get(prov, (5_000_000, 35_000_000))
+        synth: list[tuple[float, float]] = []
+        try:
+            udb = _connect_usage_db()
+            udb.row_factory = sqlite3.Row
+            sess_w = 5 * 3600
+            week_s = 7 * 86400
+            n_buckets = min(hours_back, 48)
+            for i in range(n_buckets):
+                ts = cutoff + i * 3600
+                sess_tok = udb.execute(
+                    "SELECT COALESCE(SUM(total_tokens),0) AS t FROM api_calls "
+                    "WHERE key_name=? AND ts > ? AND ts <= ?",
+                    (prov, ts - sess_w, ts)
+                ).fetchone()["t"]
+                wk_tok = udb.execute(
+                    "SELECT COALESCE(SUM(total_tokens),0) AS t FROM api_calls "
+                    "WHERE key_name=? AND ts > ? AND ts <= ?",
+                    (prov, ts - week_s, ts)
+                ).fetchone()["t"]
+                sess_pct = min(1.0, sess_tok / sess_limit) if sess_limit > 0 else 0.0
+                wk_pct = min(1.0, wk_tok / weekly_limit) if weekly_limit > 0 else 0.0
+                synth.append((ts, max(sess_pct, wk_pct)))
+            udb.close()
+        except Exception:
+            pass
+        if prov not in result:
+            result[prov] = synth
+        else:
+            # Merge with balance-derived series (densify)
+            result[prov].extend(synth)
+            result[prov].sort(key=lambda x: x[0])
+    db.close()
+    return result
 
 
 def load_current_quota_state() -> dict[str, float]:
@@ -246,7 +299,14 @@ def render_envelope(outdir: Path, log_y: bool = True) -> Path:
         cur_pct = current_state.get(provider, 0) * 100
         if cur_pct > 0:
             idx = min(int(cur_pct / 100 * len(usage)), len(usage) - 1)
-            cur_price = prices[idx] if not math.isinf(prices[idx]) else SEED_RATES.get(provider, 1.0)
+            tier = PROVIDER_TIER.get(provider, "per_token")
+            if tier in ("quota", "flat", "included"):
+                # For quota-tier, the curve caps at asymptote
+                # (MIN_EFFECTIVE_PRICE * QUOTA_PRESSURE_ASYMPTOTE),
+                # not at SEED_RATES (which is the cold-start estimate).
+                cur_price = min(prices[idx], MIN_EFFECTIVE_PRICE * QUOTA_PRESSURE_ASYMPTOTE) if not math.isinf(prices[idx]) else MIN_EFFECTIVE_PRICE * QUOTA_PRESSURE_ASYMPTOTE
+            else:
+                cur_price = prices[idx] if not math.isinf(prices[idx]) else SEED_RATES.get(provider, 1.0)
             ax.plot(cur_pct, cur_price, "o", color=color, markersize=6, zorder=5)
 
     ax.axvline(x=QUOTA_PRESSURE_ONSET * 100, color="gray", linestyle="--", alpha=0.5, label=f"onset ({QUOTA_PRESSURE_ONSET:.0%})")

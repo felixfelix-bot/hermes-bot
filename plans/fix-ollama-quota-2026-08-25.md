@@ -1,7 +1,7 @@
 # Plan: Enable Ollama Cloud Real-Time Price Discovery
 
 **Date:** 2026-08-26
-**Status:** EXECUTING
+**Status:** DONE
 **Severity:** High — ollama_cloud is invisible to the Kalman/pressure system, causing traffic to fall through to paid providers ($19+/day bleed) during 429s
 
 ## Problem
@@ -29,25 +29,25 @@ When ollama_cloud 429s (session/weekly quota hit), the router falls through to `
 ## Checklist
 
 ### Phase 1 — Enable the flags
-- [ ] Set `OLLAMA_EXTRA_USAGE_ENABLED=true` in zai-proxy environment
-- [ ] Set `OLLAMA_QUOTA_PRESSURE_ENABLED=true` in zai-proxy environment
-- [ ] Verify httpx installed (needed by fetch_ollama_usage)
+- [x] Set `OLLAMA_EXTRA_USAGE_ENABLED=true` in zai-proxy environment
+- [x] Set `OLLAMA_QUOTA_PRESSURE_ENABLED=true` in zai-proxy environment
+- [x] Verify httpx installed (needed by fetch_ollama_usage)
 
 ### Phase 2 — Restart & verify
-- [ ] Clear __pycache__, restart zai-proxy.service
-- [ ] Verify gateway started cleanly (no import errors)
-- [ ] Verify _get_ollama_quota_status() returns non-zero values (real data from ollama.com)
-- [ ] Verify flat_router select_provider reflects pressure on ollama_cloud
+- [x] Clear __pycache__, restart zai-proxy.service
+- [x] Verify gateway started cleanly (no import errors)
+- [x] Verify _get_ollama_quota_status() returns non-zero values (real data from ollama.com)
+- [x] Verify flat_router select_provider reflects pressure on ollama_cloud
 
 ### Phase 3 — Smoke test
-- [ ] Send test request via zai-proxy
-- [ ] Check api_calls shows real quota tracking
-- [ ] Monitor 60s for errors
+- [x] Send test request via zai-proxy
+- [x] Check api_calls shows real quota tracking
+- [x] Monitor 60s for errors
 
 ### Phase 4 — Verify pressure propagation
-- [ ] Confirm effective cost for ollama_cloud changes with quota state (not pinned at $0.001)
-- [ ] Confirm ollama_cloud appears in select_provider BEFORE routstrd when healthy
-- [ ] Confirm when quota nears limits, ollama_cloud's effective price rises above $0.001
+- [x] Confirm effective cost for ollama_cloud changes with quota state (not pinned at $0.001)
+- [x] Confirm ollama_cloud appears in select_provider BEFORE routstrd when healthy
+- [x] Confirm when quota nears limits, ollama_cloud's effective price rises above $0.001
 
 ## Rollback
 

@@ -6773,9 +6773,10 @@ class Handler(BaseHTTPRequestHandler):
                 "image": 0, "web_search": 0, "internal_reasoning": 0,
                 "max_completion_cost": 2, "max_prompt_cost": 2, "max_cost": 3,
             }
-            def _m(mid, owner):
+            def _m(mid, owner, ctx=1048576):
                 return {"id": mid, "object": "model", "created": now,
-                        "owned_by": owner, "sats_pricing": dict(_sp)}
+                        "owned_by": owner, "context_window": ctx,
+                        "sats_pricing": dict(_sp)}
             models_data = {
                 "object": "list",
                 "data": [
@@ -6783,10 +6784,10 @@ class Handler(BaseHTTPRequestHandler):
                     _m("glm-5.2", "zai"),
                     _m("glm-4.5-flash", "zai"),
                     _m("glm-4.5-air", "zai"),
-                    _m("kimi-k2.7-code", "ollama"),
-                    _m("kimi-k3:cloud", "ollama"),
-                    _m("kimi-k3", "telnyx"),
-                    _m("minimax-m3:cloud", "ollama"),
+                    _m("kimi-k2.7-code", "ollama", 262144),
+                    _m("kimi-k3:cloud", "ollama", 262144),
+                    _m("kimi-k3", "telnyx", 262144),
+                    _m("minimax-m3:cloud", "ollama", 1048576),
                 ]
             }
             payload = json.dumps(models_data).encode()

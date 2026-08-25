@@ -97,10 +97,10 @@ class MultiResourceKalmanPredictor:
         
         # Resource-specific constraints and thresholds
         self.thresholds = {
-            'tokens': 1e7,           # 10M tokens = dangerous level
+            'tokens': 5e7,           # 50M tokens = genuinely high (normal daily ~20M)
             'cpu_load': 8.0,         # 8.0 load = high CPU
-            'memory_pct': 70.0,      # 70% = high memory usage (lowered for earlier warning)
-            'swap_used_pct': 30.0,   # 30% swap used = warning
+            'memory_pct': 85.0,      # 85% = high memory usage (7G/7G)
+            'swap_used_pct': 80.0,   # 80% swap = only alert if genuinely high (cold pages at 60% are normal)
             'disk_used_pct': 85.0,   # 85% disk used = warning
             'worker_count': 40       # 40 workers = high concurrent load
         }

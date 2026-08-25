@@ -6855,6 +6855,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
+        elif self.path.startswith("/viz/"):
+            # Price/quota visualization static handler (price_viz.py)
+            self.close_connection = True
+            viz_dir = os.path.expanduser("~/.hermes/viz")
+            requested = self.path[len("/viz/"):]
+            # Prevent path traversal
+            safe_name = os.path.basename(requested)
+            if not safe_name or ".." in safe_name:
+                self.send_error(404)
+                return
+            filepath = os.path.join(viz_dir, safe_name)
+            if not os.path.isfile(filepath):
+                self.send_error(404)
+                return
+            ext = os.path.splitext(safe_name)[1].lower()
+            ct = {"png": "image/png", "txt": "text/plain", "json": "application/json"}.get(ext.lstrip("."), "application/octet-stream")
+            try:
+                with open(filepath, "rb") as f:
+                    payload = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception:
+                self.send_error(500)
         else:
             self._proxy()
 

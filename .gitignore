@@ -81,3 +81,24 @@ buzz_signal_bridge.json
 aux_model_audit_report.md
 cold_review_s2c.diff
 .coverage
+
+# Runtime state (ADR-012) — tracked in ~/.hermes/state-history/ via daily snapshot
+zai_state.json
+cashu_state.json
+vision_health.json
+completion_watch_state.json
+btc_usd_cache.json
+api_burn_collector.log
+api_burn_analyzer.log
+kalman_price_state.json
+kalman_tuning.json
+ollama_fallback.json
+ppq_usage.json
+ppq_corrections.json
+gh-sync-state.json
+github-sync-state.json
+github_sync_state.json
+last-github-sync.json
+synergy_map.json
+session_registry.json
+__pycache__/

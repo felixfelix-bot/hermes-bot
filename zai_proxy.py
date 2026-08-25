@@ -5281,9 +5281,17 @@ class Handler(BaseHTTPRequestHandler):
 
                         return
                     else:
-                        # Failure — mark key and try next candidate
+                        # Failure — mark key and try next candidate.
+                        # Guard: only increment failure count if the key was
+                        # actually healthy (i.e. the dispatch was attempted).
+                        # If the key was already in backoff, the dispatch
+                        # returned False without contacting the API — don't
+                        # increment the failure count (prevents death spiral
+                        # where every request increments failures while the
+                        # key is in backoff, making it never recover).
                         try:
-                            _mark_key_failure(_cand.name, "flat_router_dispatch_fail")
+                            if _is_key_healthy(_cand.name):
+                                _mark_key_failure(_cand.name, "flat_router_dispatch_fail")
                         except Exception:
                             pass
                         continue

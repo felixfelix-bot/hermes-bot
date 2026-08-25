@@ -1,7 +1,7 @@
 # Plan: Regime-Shift Alerts + Price/Quota Visualizations
 
 **Date:** 2026-08-26
-**Status:** EXECUTING
+**Status:** DONE
 **Severity:** Medium — surface quota↔metered transitions without spamming
 
 ## Problem
@@ -11,29 +11,29 @@ When traffic shifts from quota-based providers (z.ai, ollama, opencode_go) to pa
 ## Checklist
 
 ### Phase 1 — ADR + Regime-Shift Detection
-- [ ] Write ADR-013: regime-shift Kalman alerting
-- [ ] Implement regime-shift check in cost-escalation-check.py
-- [ ] Unit test: synthetic Aug 23→24 collapse → exactly 1 up-alert, 0 duplicates
-- [ ] Unit test: recovery → exactly 1 down-alert
+- [x] Write ADR-013: regime-shift Kalman alerting
+- [x] Implement regime-shift check in cost-escalation-check.py
+- [x] Unit test: synthetic Aug 23→24 collapse → exactly 1 up-alert, 0 duplicates
+- [x] Unit test: recovery → exactly 1 down-alert
 
 ### Phase 2 — Price/Quota Visualizations
-- [ ] price_viz.py: data layer (routing_profit, provider_balances, kalman_samples)
-- [ ] price_viz.py: V1 2D price-vs-quota envelope curves (LOG/LINEAR toggle)
-- [ ] price_viz.py: V2 price heatmap (time×provider, LogNorm)
-- [ ] price_viz.py: V3 quota heatmap (time×provider, linear 0-100%)
-- [ ] price_viz.py: V4 3D surface (session×weekly→price, per provider)
-- [ ] price_viz.py: V7 ASCII block for Signal/terminal
+- [x] price_viz.py: data layer (routing_profit, provider_balances, kalman_samples)
+- [x] price_viz.py: V1 2D price-vs-quota envelope curves (LOG/LINEAR toggle)
+- [x] price_viz.py: V2 price heatmap (time×provider, LogNorm)
+- [x] price_viz.py: V3 quota heatmap (time×provider, linear 0-100%)
+- [x] price_viz.py: V4 3D surface (session×weekly→price, per provider)
+- [x] price_viz.py: V7 ASCII block for Signal/terminal
 
 ### Phase 3 — Endpoint + Cron
-- [ ] zai_proxy /viz/*.png static handler
-- [ ] Hourly render cron
-- [ ] Transition-only PNG push on regime shift
+- [x] zai_proxy /viz/*.png static handler
+- [x] Hourly render cron
+- [x] Transition-only PNG push on regime shift
 
 ### Phase 4 — Commit + Push
-- [ ] Commit ADR + regime-shift check
-- [ ] Commit price_viz.py + tests
-- [ ] Commit zai_proxy endpoint + cron
-- [ ] Push all repos
+- [x] Commit ADR + regime-shift check
+- [x] Commit price_viz.py + tests
+- [x] Commit zai_proxy endpoint + cron
+- [x] Push all repos
 
 ## Rollback
 - `touch ~/.hermes/bot/.disable_regime_alerts` — kills regime-shift push

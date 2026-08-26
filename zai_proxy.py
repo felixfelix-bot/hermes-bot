@@ -4122,6 +4122,20 @@ def _refresh_loop():
                      "age_s": int(time.time() - v[1])}
                  for n, v in quota_cache.items()}
                 | {"active": _best_unlocked()[0]}, indent=2))
+        # B2 (provider-clock-alignment): persist nextResetTime into
+        # quota_clock registry so downstream consumers (price_viz ASCII /
+        # heatmaps) can show "resets in N hours" columns. Runs every refresh
+        # cycle (5 min) for every z.ai key. Idempotent + best-effort.
+        try:
+            import sys as _sys
+            _scrp = str(Path(__file__).resolve().parent / "src")
+            if _scrp not in _sys.path:
+                _sys.path.insert(0, _scrp)
+            import quota_clock as _qc
+            for name, key in KEYS.items():
+                _qc.refresh_zai_anchors(key, name)
+        except Exception:
+            pass
         # Refresh burn predictions (OUTSIDE lock — predict_exhaustion does a
         # safe self-HTTP GET to /quota which itself acquires lock).
         for name in KEYS:
@@ -4812,8 +4826,25 @@ class Handler(BaseHTTPRequestHandler):
                     _og_resp = json.loads(bytes(response_buffer))
                     _og_allow = _og_resp.get("cost", {}).get("allowance_remaining_usd")
                     if _og_allow is not None:
-                        _opencode_go_allowance["remaining_usd"] = float(_og_allow)
+                        _og_allowance_val = float(_og_allow)
+                        _opencode_go_allowance["remaining_usd"] = _og_allowance_val
                         _opencode_go_allowance["ts"] = time.time()
+                        # B3 (provider-clock-alignment): append (ts, value) to the
+                        # allowance log for later cycle-anchor inference. Bounded to
+                        # ~1000 lines; rotation keeps the file ~30KB worst case.
+                        try:
+                            _allow_log_path = Path.home() / ".hermes" / "bot" / "opencode_allowance_log.jsonl"
+                            _allow_log_path.parent.mkdir(parents=True, exist_ok=True)
+                            _allow_line = json.dumps({"ts": _opencode_go_allowance["ts"], "remaining_usd": _og_allowance_val}) + "\n"
+                            with open(_allow_log_path, "a") as _alf:
+                                _alf.write(_allow_line)
+                                # Rotate if file grew beyond ~30KB (≈1000 lines)
+                                _alf.flush()
+                            if _allow_log_path.stat().st_size > 30_000:
+                                lines = _allow_log_path.read_text().splitlines()
+                                _allow_log_path.write_text("\n".join(lines[-500:]) + "\n")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 if _LIVE_ROUTER is not None:

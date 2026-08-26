@@ -61,6 +61,7 @@ PROVIDER_TIER = {
 QUOTA_PRESSURE_ONSET = float(os.environ.get("OLLAMA_QUOTA_PRESSURE_ONSET", "0.70"))
 QUOTA_PRESSURE_ASYMPTOTE = float(os.environ.get("OLLAMA_QUOTA_PRESSURE_ASYMPTOTE", "1.5"))
 MIN_EFFECTIVE_PRICE = 0.001  # $/M floor
+_WEEKLY_S_FALLBACK = 7 * 86400  # rolling weekly duration when no anchor
 
 # Seed rates for display (from flat_router._SEED_RATES)
 SEED_RATES = {
@@ -212,20 +213,36 @@ def load_quota_series(hours_back: int = 48) -> dict[str, list[tuple[float, float
 
 
 def load_current_quota_state() -> dict[str, float]:
-    """Get current quota usage_pct per provider from api_calls token sums."""
+    """Get current quota usage_pct per provider from api_calls token sums.
+
+    For z.ai (ours/friend) anchors: weekly window starts at the provider's
+    actual reset clock (from quota_clock registry), not rolling-7d.
+    """
+    # Lazy import quota_clock — optional, falls back to rolling.
+    try:
+        import sys as _sys
+        _scrp = str(Path(__file__).resolve().parent / "src")
+        if _scrp not in _sys.path:
+            _sys.path.insert(0, _scrp)
+        from quota_clock import window_start as _window_start
+    except Exception:
+        _window_start = lambda p, k, n: n - _WEEKLY_S_FALLBACK
+
     db = _connect_usage_db()
     db.row_factory = sqlite3.Row
     now = time.time()
     result = {}
     for provider in PROVIDER_TIER:
         if PROVIDER_TIER[provider] in ("quota", "flat", "included"):
+            sess_start = now - 5 * 3600     # session stays rolling (no provider publishes a session anchor)
+            weekly_start = _window_start(provider, "weekly", now)
             sess_tokens = db.execute(
                 "SELECT COALESCE(SUM(total_tokens), 0) as t FROM api_calls "
-                "WHERE key_name=? AND ts > ?", (provider, now - 5 * 3600)
+                "WHERE key_name=? AND ts > ?", (provider, sess_start)
             ).fetchone()["t"]
             weekly_tokens = db.execute(
                 "SELECT COALESCE(SUM(total_tokens), 0) as t FROM api_calls "
-                "WHERE key_name=? AND ts > ?", (provider, now - 7 * 86400)
+                "WHERE key_name=? AND ts > ?", (provider, weekly_start)
             ).fetchone()["t"]
             sess_limit = 500_000_000
             weekly_limit = 3_500_000_000
@@ -463,11 +480,26 @@ def render_pressure_surface(outdir: Path, provider: str = "ollama_cloud", log_z:
 
 
 def render_ascii() -> str:
-    """V7: ASCII block for Signal/terminal embedding."""
+    """V7: ASCII block for Signal/terminal embedding.
+
+    Includes a ``resets`` column showing hours-until-reset when an anchor is
+    known (only z.ai publishes nextResetTime via quota_clock registry).
+    """
+    # Lazy import quota_clock — optional.
+    try:
+        import sys as _sys
+        _scrp = str(Path(__file__).resolve().parent / "src")
+        if _scrp not in _sys.path:
+            _sys.path.insert(0, _scrp)
+        from quota_clock import next_reset as _next_reset
+    except Exception:
+        _next_reset = lambda p, k="weekly": None
+
     current_state = load_current_quota_state()
+    now = time.time()
     lines = ["📊 PRICE LANDSCAPE (current)", ""]
-    lines.append(f"{'Provider':<16s} {'Tier':<10s} {'Quota%':>7s} {'$/M':>10s}")
-    lines.append("-" * 48)
+    lines.append(f"{'Provider':<16s} {'Tier':<10s} {'Quota%':>7s} {'$/M':>10s} {'Resets':>8s}")
+    lines.append("-" * 58)
 
     for provider in sorted(PROVIDER_TIER, key=lambda p: SEED_RATES.get(p, 99)):
         tier = PROVIDER_TIER[provider]
@@ -484,7 +516,17 @@ def render_ascii() -> str:
             effective = rate
             tier_label = tier.upper()
 
-        lines.append(f"{provider:<16s} {tier_label:<10s} {quota:>6.1f}% ${effective:>8.4f}/M")
+        # Reset column — only for providers with known anchors
+        reset_str = ""
+        anchor_ts = _next_reset(provider, "weekly")
+        if anchor_ts and anchor_ts > now:
+            hrs = (anchor_ts - now) / 3600
+            if hrs >= 24:
+                reset_str = f"{hrs/24:.1f}d"
+            else:
+                reset_str = f"{hrs:.0f}h"
+
+        lines.append(f"{provider:<16s} {tier_label:<10s} {quota:>6.1f}% ${effective:>8.4f}/M {reset_str:>8s}")
 
         # Bar
         bar_len = int(quota / 5)
@@ -532,6 +574,52 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
     ascii_text = render_ascii()
     (outdir / "ascii-summary.txt").write_text(ascii_text)
     rendered.append(outdir / "ascii-summary.txt")
+
+    # B4 (provider-clock-alignment): shadow validation — log rolling vs
+    # anchored weekly % for any provider with a known anchor. Hourly cron
+    # → 48h of side-by-side data helps spot divergence >2 points.
+    try:
+        import sys as _sys
+        _scrp = str(Path(__file__).resolve().parent / "src")
+        if _scrp not in _sys.path:
+            _sys.path.insert(0, _scrp)
+        from quota_clock import next_reset as _qnext, window_start as _qws, _load_state as _qstate
+        state = _qstate()
+        if state:
+            log_path = outdir / "shadow-comparison.jsonl"
+            now = time.time()
+            db = _connect_usage_db()
+            entries = []
+            for prov, entry in state.items():
+                anchor = entry.get("weekly_anchor_ts")
+                if not anchor:
+                    continue
+                wkly_limit = 14_000_000 if prov in ("ours", "friend") else 3_500_000_000
+                anchored_start = _qws(prov, "weekly", now)
+                rolling_start = now - 7 * 86400
+                anchored_tok = db.execute(
+                    "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
+                    (prov, anchored_start)).fetchone()[0]
+                rolling_tok = db.execute(
+                    "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
+                    (prov, rolling_start)).fetchone()[0]
+                entries.append({
+                    "ts": now,
+                    "provider": prov,
+                    "anchored_pct": min(100.0, anchored_tok / wkly_limit * 100),
+                    "rolling_pct": min(100.0, rolling_tok / wkly_limit * 100),
+                })
+            db.close()
+            if entries:
+                with open(log_path, "a") as f:
+                    for e in entries:
+                        f.write(json.dumps(e) + "\n")
+                # Cap at ~1000 lines
+                if log_path.exists() and log_path.stat().st_size > 30_000:
+                    lines = log_path.read_text().splitlines()
+                    log_path.write_text("\n".join(lines[-500:]) + "\n")
+    except Exception:
+        pass
 
     return rendered
 

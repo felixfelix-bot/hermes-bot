@@ -617,6 +617,23 @@ class TestModelCanonicalization:
         assert candidates[0].dispatch_fn is None
         assert candidates[0].effective_cost == float("inf")
 
+    def test_vision_model_glm46v_multi_candidate(self):
+        """'glm-4.6v' (z.ai vision model, manager auxiliary.vision) must
+        resolve to ≥2 non-fallback candidates — both z.ai keys.
+
+        z.ai serves glm-4.6v on the coding endpoint (live-verified
+        2026-08-27: POST /chat/completions → 200), though it is unlisted
+        in GET /models. Previously unregistered in PROVIDER_MODELS →
+        0 candidates → flat router 503'd all vision requests."""
+        with self._healthy_all():
+            candidates = select_provider(model="glm-4.6v")
+        names = {c.name for c in candidates if c.name != "fallback"}
+        assert len(names) >= 2, \
+            f"glm-4.6v resolved to only {sorted(names)} — vision model " \
+            f"not registered in PROVIDER_MODELS"
+        assert {"ours", "friend"} <= names, \
+            f"glm-4.6v candidates missing z.ai keys: {sorted(names)}"
+
     def test_worker_fallback_model_resolves_multi(self):
         """WORKER_FALLBACK_MODEL ('deepseek/deepseek-v4-flash') must give
         ≥3 non-fallback candidates (market-driven, not single-provider)."""

@@ -106,11 +106,16 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # z.ai keys — z.ai catalog only (deepseek/qwen/minimax/mimo are NOT
     # served by z.ai — they get 400. Excluded here so the flat router never
     # tries z.ai for them; the key is NOT marked dead, just not a candidate.)
+    # glm-4.6v: z.ai vision model, served on the coding endpoint but UNLISTED
+    # in GET /models (live-verified 2026-08-27). Required by manager
+    # auxiliary.vision — without it the flat router 503'd all vision requests.
     "ours": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
+        "glm-4.6v",
     },
     "friend": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
+        "glm-4.6v",
     },
     # Ollama Cloud — included subscription, wide model catalog
     "ollama_cloud": {

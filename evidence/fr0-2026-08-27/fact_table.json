@@ -1,0 +1,555 @@
+{
+  "ollama_catalog_live": [
+    "deepseek-v4-flash:0731",
+    "deepseek-v4-pro:0813",
+    "gemma4:31b",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3-flash",
+    "gpt-oss:120b",
+    "gpt-oss:20b",
+    "kimi-k2.6",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "minimax-m2.7",
+    "minimax-m3",
+    "mistral-large-3:675b",
+    "nemotron-3-nano:30b",
+    "nemotron-3-super",
+    "nemotron-3-ultra",
+    "qwen3.5:397b"
+  ],
+  "opencode_go_catalog_live": [
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-pro",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "gpt-5.6-luna",
+    "grok-4.5",
+    "grok-4.6",
+    "hy3",
+    "hy3-preview",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "longcat-2.0",
+    "mimo-v2-omni",
+    "mimo-v2-pro",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "minimax-m2.5",
+    "minimax-m2.7",
+    "minimax-m3",
+    "muse-spark-1.2-contributor",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.8-max"
+  ],
+  "rows": [
+    {
+      "provider": "ours",
+      "registry_model": "glm-4.5",
+      "dispatch_native_name": "glm-4.5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ours",
+      "registry_model": "glm-4.5-air",
+      "dispatch_native_name": "glm-4.5-air",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ours",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ours",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ours",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "friend",
+      "registry_model": "glm-4.5",
+      "dispatch_native_name": "glm-4.5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "friend",
+      "registry_model": "glm-4.5-air",
+      "dispatch_native_name": "glm-4.5-air",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "friend",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "friend",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "friend",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-v4-flash:0731",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-v4-pro:0813",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "gemma4:31b",
+      "dispatch_native_name": "gemma4:31b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "gpt-oss:120b",
+      "dispatch_native_name": "gpt-oss:120b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "kimi-k2.7-code",
+      "dispatch_native_name": "kimi-k2.7-code",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "kimi-k3:cloud",
+      "dispatch_native_name": "kimi-k3:cloud",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "minimax-m3:cloud",
+      "dispatch_native_name": "minimax-m3:cloud",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud",
+      "registry_model": "qwen3.5:397b",
+      "dispatch_native_name": "qwen3.5:397b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-v4-flash:0731",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-v4-pro:0813",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "gemma4:31b",
+      "dispatch_native_name": "gemma4:31b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "gpt-oss:120b",
+      "dispatch_native_name": "gpt-oss:120b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "kimi-k2.7-code",
+      "dispatch_native_name": "kimi-k2.7-code",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "kimi-k3:cloud",
+      "dispatch_native_name": "kimi-k3:cloud",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "minimax-m3:cloud",
+      "dispatch_native_name": "minimax-m3:cloud",
+      "catalog_status": "MISSING (live 404)"
+    },
+    {
+      "provider": "ollama_cloud_2",
+      "registry_model": "qwen3.5:397b",
+      "dispatch_native_name": "qwen3.5:397b",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-v4-flash",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-v4-pro",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-v4-flash",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-v4-pro",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.3",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "kimi-k2.7-code",
+      "dispatch_native_name": "kimi-k2.7-code",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "opencode_go",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "kimi-k3",
+      "catalog_status": "EXISTS (live)"
+    },
+    {
+      "provider": "neuralwatt",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-v4-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "neuralwatt",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-v4-pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "neuralwatt",
+      "registry_model": "deepseek/gemma-4-31b",
+      "dispatch_native_name": "gemma-4-31b",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "neuralwatt",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "neuralwatt",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "kimi-k3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "deepinfra",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek-ai/DeepSeek-V4-Flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "deepinfra",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek-ai/DeepSeek-V4-Pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "deepinfra",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "zai-org/GLM-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ppq",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek/deepseek-v4-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ppq",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek/deepseek-v4-pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ppq",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "z-ai/glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "ppq",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "moonshotai/kimi-k3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "openrouter",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek/deepseek-v4-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "openrouter",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek/deepseek-v4-pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "openrouter",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "z-ai/glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "openrouter",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "moonshotai/kimi-k3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "claude-haiku-4-5",
+      "dispatch_native_name": "anthropic/claude-haiku-4-5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "gpt-5",
+      "dispatch_native_name": "openai/gpt-5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "kimi-k2.5",
+      "dispatch_native_name": "moonshotai/Kimi-K2.5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "kimi-k2.7-code",
+      "dispatch_native_name": "moonshotai/Kimi-K2.5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "moonshotai/Kimi-K3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "kimi-k3:cloud",
+      "dispatch_native_name": "moonshotai/Kimi-K2.5",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "telnyx",
+      "registry_model": "minimax-m3",
+      "dispatch_native_name": "MiniMaxAI/MiniMax-M3-MXFP8",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek/deepseek-v4-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek/deepseek-v4-pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstr",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "kimi-k3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "deepseek/deepseek-v4-flash",
+      "dispatch_native_name": "deepseek/deepseek-v4-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "deepseek/deepseek-v4-pro",
+      "dispatch_native_name": "deepseek/deepseek-v4-pro",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "glm-4.5-flash",
+      "dispatch_native_name": "glm-4.5-flash",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "glm-5.2",
+      "dispatch_native_name": "glm-5.2",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "glm-5.3",
+      "dispatch_native_name": "glm-5.3",
+      "catalog_status": "listed (not probed)"
+    },
+    {
+      "provider": "routstrd",
+      "registry_model": "kimi-k3",
+      "dispatch_native_name": "kimi-k3",
+      "catalog_status": "listed (not probed)"
+    }
+  ],
+  "v1_models_stub": {
+    "live_endpoint": "http://127.0.0.1:9099/v1/models (HTTP 200, matches stub code 6794-6826)",
+    "advertised": [
+      "glm-4.5-air",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "kimi-k2.7-code",
+      "kimi-k3",
+      "kimi-k3:cloud",
+      "minimax-m3:cloud"
+    ],
+    "deepseek_advertised": [],
+    "registry_models_NOT_advertised": [
+      "claude-haiku-4-5",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "deepseek/gemma-4-31b",
+      "gemma4:31b",
+      "glm-4.5",
+      "gpt-5",
+      "gpt-oss:120b",
+      "kimi-k2.5",
+      "minimax-m3",
+      "qwen3.5:397b"
+    ],
+    "advertised_but_no_flat_router_candidate": []
+  },
+  "ollama_untranslated_404_paths": [
+    "ollama_cloud: 'glm-4.5-flash' dispatched VERBATIM, absent from live catalog",
+    "ollama_cloud: 'kimi-k3:cloud' dispatched VERBATIM, absent from live catalog",
+    "ollama_cloud: 'minimax-m3:cloud' dispatched VERBATIM, absent from live catalog",
+    "ollama_cloud_2: 'glm-4.5-flash' dispatched VERBATIM, absent from live catalog",
+    "ollama_cloud_2: 'kimi-k3:cloud' dispatched VERBATIM, absent from live catalog",
+    "ollama_cloud_2: 'minimax-m3:cloud' dispatched VERBATIM, absent from live catalog"
+  ],
+  "_PROVIDER_MODEL_NAMES_providers": [
+    "deepinfra",
+    "neuralwatt",
+    "ollama_cloud",
+    "ollama_cloud_2",
+    "opencode_go",
+    "openrouter",
+    "ppq",
+    "telnyx"
+  ]
+}

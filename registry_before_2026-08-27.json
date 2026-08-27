@@ -1,0 +1,112 @@
+{
+  "_meta": {
+    "captured_at": "2026-08-27T16:54:49+0530",
+    "task": "FR-0 before-state evidence (t_39c85a31)",
+    "source_file": "/home/c03rad0r/.hermes/bot/flat_router.py",
+    "source_sha256": "3cae19323c2f3f115a95ec37a70af72be4d5eac6a197c9db1d22ec06c7fd9411",
+    "source_lines": "78-142",
+    "git_commit": "efd6344fa066",
+    "extraction": "ast.literal_eval \u2014 verbatim runtime-literal values, no import"
+  },
+  "PROVIDER_MODELS": {
+    "ours": [
+      "glm-4.5",
+      "glm-4.5-air",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3"
+    ],
+    "friend": [
+      "glm-4.5",
+      "glm-4.5-air",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3"
+    ],
+    "ollama_cloud": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "gemma4:31b",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "gpt-oss:120b",
+      "kimi-k2.7-code",
+      "kimi-k3:cloud",
+      "minimax-m3:cloud",
+      "qwen3.5:397b"
+    ],
+    "ollama_cloud_2": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "gemma4:31b",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "gpt-oss:120b",
+      "kimi-k2.7-code",
+      "kimi-k3:cloud",
+      "minimax-m3:cloud",
+      "qwen3.5:397b"
+    ],
+    "opencode_go": [
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-5.2",
+      "glm-5.3",
+      "kimi-k2.7-code",
+      "kimi-k3"
+    ],
+    "neuralwatt": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "deepseek/gemma-4-31b",
+      "glm-5.2",
+      "kimi-k3"
+    ],
+    "deepinfra": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-5.2"
+    ],
+    "ppq": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-5.2",
+      "kimi-k3"
+    ],
+    "openrouter": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-5.2",
+      "kimi-k3"
+    ],
+    "telnyx": [
+      "claude-haiku-4-5",
+      "gpt-5",
+      "kimi-k2.5",
+      "kimi-k2.7-code",
+      "kimi-k3",
+      "kimi-k3:cloud",
+      "minimax-m3"
+    ],
+    "routstr": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "kimi-k3"
+    ],
+    "routstrd": [
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+      "glm-4.5-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "kimi-k3"
+    ]
+  }
+}

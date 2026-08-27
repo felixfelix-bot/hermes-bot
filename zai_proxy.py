@@ -1062,13 +1062,60 @@ def _is_key_healthy(name: str) -> bool:
     return time.time() >= h.get("retry_after", 0)
 
 
-def _mark_key_failure(name: str, error_type: str = "exhausted") -> None:
+def _parse_opencode_reset_seconds(text: str | None) -> float | None:
+    """Parse an upstream 'Resets in N days[/hours/minutes]' message → seconds.
+
+    Used by the opencode_go 429 path so the backoff matches the REAL reset
+    time (e.g. weekly cap → 'Resets in 3 days' → 259200s) instead of the
+    flat exponential default. Returns None when nothing parseable is found.
+    Never raises.
+    """
+    if not text:
+        return None
+    try:
+        import re as _re
+        m = _re.search(
+            r"resets?\s+in\s+"
+            r"((?:\d+\s*(?:days?|hours?|hrs?|h|minutes?|mins?|m|"
+            r"seconds?|secs?|s)[,\s]*)+)",
+            text, _re.IGNORECASE)
+        if not m:
+            return None
+        total = 0.0
+        found = False
+        for num, unit in _re.findall(
+                r"(\d+)\s*(days?|hours?|hrs?|h|minutes?|mins?|m|"
+                r"seconds?|secs?|s)", m.group(1), _re.IGNORECASE):
+            n = float(num)
+            u = unit.lower()
+            if u.startswith("day"):
+                total += n * 86400.0
+            elif u.startswith("hour") or u.startswith("hr") or u == "h":
+                total += n * 3600.0
+            elif u.startswith("min") or u == "m":
+                total += n * 60.0
+            else:  # seconds / secs / s
+                total += n
+            found = True
+        if not found or total <= 0:
+            return None
+        return min(total, 14 * 86400.0)  # sanity cap: 14 days
+    except Exception:
+        return None
+
+
+def _mark_key_failure(name: str, error_type: str = "exhausted",
+                      retry_after_seconds: float | None = None) -> None:
     """Record one failure for *name* and arm the appropriate backoff window.
 
     error_type selects the backoff strategy (req 2 — dead-key detection):
       "exhausted" (429 / empty) → exponential ramp 2→60s (req 1)
       "dead"     (401/403)      → flat 1h (key likely revoked)
       "server"   (500/502/503/504) → flat 30s (transient upstream issue)
+
+    retry_after_seconds, when provided (>0), OVERRIDES the computed backoff
+    with the upstream-declared reset time (e.g. parsed from a 429
+    "Resets in N days" body). Capped at 14 days.
 
     Bumps the consecutive-failure counter (reset on success), mirrors the new
     state to the ``key_health`` table (req 4), and logs backoff/KEY_DEAD
@@ -1090,6 +1137,13 @@ def _mark_key_failure(name: str, error_type: str = "exhausted") -> None:
             backoff = _SERVER_ERROR_BACKOFF_SECONDS
         else:  # "exhausted" — 429 / empty response
             backoff = _backoff_for_failure(failures)
+        if retry_after_seconds is not None:
+            try:
+                _parsed_reset = float(retry_after_seconds)
+                if _parsed_reset > 0:
+                    backoff = min(_parsed_reset, 14 * 86400.0)
+            except Exception:
+                pass
         retry_after = now + backoff
         disabled = _is_manually_disabled(name)
         _zai_key_health[name] = {
@@ -4885,9 +4939,42 @@ class Handler(BaseHTTPRequestHandler):
                 return True
 
         except urllib.error.HTTPError as he:
+            # Read the error body once — needed for RegionError detection
+            # (model-scoped 403) and 429 reset-time parsing.
+            _og_err_body = b""
+            try:
+                _og_err_body = he.read() or b""
+            except Exception:
+                pass
+            try:
+                _og_err_text = _og_err_body.decode("utf-8", "replace")
+            except Exception:
+                _og_err_text = ""
             if he.code == 429:
-                _mark_key_exhausted("opencode_go")
+                # Quota cap — mark exhausted, but use the upstream
+                # "Resets in N days/hours" hint for the backoff when present
+                # instead of the exponential default.
+                _og_reset_s = _parse_opencode_reset_seconds(_og_err_text)
+                _mark_key_failure("opencode_go", "exhausted",
+                                  retry_after_seconds=_og_reset_s)
             elif he.code in (401, 403):
+                # Model-scoped 403 (RegionError): the MODEL is unavailable in
+                # the key's region, but the KEY is fine — glm-5.3, kimi-k3
+                # and everything else still route here. Do NOT poison the
+                # key. (Incident 2026-08-25: RegionError marked the key
+                # exhausted → glm-5.3 dead/exhausted cycled for 72h.)
+                if he.code == 403 and "regionerror" in _og_err_text.lower():
+                    print(f"[opencode_go] 403 RegionError (model-scoped) "
+                          f"model={og_model} — key kept healthy, skipping "
+                          f"this model on this provider", flush=True)
+                    try:
+                        _log_anomaly("INFO", "model_scoped_skip",
+                                     "opencode_go 403 RegionError — model skipped, key kept",
+                                     f"model={og_model}; body={_og_err_text[:200]}",
+                                     key_name="opencode_go")
+                    except Exception:
+                        pass
+                    return False
                 # Don't immediately mark "dead" on first 401 — the key may be
                 # valid but the endpoint returned a transient auth error.
                 # Use "exhausted" backoff (shorter) instead of "dead" (1h).

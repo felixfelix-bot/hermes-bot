@@ -641,5 +641,82 @@ class TestModelCanonicalization:
         assert "opencode_go" not in names
 
 
+class TestRegionErrorModelScoped:
+    """403 RegionError from opencode_go must be model-scoped: the KEY stays
+    healthy so glm-5.3 (and everything else) keeps routing there."""
+
+    def _make_handler(self):
+        import zai_proxy
+        return object.__new__(zai_proxy.Handler)
+
+    def test_region_error_model_scoped(self):
+        """_try_opencode_go receiving 403 body containing 'RegionError' must
+        NOT mark the key exhausted/dead."""
+        import zai_proxy
+        import io
+        import urllib.error
+
+        handler = self._make_handler()
+        body = json.dumps({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+
+        err_fp = io.BytesIO(
+            b'{"error":{"type":"RegionError","message":'
+            b'"Model deepseek-v4-flash is not available in your region"}}')
+        http_err = urllib.error.HTTPError(
+            url="https://opencode.ai/api/v1/chat/completions",
+            code=403, msg="Forbidden", hdrs={}, fp=err_fp)
+
+        marks = []
+        with patch.object(zai_proxy, "OPENCODE_GO_KEY", "test-key-1234"), \
+             patch.object(zai_proxy, "_is_key_healthy", return_value=True), \
+             patch.object(zai_proxy, "_mark_key_failure",
+                          side_effect=lambda n, t=None, **kw: marks.append((n, t))), \
+             patch.object(zai_proxy, "_mark_key_exhausted",
+                          side_effect=lambda n: marks.append((n, "exhausted"))), \
+             patch("urllib.request.urlopen", side_effect=http_err):
+            result = handler._try_opencode_go(body, "deepseek-v4-flash",
+                                              bytearray(), time.time())
+
+        assert result is False, "RegionError should return False (try next provider)"
+        assert marks == [], \
+            f"RegionError must NOT mark the key (got marks: {marks}) — " \
+            f"this poisoned glm-5.3 for 72h in the Aug-25 incident"
+
+    def test_auth_error_still_marks(self):
+        """A plain 403 (no RegionError) must still mark the key (revoked key
+        detection unchanged)."""
+        import zai_proxy
+        import io
+        import urllib.error
+
+        handler = self._make_handler()
+        body = json.dumps({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+
+        err_fp = io.BytesIO(b'{"error":{"message":"Invalid API key"}}')
+        http_err = urllib.error.HTTPError(
+            url="https://opencode.ai/api/v1/chat/completions",
+            code=403, msg="Forbidden", hdrs={}, fp=err_fp)
+
+        marks = []
+        with patch.object(zai_proxy, "OPENCODE_GO_KEY", "test-key-1234"), \
+             patch.object(zai_proxy, "_is_key_healthy", return_value=True), \
+             patch.object(zai_proxy, "_mark_key_failure",
+                          side_effect=lambda n, t=None, **kw: marks.append((n, t))), \
+             patch.object(zai_proxy, "_mark_key_exhausted",
+                          side_effect=lambda n: marks.append((n, "exhausted"))), \
+             patch("urllib.request.urlopen", side_effect=http_err):
+            result = handler._try_opencode_go(body, "glm-5.3",
+                                              bytearray(), time.time())
+
+        assert result is False
+        assert marks != [], "Non-RegionError 403 must still mark the key"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -570,6 +570,7 @@ _EXTERNAL_KEYS = _load_external_keys()
 # Fail-closed: any import/config error -> tier absent -> zero regression.
 # NOTE: Must be AFTER _EXTERNAL_KEYS = _load_external_keys() — the tier needs the key.
 _OXALPHA_TIER = None
+_oxalpha_key_alive = True  # validated at startup; False → poller/failover skip
 try:
     from src.oxalpha_tier import OxalphaTier, load_tier_from_config
     from src.promo_tier import PromoTierGuard
@@ -585,8 +586,27 @@ try:
         _ox_strategy = {}
     _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
     _OXALPHA_TIER = load_tier_from_config(_ox_cfg, _ox_strategy, _ox_key)
+    # Validate the oxalpha key (OpenRouter /api/v1/key). A 401 means the
+    # promo key is dead/expired — disable the poller and failover attempts
+    # so we don't spam 401 every 5 min in the logs. One INFO at startup
+    # instead of an error loop.  Re-checking happens on process restart.
+    _oxalpha_key_alive = True
+    if _ox_key:
+        try:
+            _ox_probe = urllib.request.Request(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {_ox_key}", "User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(_ox_probe, timeout=10) as _r:
+                if _r.status != 200:
+                    raise OSError(f"HTTP {_r.status}")
+        except Exception as _ke:
+            _oxalpha_key_alive = False
+            print(f"[oxalpha] key DEAD ({_ke}) — poller + failover DISABLED "
+                  f"to avoid 401 spam every 5 min. Promo key suffix=...{_ox_key[-4:]}", flush=True)
     print(f"[oxalpha] tier loaded — failover_enabled={_OXALPHA_TIER.failover_enabled} "
-          f"configured={_OXALPHA_TIER.configured} key={'present' if _ox_key else 'ABSENT'}", flush=True)
+          f"configured={_OXALPHA_TIER.configured} key={'present' if _ox_key else 'ABSENT'} "
+          f"alive={_oxalpha_key_alive}", flush=True)
 except Exception as _ox_e:
     print(f"[oxalpha] tier DISABLED — {_ox_e}", flush=True)
     _OXALPHA_TIER = None
@@ -5151,6 +5171,10 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not _OXALPHA_TIER or not _OXALPHA_TIER.failover_eligible():
             return False
+        # Dead promo key (validated at startup) — skip, don't burn a
+        # 401 round-trip on every failover attempt.
+        if not _oxalpha_key_alive:
+            return False
         _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
         if not _ox_key:
             return False
@@ -5361,7 +5385,9 @@ class Handler(BaseHTTPRequestHandler):
         # Positioned after z.ai keys (the only way this function is reached)
         # and before every paid candidate. Single attempt, 90s timeout.
         # ANY error falls through to the paid chain — zero regression.
-        if _OXALPHA_TIER is not None and _OXALPHA_TIER.failover_eligible():
+        # Skipped entirely when the promo key was validated dead at startup.
+        if _OXALPHA_TIER is not None and _OXALPHA_TIER.failover_eligible() \
+                and _oxalpha_key_alive:
             if self._serve_via_oxalpha(body, response_buffer, t0):
                 return True
             # oxalpha failed — fall through to paid chain below
@@ -7052,6 +7078,10 @@ def _oxalpha_usage_poller():
     _key = _EXTERNAL_KEYS.get("oxalpha", "")
     if not _key:
         return
+    # Dead key (validated at startup, OpenRouter 401) — no point polling.
+    # Single startup log already emitted; skip the 5-min error loop.
+    if not _oxalpha_key_alive:
+        return
     while True:
         try:
             if _OXALPHA_TIER is None or not _OXALPHA_TIER.configured:
@@ -7295,7 +7325,8 @@ if __name__ == "__main__":
     t = threading.Thread(target=_refresh_loop, daemon=True)
     t.start()
     # OX-2: start oxalpha usage-delta poller
-    if _OXALPHA_TIER is not None and _OXALPHA_TIER.configured:
+    # (skipped when the key was validated dead at startup — see _oxalpha_key_alive)
+    if _OXALPHA_TIER is not None and _OXALPHA_TIER.configured and _oxalpha_key_alive:
         _ox_poll = threading.Thread(target=_oxalpha_usage_poller, daemon=True)
         _ox_poll.start()
     # Nostr kind-30315 Kalman pricing publisher

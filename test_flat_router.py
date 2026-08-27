@@ -772,5 +772,134 @@ class TestRegionErrorModelScoped:
         assert marks != [], "Non-RegionError 403 must still mark the key"
 
 
+# ── FR-2 tests (2026-08-27): canonical registry + dispatch translation ──────
+# Canonicalize PROVIDER_MODELS to canonical IDs ONLY (no :cloud tags, no
+# phantom ollama entries). Dispatch translation must be alias-aware so a
+# canonical short ID resolves to the provider-native name at request time.
+# Evidence: FR-0 live probe (ollama_tags_key1.json) — ollama real tags are
+# kimi-k3 / minimax-m3 / deepseek-v4-flash:0731 / deepseek-v4-pro:0813.
+# kimi-k3:cloud and minimax-m3:cloud are verbatim-404 paths (do NOT exist).
+
+
+class TestFR2CanonicalRegistry:
+    """PROVIDER_MODELS must use canonical IDs only; no phantom ollama entries."""
+
+    def test_ollama_uses_canonical_kimi_k3_not_cloud(self):
+        """ollama sets must list canonical 'kimi-k3', never 'kimi-k3:cloud'."""
+        for prov in ("ollama_cloud", "ollama_cloud_2"):
+            assert "kimi-k3" in PROVIDER_MODELS[prov], \
+                f"{prov} missing canonical kimi-k3"
+            assert "kimi-k3:cloud" not in PROVIDER_MODELS[prov], \
+                f"{prov} still lists phantom kimi-k3:cloud (404 on ollama)"
+
+    def test_ollama_uses_canonical_minimax_m3_not_cloud(self):
+        """ollama sets must list canonical 'minimax-m3', never 'minimax-m3:cloud'."""
+        for prov in ("ollama_cloud", "ollama_cloud_2"):
+            assert "minimax-m3" in PROVIDER_MODELS[prov], \
+                f"{prov} missing canonical minimax-m3"
+            assert "minimax-m3:cloud" not in PROVIDER_MODELS[prov], \
+                f"{prov} still lists phantom minimax-m3:cloud (404 on ollama)"
+
+    def test_ollama_phantom_glm53_removed(self):
+        """glm-5.3 is PHANTOM on ollama (FR-0: catalog has glm-5.1/5.2/5.3-flash).
+        It must be removed from ollama sets — the silent downgrade to glm-5.2
+        violates the never-substitute principle."""
+        for prov in ("ollama_cloud", "ollama_cloud_2"):
+            assert "glm-5.3" not in PROVIDER_MODELS[prov], \
+                f"{prov} still lists phantom glm-5.3 (silent downgrade to glm-5.2)"
+
+    def test_ollama_phantom_glm45flash_removed(self):
+        """glm-4.5-flash is PHANTOM on ollama (FR-0: absent from live catalog,
+        verbatim 404). Must be removed from ollama sets."""
+        for prov in ("ollama_cloud", "ollama_cloud_2"):
+            assert "glm-4.5-flash" not in PROVIDER_MODELS[prov], \
+                f"{prov} still lists phantom glm-4.5-flash (verbatim 404)"
+
+    def test_telnyx_kimi_k3_cloud_deduped(self):
+        """telnyx kimi-k3:cloud (silent downgrade to Kimi-K2.5) must be deduped
+        under canonical kimi-k3 — no silent substitution."""
+        assert "kimi-k3:cloud" not in PROVIDER_MODELS["telnyx"], \
+            "telnyx still lists kimi-k3:cloud (silent K2.5 downgrade)"
+        assert "kimi-k3" in PROVIDER_MODELS["telnyx"], \
+            "telnyx missing canonical kimi-k3"
+
+    def test_no_cloud_tags_anywhere_in_registry(self):
+        """No ':cloud' tagged model IDs may remain in PROVIDER_MODELS."""
+        for prov, models in PROVIDER_MODELS.items():
+            for m in models:
+                assert not m.endswith(":cloud"), \
+                    f"{prov} still lists tagged {m!r} — registry must be canonical"
+
+
+class TestFR2DispatchTranslation:
+    """Dispatch-time translation must be alias-aware: canonical short IDs
+    resolve to provider-native names via _resolve_model_for_provider."""
+
+    def _healthy_all(self):
+        return patch("flat_router._is_provider_healthy", return_value=True)
+
+    def test_kimi_k3_to_ollama_sends_real_tag(self):
+        """kimi-k3 routed to ollama must send 'kimi-k3' (the real ollama tag),
+        not 'kimi-k3:cloud' (which 404s)."""
+        import zai_proxy
+        with self._healthy_all():
+            candidates = select_provider(model="kimi-k3")
+        ollama = [c for c in candidates if c.name in ("ollama_cloud", "ollama_cloud_2")]
+        assert ollama, "kimi-k3 must have ollama candidates"
+        for c in ollama:
+            assert c.model == "kimi-k3", \
+                f"ollama outgoing model {c.model!r} != 'kimi-k3' (real tag)"
+
+    def test_deepseek_flash_to_deepinfra_sends_native(self):
+        """deepseek-v4-flash routed to deepinfra must send
+        'deepseek-ai/DeepSeek-V4-Flash' (case-sensitive dotted form)."""
+        import zai_proxy
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek-v4-flash")
+        di = [c for c in candidates if c.name == "deepinfra"]
+        assert di, "deepseek-v4-flash must have deepinfra candidate"
+        assert di[0].model == "deepseek-ai/DeepSeek-V4-Flash", \
+            f"deepinfra outgoing {di[0].model!r} != 'deepseek-ai/DeepSeek-V4-Flash'"
+
+    def test_short_form_deepseek_resolves_via_alias_lookup(self):
+        """_resolve_model_for_provider must resolve the SHORT form
+        'deepseek-v4-flash' to deepinfra's native name (alias-aware lookup),
+        not miss and send it verbatim."""
+        from flat_router import _resolve_model_for_provider
+        got = _resolve_model_for_provider("deepinfra", "deepseek-v4-flash")
+        assert got == "deepseek-ai/DeepSeek-V4-Flash", \
+            f"short-form lookup returned {got!r} — alias-aware lookup missing"
+
+    def test_slashed_form_deepseek_still_resolves(self):
+        """The slashed canonical form must still resolve (rollback safety)."""
+        from flat_router import _resolve_model_for_provider
+        got = _resolve_model_for_provider("deepinfra", "deepseek/deepseek-v4-flash")
+        assert got == "deepseek-ai/DeepSeek-V4-Flash", \
+            f"slashed-form lookup returned {got!r}"
+
+    def test_worker_fallback_model_consumers_work(self):
+        """WORKER_FALLBACK_MODEL ('deepseek/deepseek-v4-flash') must still
+        resolve to ≥3 candidates AND its deepinfra outgoing name must be the
+        native dotted form (rollback safety net intact)."""
+        import zai_proxy
+        assert zai_proxy.WORKER_FALLBACK_MODEL == "deepseek/deepseek-v4-flash"
+        with self._healthy_all():
+            candidates = select_provider(model=zai_proxy.WORKER_FALLBACK_MODEL)
+        non_fallback = [c for c in candidates if c.name != "fallback"]
+        assert len(non_fallback) >= 3, \
+            f"WORKER_FALLBACK_MODEL resolved to only {[c.name for c in non_fallback]}"
+        di = [c for c in non_fallback if c.name == "deepinfra"]
+        assert di and di[0].model == "deepseek-ai/DeepSeek-V4-Flash", \
+            "WORKER_FALLBACK_MODEL deepinfra outgoing must be native dotted form"
+
+    def test_known_external_model_short_form(self):
+        """_is_known_external_model must recognize the SHORT form
+        'deepseek-v4-flash' (canonicalized) so the old failover path passes it
+        through verbatim instead of rejecting it."""
+        import zai_proxy
+        assert zai_proxy._is_known_external_model("deepseek-v4-flash") is True, \
+            "short-form deepseek-v4-flash must be known to external failover"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

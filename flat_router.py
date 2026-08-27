@@ -70,6 +70,33 @@ class ProviderCandidate:
     reason: str = ""
 
 
+# ── Model alias canonicalization (2026-08-27 fix) ───────────────────────────
+# Short-form / tagged model IDs that clients (cron jobs, workers, ollama
+# habits) send but that only match ONE provider's registry entry (opencode_go)
+# unless normalized. Mapping them to the canonical "deepseek/deepseek-v4-*"
+# form lets ALL providers compete — market-driven routing (Felix-approved).
+# Incident 2026-08-25: 2,305 prod requests for short forms got single-candidate
+# lists; when opencode_go hit 429 weekly-cap + 403 RegionError, they 503'd.
+MODEL_ALIASES: dict[str, str] = {
+    "deepseek-v4-flash":      "deepseek/deepseek-v4-flash",
+    "deepseek-v4-pro":        "deepseek/deepseek-v4-pro",
+    "deepseek-v4-flash-0731": "deepseek/deepseek-v4-flash",
+    "deepseek-v4-pro-0813":   "deepseek/deepseek-v4-pro",
+}
+
+
+def canonicalize_model(model: str | None) -> str:
+    """Canonicalize a model ID: strip whitespace, resolve known aliases.
+
+    Idempotent: canonical forms and unknown models pass through verbatim.
+    Never raises — a None input returns "".
+    """
+    if not model:
+        return ""
+    m = model.strip()
+    return MODEL_ALIASES.get(m, m)
+
+
 # ── PROVIDER_MODELS registry (design doc §2.6) ──────────────────────────────
 # Dict mapping provider name -> set of model IDs it can serve.
 # Covers ALL 12 providers from the design doc §3.
@@ -795,7 +822,11 @@ def select_provider(
     Phase 1: runs in SHADOW MODE only. best_key() still drives all routing.
     """
     try:
-        model_id = model or "glm-5.2"
+        original_model = (model or "glm-5.2").strip() if model else "glm-5.2"
+        # Canonicalize BEFORE the model filter so short forms
+        # ("deepseek-v4-flash", tagged "-0731"/"-0813") resolve to the
+        # canonical IDs that ALL providers register, not just opencode_go.
+        model_id = canonicalize_model(original_model) or "glm-5.2"
         candidates: list[ProviderCandidate] = []
 
         for name, models in PROVIDER_MODELS.items():
@@ -832,10 +863,12 @@ def select_provider(
         candidates.sort(key=lambda c: c.effective_cost)
 
         if not candidates:
-            # Fallback candidate — no viable providers
+            # Fallback candidate — no viable providers.
+            # Echo the ORIGINAL requested string (pre-canonicalization) for
+            # debuggability: the caller's 503 must show what was asked for.
             candidates.append(ProviderCandidate(
                 name="fallback",
-                model=model_id,
+                model=original_model,
                 effective_cost=float("inf"),
                 dispatch_fn=None,
                 reason="no viable provider found",

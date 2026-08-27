@@ -514,5 +514,132 @@ class TestRollbackFlag:
             "_try_opencode_go must be preserved for rollback"
 
 
+# ── Canonicalization tests (2026-08-27): short-form deepseek resolution ─────
+# Incident: 2,305 prod requests for "deepseek-v4-flash"/"deepseek-v4-pro"
+# (and hyphen-tagged "-0731"/"-0813" forms) matched ONLY opencode_go in
+# PROVIDER_MODELS → single-candidate lists → 503s when opencode_go was
+# down. Canonicalization must map these to the canonical
+# "deepseek/deepseek-v4-*" forms so ALL providers compete on price.
+
+
+class TestModelCanonicalization:
+    """Short-form / tagged model IDs must resolve to the full provider set."""
+
+    def _healthy_all(self):
+        """Patch context where every provider passes the health gate."""
+        return patch("flat_router._is_provider_healthy", return_value=True)
+
+    def test_short_form_deepseek_flash_multi_candidate(self):
+        """'deepseek-v4-flash' must resolve to ≥3 providers incl. a per-token one."""
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek-v4-flash")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert len(names) >= 3, \
+            f"Short-form deepseek-v4-flash resolved to only {names} — " \
+            f"canonicalization missing or broken"
+        per_token = {"ppq", "neuralwatt", "deepinfra", "openrouter",
+                     "routstr", "routstrd"}
+        assert per_token & set(names), \
+            f"No per-token provider in candidate list {names}"
+
+    def test_short_form_deepseek_pro_multi_candidate(self):
+        """'deepseek-v4-pro' must resolve to ≥3 providers incl. a per-token one."""
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek-v4-pro")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert len(names) >= 3, \
+            f"Short-form deepseek-v4-pro resolved to only {names}"
+        per_token = {"ppq", "neuralwatt", "deepinfra", "openrouter",
+                     "routstr", "routstrd"}
+        assert per_token & set(names), \
+            f"No per-token provider in candidate list {names}"
+
+    def test_ollama_tagged_hyphen_form_normalized(self):
+        """'deepseek-v4-flash-0731' (cron-style tag) → same set as canonical."""
+        with self._healthy_all():
+            tagged = select_provider(model="deepseek-v4-flash-0731")
+            canonical = select_provider(model="deepseek/deepseek-v4-flash")
+        tagged_names = sorted(c.name for c in tagged if c.name != "fallback")
+        canonical_names = sorted(c.name for c in canonical if c.name != "fallback")
+        assert tagged_names == canonical_names, \
+            f"Tagged form candidates {tagged_names} != canonical {canonical_names}"
+        assert len(tagged_names) >= 3, \
+            f"Tagged form resolved to only {tagged_names}"
+
+    def test_canonicalization_idempotent(self):
+        """canonicalize_model must leave canonical + z.ai/kimi IDs untouched."""
+        from flat_router import canonicalize_model
+        # Canonical forms unchanged (idempotent)
+        assert canonicalize_model("deepseek/deepseek-v4-flash") == \
+            "deepseek/deepseek-v4-flash"
+        assert canonicalize_model("deepseek/deepseek-v4-pro") == \
+            "deepseek/deepseek-v4-pro"
+        # Common z.ai / kimi IDs unchanged
+        assert canonicalize_model("glm-5.2") == "glm-5.2"
+        assert canonicalize_model("glm-5.3") == "glm-5.3"
+        assert canonicalize_model("kimi-k3") == "kimi-k3"
+        # Aliases resolve
+        assert canonicalize_model("deepseek-v4-flash") == "deepseek/deepseek-v4-flash"
+        assert canonicalize_model("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
+        assert canonicalize_model("deepseek-v4-flash-0731") == "deepseek/deepseek-v4-flash"
+        assert canonicalize_model("deepseek-v4-pro-0813") == "deepseek/deepseek-v4-pro"
+        # Whitespace stripped
+        assert canonicalize_model("  deepseek-v4-flash  ") == "deepseek/deepseek-v4-flash"
+        # Unknown models pass through verbatim
+        assert canonicalize_model("nonexistent-model-xyz") == "nonexistent-model-xyz"
+
+    def test_alias_outgoing_names_correct(self):
+        """Each candidate for a short-form request must use the provider's
+        outgoing model name from _PROVIDER_MODEL_NAMES (translation at
+        selection must match translation at dispatch)."""
+        import zai_proxy
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek-v4-flash")
+        canonical = "deepseek/deepseek-v4-flash"
+        checked = 0
+        for c in candidates:
+            if c.name == "fallback":
+                continue
+            expected = zai_proxy._PROVIDER_MODEL_NAMES.get(c.name, {}).get(
+                canonical, canonical)
+            assert c.model == expected, \
+                f"{c.name}: outgoing model {c.model!r} != expected {expected!r}"
+            checked += 1
+        assert checked >= 3, f"Only {checked} candidates checked"
+
+    def test_unknown_model_still_fallback(self):
+        """Unknown models must still produce a single fallback candidate."""
+        with self._healthy_all():
+            candidates = select_provider(model="nonexistent-model-xyz")
+        assert len(candidates) == 1, \
+            f"Expected exactly 1 fallback candidate, got {candidates}"
+        assert candidates[0].name == "fallback"
+        assert candidates[0].dispatch_fn is None
+        assert candidates[0].effective_cost == float("inf")
+
+    def test_worker_fallback_model_resolves_multi(self):
+        """WORKER_FALLBACK_MODEL ('deepseek/deepseek-v4-flash') must give
+        ≥3 non-fallback candidates (market-driven, not single-provider)."""
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek/deepseek-v4-flash")
+        non_fallback = [c for c in candidates if c.name != "fallback"]
+        assert len(non_fallback) >= 3, \
+            f"Worker fallback model resolved to only {[c.name for c in non_fallback]}"
+
+    def test_exhausted_opencode_go_still_serves_short_form(self):
+        """THE incident regression test: with opencode_go unhealthy, a
+        short-form deepseek request must STILL return ≥2 candidates.
+        (Previously 'deepseek-v4-flash' matched only opencode_go → 0
+        candidates → 503 for 72h.)"""
+        with patch("flat_router._is_provider_healthy",
+                   side_effect=lambda n: n != "opencode_go"):
+            candidates = select_provider(model="deepseek-v4-flash")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert len(names) >= 2, \
+            f"Short form with dead opencode_go gave only {names} — " \
+            f"the 2026-08-25 503 incident would recur"
+        assert "opencode_go" not in names
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

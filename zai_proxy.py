@@ -774,9 +774,20 @@ def _is_known_external_model(model: str | None) -> bool:
       1. It appears in _PROVIDER_MODEL_NAMES for any provider, OR
       2. It starts with a known provider prefix (deepseek/, qwen, minimax, mimo), OR
       3. It matches any model in the flat router's PROVIDER_MODELS sets.
+
+    Short-form aliases (e.g. "deepseek-v4-flash") are canonicalized first
+    (single source of truth: flat_router.canonicalize_model) so they are
+    recognized even though registries list the canonical ID.
     """
     if not model:
         return False
+    model = model.strip()
+    # Canonicalize aliases before any registry/prefix check
+    try:
+        from flat_router import canonicalize_model as _fr_canonicalize
+        model = _fr_canonicalize(model) or model
+    except Exception:
+        pass
     # Check known prefixes
     if model.startswith(_KNOWN_EXTERNAL_PREFIXES):
         return True

@@ -101,6 +101,15 @@ def canonicalize_model(model: str | None) -> str:
 # Dict mapping provider name -> set of model IDs it can serve.
 # Covers ALL 12 providers from the design doc §3.
 # NO CAPS on any provider — free market price discovery.
+#
+# CANONICAL-ONLY (2026-08-27, FR-2): every entry is a canonical short ID.
+# No ':cloud' tags, no slashed deepseek forms, no phantom ollama entries.
+# Dispatch-time translation to provider-native names happens in
+# _resolve_model_for_provider() via zai_proxy._PROVIDER_MODEL_NAMES.
+# Evidence: FR-0 live probe (ollama_tags_key1.json) — ollama real tags are
+# kimi-k3 / minimax-m3 / deepseek-v4-flash:0731 / deepseek-v4-pro:0813.
+# kimi-k3:cloud, minimax-m3:cloud, glm-5.3, glm-4.5-flash are PHANTOM on
+# ollama (verbatim 404 or silent downgrade) and are removed here.
 
 PROVIDER_MODELS: dict[str, set[str]] = {
     # z.ai keys — z.ai catalog only (deepseek/qwen/minimax/mimo are NOT
@@ -117,24 +126,30 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
         "glm-4.6v",
     },
-    # Ollama Cloud — included subscription, wide model catalog
+    # Ollama Cloud — included subscription, wide model catalog.
+    # Canonical IDs only. glm-5.3 / glm-4.5-flash / kimi-k3:cloud /
+    # minimax-m3:cloud are PHANTOM on ollama (FR-0 live probe) — removed.
+    # deepseek stays in SLASHED canonical form (FR-1 direction, do NOT
+    # reverse to short). Dispatch translates kimi-k3 -> kimi-k3,
+    # minimax-m3 -> minimax-m3, deepseek/deepseek-v4-flash ->
+    # deepseek-v4-flash:0731 (real tags).
     "ollama_cloud": {
-        "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
+        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
-        "minimax-m3:cloud",
+        "minimax-m3",
     },
     "ollama_cloud_2": {
-        "glm-5.2", "glm-5.3", "glm-4.5-flash", "kimi-k3:cloud", "kimi-k2.7-code",
+        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
-        "minimax-m3:cloud",
+        "minimax-m3",
     },
-    # OpenCode Go — flat-rate $10/mo, native glm-5.3, 29 models
+    # OpenCode Go — flat-rate $10/mo, native glm-5.3, 29 models.
+    # deepseek stays in SLASHED canonical form (FR-1 direction).
     "opencode_go": {
         "glm-5.2", "glm-5.3", "kimi-k3", "kimi-k2.7-code",
         "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
-        "deepseek-v4-pro", "deepseek-v4-flash",
     },
     # NeuralWatt — per-token, deepseek-v4-flash $0.14/M
     "neuralwatt": {
@@ -156,10 +171,13 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     },
-    # Telnyx — Kimi-focused by operator decision
+    # Telnyx — Kimi-focused by operator decision.
+    # kimi-k3:cloud deduped under canonical kimi-k3 (2026-08-27, FR-2):
+    # the :cloud form silently downgraded to Kimi-K2.5 — a silent
+    # substitution that violated the never-substitute principle.
     "telnyx": {
         "kimi-k3", "kimi-k2.5", "gpt-5", "claude-haiku-4-5",
-        "minimax-m3", "kimi-k3:cloud", "kimi-k2.7-code",
+        "minimax-m3", "kimi-k2.7-code",
     },
     # Routstr — Cashu-metered, same model IDs as proxy
     "routstr": {
@@ -896,6 +914,15 @@ def _resolve_model_for_provider(name: str, model: str) -> str:
 
     Uses _PROVIDER_MODEL_NAMES from zai_proxy for translation.
     Falls back to the original model name if no mapping exists.
+
+    ALIAS-AWARE (2026-08-27, FR-2): the registry now stores canonical SHORT
+    IDs (e.g. "deepseek-v4-flash"), but _PROVIDER_MODEL_NAMES is keyed by the
+    SLASHED canonical form (e.g. "deepseek/deepseek-v4-flash"). We try the
+    exact key first, then the canonicalized (slashed) form, so a short-ID
+    lookup still resolves to the provider-native name instead of being sent
+    verbatim (which would 400 on deepinfra). We do NOT re-key zai_proxy's map
+    — that would break rollback consumers at zai_proxy.py:4517,4784,4951,
+    5153,5273-5355.
     """
     try:
         model_names = _resolve("_PROVIDER_MODEL_NAMES")
@@ -903,6 +930,10 @@ def _resolve_model_for_provider(name: str, model: str) -> str:
             mapping = model_names.get(name, {})
             if model in mapping:
                 return mapping[model]
+            # Alias-aware fallback: try the canonicalized (slashed) form.
+            canonical = canonicalize_model(model)
+            if canonical != model and canonical in mapping:
+                return mapping[canonical]
     except Exception:
         pass
     return model

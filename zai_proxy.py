@@ -4601,6 +4601,7 @@ class Handler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
                 self.send_response(resp.status)
+                self._response_started = True  # response bytes committed — no retry
                 for h, v in resp.headers.items():
                     if h.lower() not in ("transfer-encoding", "connection"):
                         self.send_header(h, v)
@@ -4755,6 +4756,7 @@ class Handler(BaseHTTPRequestHandler):
                 _mark_key_healthy(key_name)
                 try:
                     self.send_response(resp.status)
+                    self._response_started = True  # response bytes committed — no retry
                     for h, v in resp.headers.items():
                         if h.lower() not in ("transfer-encoding", "connection"):
                             self.send_header(h, v)
@@ -4865,6 +4867,7 @@ class Handler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
                 self.send_response(resp.status)
+                self._response_started = True  # response bytes committed — no retry
                 for h, v in resp.headers.items():
                     if h.lower() not in ("transfer-encoding", "connection"):
                         self.send_header(h, v)
@@ -5076,6 +5079,7 @@ class Handler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
                 self.send_response(resp.status)
+                self._response_started = True  # response bytes committed — no retry
                 for h, v in resp.headers.items():
                     if h.lower() not in ("transfer-encoding", "connection"):
                         self.send_header(h, v)
@@ -5274,6 +5278,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with urllib.request.urlopen(req, timeout=180) as resp:
                     self.send_response(resp.status)
+                    self._response_started = True  # response bytes committed — no retry
                     for h, v in resp.headers.items():
                         if h.lower() not in ("transfer-encoding", "connection"):
                             self.send_header(h, v)
@@ -5715,6 +5720,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 _flat_response_buffer = bytearray()
                 _flat_key_used: str | None = None
+                # Reset the double-response guard for THIS request (the
+                # handler instance is reused across keep-alive requests).
+                self._response_started = False
                 _flat_status_code = None
                 _flat_error_text = None
                 _flat_served = False
@@ -5819,6 +5827,16 @@ class Handler(BaseHTTPRequestHandler):
 
                         return
                     else:
+                        # Double-response guard: if this candidate already
+                        # sent status/headers/body bytes to the client, we
+                        # CANNOT try the next candidate (the client would get
+                        # two concatenated responses) and CANNOT send a 503
+                        # either. Treat a started response as terminal.
+                        if getattr(self, "_response_started", False):
+                            print("[flat-router] response already started — "
+                                  "aborting candidate iteration "
+                                  f"(failed at {_cand.name})", flush=True)
+                            return
                         # Failure — mark key and try next candidate.
                         # Guard: only increment failure count if the key was
                         # actually healthy (i.e. the dispatch was attempted).
@@ -5835,9 +5853,11 @@ class Handler(BaseHTTPRequestHandler):
                         continue
 
                 # All candidates failed — send 503
-                if not _flat_served:
+                # (skip if a response was already started — see guard above)
+                if not _flat_served and not getattr(self, "_response_started", False):
                     _err = json.dumps({
                         "error": "all providers exhausted (flat router)",
+                        "model": original_model,
                         "candidates_tried": _cand_names,
                     }).encode()
                     self.send_response(503)

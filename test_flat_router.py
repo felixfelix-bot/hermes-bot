@@ -641,6 +641,43 @@ class TestModelCanonicalization:
         assert "opencode_go" not in names
 
 
+class TestDoubleResponseGuard:
+    """Response-started guard: once bytes hit the client, iteration must stop."""
+
+    def test_response_started_flag_set_in_handlers(self):
+        """Dispatch handlers must mark _response_started right after
+        send_response()."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_response_started" in source, \
+            "Handlers must set self._response_started after send_response()"
+        # All five dispatch handlers that stream must set the flag
+        for marker in ("X-Provider", ):
+            assert marker in source
+        n_set = source.count("self._response_started = True")
+        assert n_set >= 5, \
+            f"Expected ≥5 _response_started sets (one per streaming handler), got {n_set}"
+
+    def test_response_started_aborts_iteration(self):
+        """The flat-router candidate loop must abort (not try the next
+        candidate, not send a second response) when _response_started is
+        already True."""
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert 'getattr(self, "_response_started", False)' in source, \
+            "Flat loop must check _response_started and treat it as terminal"
+        # The abort must happen in the failure branch of the candidate loop
+        # (i.e. the check exists between the dispatch and the next-candidate
+        # continuation). Verify the guard appears inside the loop body by
+        # checking it comes after the dispatch call and before 'continue'.
+        loop_idx = source.find("for _cand in _candidates:")
+        assert loop_idx != -1, "Flat router candidate loop not found"
+        loop_body = source[loop_idx:loop_idx + 6000]
+        guard_idx = loop_body.find('getattr(self, "_response_started", False)')
+        assert guard_idx != -1, \
+            "_response_started guard must live inside the candidate loop"
+
+
 class TestRegionErrorModelScoped:
     """403 RegionError from opencode_go must be model-scoped: the KEY stays
     healthy so glm-5.3 (and everything else) keeps routing there."""

@@ -6705,7 +6705,12 @@ class Handler(BaseHTTPRequestHandler):
             #   IMPL-SPEC-kalman-dispatch-gate.md (v2) + src/dispatch_gate.py.
             self.close_connection = True
             from urllib.parse import urlparse, parse_qs
-            from datetime import datetime, timezone
+            # NOTE: do NOT `from datetime import datetime, timezone` here.
+            # A local import anywhere in do_GET makes `datetime` a local name
+            # for the WHOLE method scope, so branches that use it without
+            # binding it first (e.g. /spend at datetime.now(timezone.utc))
+            # raise UnboundLocalError → HTTP 500. The module-level import
+            # (top of file) already provides datetime/timezone.
             try:
                 qs = parse_qs(urlparse(self.path).query)
                 estimated_tokens = int(qs.get("estimated_tokens", ["0"])[0])

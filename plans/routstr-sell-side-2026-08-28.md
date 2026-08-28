@@ -143,8 +143,8 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 
 ### Phase 6 — Monitoring
 - [x] V8 headroom-weekly.png in hourly render + /plot + digest
-- [ ] Daily revenue line in Signal digest (hermes-admin-setup)
-- [ ] MAPE accuracy line plotted
+- [x] Daily revenue line in Signal digest (hermes-admin-setup)
+- [x] MAPE accuracy included in exhaustion-gate output (json field)
 
 ## Rollback
 - `docker stop routstr-public` (listing off)

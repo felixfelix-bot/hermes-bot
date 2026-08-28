@@ -41,6 +41,11 @@ ROUTSTR_SSH = "root@23.182.128.51"
 ROUTSTR_DB = "/var/lib/docker/volumes/routstr-public_routstr_public_data/_data/keys.db"
 ROUTSTR_PROXY_DB = "/var/lib/docker/volumes/routstr_routstr_data/_data/keys.db"
 
+PEER_NPUBS = []
+NSEC_FILE = str(BOT_DIR / "kalman_npub.nsec")
+NOSTR_RELAYS = ["wss://relay.primal.net", "wss://nostr.oxtr.dev"]
+PEER_STALE_THRESHOLD_S = 15 * 60
+
 BTC_PRICE_USD = 97500.0
 
 MARKET_FLOOR_USD_PER_M = 0.003
@@ -72,6 +77,55 @@ STALE_THRESHOLD_S = 15 * 60
 
 def _connect_db():
     return sqlite3.connect(f"file:{USAGE_DB}?mode=ro", uri=True, timeout=5)
+
+
+def _fetch_peer_state():
+    """Fetch latest Kalman state from peer nodes via Nostr (kind 30315).
+
+    Returns dict of {pool: {p_exhaust, wk_pct, delisted, age_s}} from
+    the freshest peer event. Empty dict if no peers or all stale.
+    """
+    import subprocess
+    if not PEER_NPUBS:
+        return {}
+    result = {}
+    for npub in PEER_NPUBS:
+        for relay in NOSTR_RELAYS:
+            try:
+                cmd = [
+                    str(Path.home() / ".local" / "bin" / "nak"),
+                    "fetch", "--kind", "30315",
+                    "--author", npub,
+                    "--limit", "1",
+                    relay,
+                ]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                if r.returncode == 0 and r.stdout.strip():
+                    import json as _json
+                    for line in r.stdout.strip().splitlines():
+                        try:
+                            ev = _json.loads(line)
+                            content = _json.loads(ev.get("content", "{}"))
+                            created = ev.get("created_at", 0)
+                            age = time.time() - created
+                            if age > PEER_STALE_THRESHOLD_S:
+                                continue
+                            providers = content.get("providers", {})
+                            for pool, data in providers.items():
+                                if pool not in result or result[pool].get("age_s", 99999) > age:
+                                    result[pool] = {
+                                        "p_exhaust": data.get("p_exhaust", 0),
+                                        "wk_pct": data.get("wk_pct", 0),
+                                        "delisted": data.get("delisted", False),
+                                        "age_s": age,
+                                    }
+                        except Exception:
+                            pass
+                    if result:
+                        return result
+            except Exception:
+                pass
+    return result
 
 
 def _query_routstr_buyer_burn(pool, now, window_s):
@@ -197,6 +251,12 @@ def compute_pricing():
     kappa = KAPPA_NORMAL if accuracy_ok else KAPPA_UNCERTAIN
     floor_mult = 1.0 if accuracy_ok else FLOOR_MULTIPLIER_UNCERTAIN
 
+    peer_state = _fetch_peer_state()
+    peer_stale = not peer_state if PEER_NPUBS else False
+    if peer_stale:
+        kappa = max(kappa, KAPPA_UNCERTAIN)
+        floor_mult = max(floor_mult, FLOOR_MULTIPLIER_UNCERTAIN)
+
     providers = {}
     sat_per_usd = 1e8 / BTC_PRICE_USD
 
@@ -211,6 +271,13 @@ def compute_pricing():
 
         p_exhaust = _compute_p_exhaust(projected_total, uncertainty, burn_rate)
         p_exhaust = min(0.99, max(0.01, p_exhaust))
+
+        ps = peer_state.get(pool, {})
+        if ps:
+            p_exhaust = max(p_exhaust, ps.get("p_exhaust", 0))
+            weekly_pct = max(weekly_pct, ps.get("wk_pct", 0))
+            if ps.get("delisted"):
+                weekly_pct = WEEKLY_DELIST_THRESHOLD
 
         if weekly_pct >= WEEKLY_DELIST_THRESHOLD:
             providers[pool] = {

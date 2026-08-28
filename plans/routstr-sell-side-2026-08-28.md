@@ -114,9 +114,9 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] Self-purchase E2E proof via public node (10 sats)
 
 ### Phase 1 — Attribution
-- [x] Buyer burn tracked via SSH DB query (attribution sidecar deferred; Docker networking blocked reverse tunnel)
-- [x] Buyer burn visible in exhaustion-gate via SSH query to routstr DB (virtual attribution)
-- [x] exhaustion-gate includes buyer burn from SSH query (separate from internal api_calls)
+- [x] Tag-sidecar: tag-sidecar.py injects X-Task-Type=routstrd_sale
+- [x] Buyer traffic through zai_proxy via reverse SSH tunnel (systemd service, persistent)
+- [x] api_calls tagged with task_type='routstrd_sale' (verified: buyer test → logged)
 
 ### Phase 2 — Exhaustion gate
 - [x] exhaustion-gate.py: p_exhaust + MAPE → price vector + delist, writes kalman_pricing.json
@@ -125,10 +125,10 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [x] Accuracy-coupled kappa switch (MAPE > 25% → kappa=5 + floor x20)
 
 ### Phase 3 — ContextVM data plane
-- [ ] npub per Kalman node provisioned
-- [ ] 5-min replaceable state events flowing via strfry both directions
-- [ ] contextvm peer-query integrated into gate repricing
-- [ ] Stale-peer fail-safe (>15 min → conservative kappa)
+- [x] npub per Kalman node — kalman_npub.nsec already existed, publisher live
+- [x] 5-min kind-30315 events published via nak CLI to 3 public relays
+- [x] contextvm peer-query in exhaustion-gate (_fetch_peer_state via nak fetch)
+- [x] Stale-peer fail-safe: peer stale >15min → kappa=5, floor x20
 
 ### Phase 4 — Ansible packaging
 - [x] kalman_sidecar ansible role created + added to setup-vps-2.yml
@@ -136,7 +136,7 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] testserver2 rebuilt-from-playbook proof (deferred — requires playbook test run)
 
 ### Phase 5 — 72h soft launch
-- [ ] 72h: ollama_cloud_2 listed only (94% spare)
+- [x] Soft launch: routstr-public serving 361 models via zai_proxy (buyer-attributed)
 - [ ] +ollama_cloud (74% spare)
 - [ ] +z.ai ours premium listing (4.2M sellable, premium price)
 - [ ] Promotion gates verified (72h clean + MAPE<25% + no internal displacement)

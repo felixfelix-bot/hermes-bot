@@ -6941,34 +6941,77 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
         elif self.path == "/v1/models" or self.path == "/models":
-            # Model listing — return stub so Hermes doesn't 404 → fall back to PPQ
-            # Includes sats_pricing fields so the Routstr SDK accepts these
-            # models into its price-ranked provider list (the SDK silently
-            # drops models without sats_pricing). Values are near-zero because
-            # zai_proxy is free locally (flat-rate subscriptions upstream).
+            # Model listing with Kalman-driven dynamic sats_pricing.
+            # Reads ~/.hermes/bot/kalman_pricing.json (written by exhaustion-gate.py
+            # every 5 min). Price per model is determined by its backing pool's
+            # effective_rate_per_m. Delisted pools → model omitted from listing.
             self.close_connection = True
             now = int(time.time())
-            _sp = {
+
+            # Load dynamic pricing state
+            _kp = {}
+            try:
+                _kp_path = Path.home() / ".hermes" / "bot" / "kalman_pricing.json"
+                if _kp_path.exists():
+                    _kp = json.loads(_kp_path.read_text()).get("providers", {})
+            except Exception:
+                pass
+
+            # Model → backing pool mapping (which quota pool serves this model)
+            _MODEL_POOL = {
+                "glm-5.3":          "ours",
+                "glm-5.2":           "ollama_cloud",
+                "glm-4.5-flash":    "ollama_cloud",
+                "glm-4.5-air":      "ollama_cloud",
+                "kimi-k2.7-code":   "ollama_cloud",
+                "kimi-k3:cloud":    "ollama_cloud",
+                "kimi-k3":          "telnyx",
+                "minimax-m3:cloud": "ollama_cloud",
+            }
+
+            # Default near-zero pricing (internal use — our own agents pay ~$0)
+            _DEFAULT_SP = {
                 "prompt": 0.000001, "completion": 0.000001, "request": 1,
                 "image": 0, "web_search": 0, "internal_reasoning": 0,
                 "max_completion_cost": 2, "max_prompt_cost": 2, "max_cost": 3,
             }
+
             def _m(mid, owner, ctx=1048576):
+                pool = _MODEL_POOL.get(mid, "ollama_cloud")
+                kp_entry = _kp.get(pool, {})
+                if kp_entry.get("delisted"):
+                    return None
+                sat_per_m = kp_entry.get("sat_per_m")
+                if sat_per_m and sat_per_m > 0:
+                    sat_per_token = sat_per_m / 1e6
+                    sp = {
+                        "prompt": sat_per_token,
+                        "completion": sat_per_token,
+                        "request": 1, "image": 0, "web_search": 0,
+                        "internal_reasoning": 0,
+                        "max_completion_cost": int(sat_per_m * 2),
+                        "max_prompt_cost": int(sat_per_m),
+                        "max_cost": int(sat_per_m * 3),
+                    }
+                else:
+                    sp = dict(_DEFAULT_SP)
                 return {"id": mid, "object": "model", "created": now,
                         "owned_by": owner, "context_window": ctx,
-                        "sats_pricing": dict(_sp)}
+                        "sats_pricing": sp}
+
+            _all_models = [
+                _m("glm-5.3", "zai"),
+                _m("glm-5.2", "zai"),
+                _m("glm-4.5-flash", "zai"),
+                _m("glm-4.5-air", "zai"),
+                _m("kimi-k2.7-code", "ollama", 262144),
+                _m("kimi-k3:cloud", "ollama", 262144),
+                _m("kimi-k3", "telnyx", 262144),
+                _m("minimax-m3:cloud", "ollama", 1048576),
+            ]
             models_data = {
                 "object": "list",
-                "data": [
-                    _m("glm-5.3", "zai"),
-                    _m("glm-5.2", "zai"),
-                    _m("glm-4.5-flash", "zai"),
-                    _m("glm-4.5-air", "zai"),
-                    _m("kimi-k2.7-code", "ollama", 262144),
-                    _m("kimi-k3:cloud", "ollama", 262144),
-                    _m("kimi-k3", "telnyx", 262144),
-                    _m("minimax-m3:cloud", "ollama", 1048576),
-                ]
+                "data": [m for m in _all_models if m is not None],
             }
             payload = json.dumps(models_data).encode()
             self.send_response(200)

@@ -158,3 +158,26 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - z.ai ours sold premium-only (~$0.03/M, 10x floor) — tiny pool, price reflects scarcity
 - opencode_go never for sale (internal flat sub)
 - Node A public exposure: plain listen on 0.0.0.0:8008, no nginx auth
+
+## Phase 7 — Closing the loop (2026-08-28)
+
+### What was fixed
+- [x] zai_proxy /v1/models now reads kalman_pricing.json dynamically
+  - Per-model sats_pricing driven by backing pool's effective_rate_per_m
+  - Delisted pools (≥60% weekly) → models removed from listing
+  - Verified: glm-5.3 delisted (ours 100%), ollama models at $0.10/M
+  - Prices propagate: zai_proxy → routstr-proxy → routstr-public → buyers
+- [x] Double-counting fixed: removed SSH buyer-burn estimate from
+  exhaustion-gate (buyer traffic now in api_calls via tag-sidecar)
+- [x] Revenue digest piped to Signal (hermes-admin-setup) via cron
+- [x] E2E verified: routstr-public returns 401 (requires Cashu) — payment
+  enforcement active; zai_proxy serves dynamic prices; tag-sidecar
+  attributes buyer traffic
+
+### Notes
+- Internal burn queries in flat_router/burn_predictor intentionally left
+  unfiltered: total burn (incl buyer) is correct for quota-exhaustion
+  safety; buyer-attributed reporting is separate concern
+- PEER_NPUBS still empty until testserver2 runs its own kalman sidecar
+- z.ai weekly Kalman still over-predicts (258%); harmless since ours is
+  delisted; needs decay/clamp fix eventually

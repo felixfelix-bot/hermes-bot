@@ -174,9 +174,7 @@ def _weekly_used_pct(db, pool, now):
         "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
         (pool, now - 7 * 86400)
     ).fetchone()[0]
-    buyer_tok, _, _ = _query_routstr_buyer_burn(pool, now, 7 * 86400)
-    total = tok + buyer_tok
-    return min(1.0, total / cap) if cap > 0 else 0.0
+    return min(1.0, tok / cap) if cap > 0 else 0.0
 
 
 def _session_used_pct(db, pool, now):
@@ -187,9 +185,7 @@ def _session_used_pct(db, pool, now):
         "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
         (pool, now - 5 * 3600)
     ).fetchone()[0]
-    buyer_tok, _, _ = _query_routstr_buyer_burn(pool, now, 5 * 3600)
-    total = tok + buyer_tok
-    return min(1.0, total / cap) if cap > 0 else 0.0
+    return min(1.0, tok / cap) if cap > 0 else 0.0
 
 
 def _compute_p_exhaust(projected_total_pct, uncertainty, burn_rate):

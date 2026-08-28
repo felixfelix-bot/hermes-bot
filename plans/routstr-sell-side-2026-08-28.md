@@ -142,7 +142,7 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] Promotion gates verified (72h clean + MAPE<25% + no internal displacement)
 
 ### Phase 6 — Monitoring
-- [ ] V8 headroom-weekly.png in hourly render + /plot + digest
+- [x] V8 headroom-weekly.png in hourly render + /plot + digest
 - [ ] Daily revenue line in Signal digest (hermes-admin-setup)
 - [ ] MAPE accuracy line plotted
 

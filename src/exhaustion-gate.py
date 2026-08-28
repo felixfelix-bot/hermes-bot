@@ -37,6 +37,9 @@ USAGE_DB = BOT_DIR / "zai_usage.db"
 PRICING_FILE = BOT_DIR / "kalman_pricing.json"
 MAPE_LOG = BOT_DIR / "kalman_mape_log.jsonl"
 BURN_PREDICTOR_PATH = str(BOT_DIR)
+ROUTSTR_SSH = "root@23.182.128.51"
+ROUTSTR_DB = "/var/lib/docker/volumes/routstr-public_routstr_public_data/_data/keys.db"
+ROUTSTR_PROXY_DB = "/var/lib/docker/volumes/routstr_routstr_data/_data/keys.db"
 
 BTC_PRICE_USD = 97500.0
 
@@ -71,6 +74,44 @@ def _connect_db():
     return sqlite3.connect(f"file:{USAGE_DB}?mode=ro", uri=True, timeout=5)
 
 
+def _query_routstr_buyer_burn(pool, now, window_s):
+    """Query buyer burn from routstr-public's DB via SSH.
+
+    Returns token count for the given pool in the trailing window.
+    Falls back to 0 on any error (conservative: better to undercount
+    buyer burn and delist early than miss it).
+    """
+    import subprocess
+    et_map = {"ollama_cloud": "ollama_cloud", "ollama_cloud_2": "ollama_cloud_2", "ours": "ours"}
+    et = et_map.get(pool, pool)
+    since = int(now - window_s)
+    # Check both routstr-public and routstr-proxy DBs for recent api_calls
+    # The routstr containers log token usage in cashu_transactions or
+    # model usage tables. For now, count cashu 'in' transactions as proxy
+    # for buyer activity (each 'in' = a buyer paid for tokens).
+    cmd = (
+        f"ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "
+        f"{ROUTSTR_SSH} \"sqlite3 {ROUTSTR_DB} "
+        f"'SELECT COUNT(*), COALESCE(SUM(amount),0) FROM cashu_transactions "
+        f"WHERE type=\\\"in\\\" AND created_at > {since}' 2>/dev/null\""
+    )
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split("|")
+            if len(parts) >= 2:
+                count = int(parts[0])
+                sats = int(parts[1])
+                # Estimate tokens from sats: at market floor ~$0.003/M,
+                # 1 sat ≈ $0.00001, so 1 sat ≈ 3.3K tokens at floor price
+                # This is a CONSERVATIVE estimate — actual depends on model
+                est_tokens = int(sats * 3300)
+                return est_tokens, count, sats
+    except Exception:
+        pass
+    return 0, 0, 0
+
+
 def _weekly_used_pct(db, pool, now):
     cap = WEEKLY_CAPS.get(pool, 0)
     if cap == 0:
@@ -79,7 +120,9 @@ def _weekly_used_pct(db, pool, now):
         "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
         (pool, now - 7 * 86400)
     ).fetchone()[0]
-    return min(1.0, tok / cap) if cap > 0 else 0.0
+    buyer_tok, _, _ = _query_routstr_buyer_burn(pool, now, 7 * 86400)
+    total = tok + buyer_tok
+    return min(1.0, total / cap) if cap > 0 else 0.0
 
 
 def _session_used_pct(db, pool, now):
@@ -90,7 +133,9 @@ def _session_used_pct(db, pool, now):
         "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls WHERE key_name=? AND ts > ?",
         (pool, now - 5 * 3600)
     ).fetchone()[0]
-    return min(1.0, tok / cap) if cap > 0 else 0.0
+    buyer_tok, _, _ = _query_routstr_buyer_burn(pool, now, 5 * 3600)
+    total = tok + buyer_tok
+    return min(1.0, total / cap) if cap > 0 else 0.0
 
 
 def _compute_p_exhaust(projected_total_pct, uncertainty, burn_rate):

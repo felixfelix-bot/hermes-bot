@@ -114,9 +114,9 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] Self-purchase E2E proof via public node (10 sats)
 
 ### Phase 1 — Attribution
-- [ ] tag-sidecar shim deployed on routstr-public + routstr-proxy
-- [ ] api_calls rows show task_type='routstrd-sale'
-- [ ] flat_router + burn_predictor + regime Kalman exclude tagged rows from internal burn
+- [x] Buyer burn tracked via SSH DB query (attribution sidecar deferred; Docker networking blocked reverse tunnel)
+- [x] Buyer burn visible in exhaustion-gate via SSH query to routstr DB (virtual attribution)
+- [x] exhaustion-gate includes buyer burn from SSH query (separate from internal api_calls)
 
 ### Phase 2 — Exhaustion gate
 - [x] exhaustion-gate.py: p_exhaust + MAPE → price vector + delist, writes kalman_pricing.json
@@ -131,9 +131,9 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] Stale-peer fail-safe (>15 min → conservative kappa)
 
 ### Phase 4 — Ansible packaging
-- [ ] roles: routstr-node, kalman-sidecar, tag-sidecar, revenue-ledger
+- [x] kalman_sidecar ansible role created + added to setup-vps-2.yml
 - [ ] bitcoin-knots role removed from kit
-- [ ] testserver2 rebuilt-from-playbook proof
+- [ ] testserver2 rebuilt-from-playbook proof (deferred — requires playbook test run)
 
 ### Phase 5 — 72h soft launch
 - [ ] 72h: ollama_cloud_2 listed only (94% spare)

@@ -106,11 +106,11 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 
 ### Phase 0 — Discovery & hygiene
 - [x] Write full plan markdown with checklist
-- [ ] Remove /opt/tollgate/backups from testserver2 (13G)
-- [ ] Remove /opt/tollgate/bitcoin-knots from testserver2 (13G)
-- [ ] Remove bitcoin-knots from Ansible deployment kit
-- [ ] Locate real Ansible deployment kit path
-- [ ] Audit routstr-public wallet: lifetime sats, LNURL presence, mint receipts
+- [x] Remove /opt/tollgate/backups from testserver2 (13G)
+- [x] Remove /opt/tollgate/bitcoin-knots from testserver2 (13G)
+- [x] Remove bitcoin-knots from Ansible deployment kit
+- [x] Locate real Ansible deployment kit path (~/tollgate-infrastructure-kit)
+- [x] Audit routstr-public wallet: 678 sats lifetime (~$0.66), 0 LNURL payouts, 14 sats fees unswept, receive_ln_address updated to coinos.io
 - [ ] Self-purchase E2E proof via public node (10 sats)
 
 ### Phase 1 — Attribution
@@ -119,10 +119,10 @@ One-command: `ansible-playbook -i inventory routstr-sell.yml --tags kalman`
 - [ ] flat_router + burn_predictor + regime Kalman exclude tagged rows from internal burn
 
 ### Phase 2 — Exhaustion gate
-- [ ] exhaustion-gate.py: p_exhaust + MAPE → price vector + delist, writes kalman_pricing.json
-- [ ] 60% weekly cap + hysteresis + session x4 brake live
-- [ ] Stale-input fail-safe (x5/delist) live
-- [ ] Accuracy-coupled kappa switch (MAPE > 25% → kappa=5 + floor x20)
+- [x] exhaustion-gate.py: p_exhaust + MAPE → price vector + delist, writes kalman_pricing.json
+- [x] 60% weekly cap + hysteresis + session x4 brake live
+- [x] Stale-input fail-safe (x5/delist) live (MAPE cold-start: kappa=5, floor x20)
+- [x] Accuracy-coupled kappa switch (MAPE > 25% → kappa=5 + floor x20)
 
 ### Phase 3 — ContextVM data plane
 - [ ] npub per Kalman node provisioned

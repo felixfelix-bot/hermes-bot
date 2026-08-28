@@ -64,6 +64,7 @@ DEFAULT_PLOTS=(
     "$VIZ_DIR/price-heatmap.png"
     "$VIZ_DIR/quota-heatmap.png"
     "$VIZ_DIR/surface-ollama_cloud.png"
+    "$VIZ_DIR/headroom-weekly.png"
 )
 DIGEST_PLOTS=(
     "$VIZ_DIR/price-envelope.png"

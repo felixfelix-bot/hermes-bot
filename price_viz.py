@@ -540,6 +540,64 @@ def render_ascii() -> str:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def render_headroom_weekly(outdir: Path) -> Path:
+    """V8: Total remaining quota headroom over last 7 days (stacked area)."""
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    now = time.time()
+    n_hours = 168
+    pools = [
+        ("ollama_cloud",   3_500_000_000, "#2ca02c"),
+        ("ollama_cloud_2", 3_500_000_000, "#90c3c4"),
+        ("ours",           14_000_000,    "#1f77b4"),
+    ]
+    hour_bins = [now - (n_hours - i) * 3600 for i in range(n_hours)]
+    series = {}
+    for pool_name, cap, _ in pools:
+        vals = []
+        for h in range(n_hours):
+            t_end = now - (n_hours - h - 1) * 3600
+            used = db.execute(
+                "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls "
+                "WHERE key_name=? AND ts BETWEEN ? AND ?",
+                (pool_name, t_end - 7*86400, t_end)
+            ).fetchone()[0]
+            vals.append(max(0, (cap - used) / 1e9))
+        series[pool_name] = vals
+    db.close()
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    x = range(n_hours)
+    bottom = np.zeros(n_hours)
+    colors = []
+    labels = []
+    for pool_name, _, color in pools:
+        vals = series[pool_name]
+        ax.fill_between(x, bottom, bottom + np.array(vals), alpha=0.6, color=color, label=pool_name)
+        ax.plot(x, bottom + np.array(vals), color=color, linewidth=0.8)
+        bottom = bottom + np.array(vals)
+
+    ax.axhline(y=sum(bottom[-1:]), color="white", linestyle="--", alpha=0.3)
+    total_vals = sum(np.array(series[p[0]]) for p in pools)
+    ax.plot(x, total_vals, color="white", linewidth=2, alpha=0.7, label="Total")
+
+    xticks = range(0, n_hours, 24)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([time.strftime("%m-%d", time.gmtime(hour_bins[i])) for i in xticks], fontsize=8)
+    ax.set_xlabel("Date (UTC, last 7 days)")
+    ax.set_ylabel("Remaining Quota (B tokens)")
+    ax.set_title("Weekly Quota Headroom — Remaining vs Time")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.2)
+    ax.set_xlim(0, n_hours)
+    ax.set_ylim(bottom=0)
+
+    outpath = outdir / "headroom-weekly.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return outpath
+
+
 def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
     """Render all visualizations. Returns list of output file paths."""
     if outdir is None:
@@ -620,6 +678,14 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
                     log_path.write_text("\n".join(lines[-500:]) + "\n")
     except Exception:
         pass
+
+    # V8: headroom-weekly.png — total remaining quota over last 7d
+    try:
+        p = render_headroom_weekly(outdir)
+        if p:
+            rendered.append(p)
+    except Exception as e:
+        print(f"V8 headroom: {e}", file=sys.stderr)
 
     return rendered
 

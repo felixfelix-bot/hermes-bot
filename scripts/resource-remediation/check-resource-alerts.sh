@@ -27,6 +27,13 @@
 # Output goes to the cron's script field → injected into agent prompt.
 
 set -uo pipefail
+
+# Resource throttle (Felix 2026-08-29): never compete with urgent work.
+# nice -n 19 = LOWEST CPU priority (positive = nicer). Inherited by all children.
+# ionice -c3 = idle I/O class: disk access only when nothing else wants it.
+renice -n 19 -p $$ >/dev/null 2>&1
+ionice -c3 -p $$ >/dev/null 2>&1
+
 STATE_FILE="/tmp/unified-system-alert-state.json"
 
 if [ ! -f "$STATE_FILE" ]; then

@@ -98,13 +98,16 @@ PROVIDERS: dict[str, dict] = {
     "routstr": {
         "url": "http://127.0.0.1:8009/v1/models",
         "key_env": None,
-        "catalog_complete": True,
+        # F4: marketplace aggregator — listing under-reports what it proxies
+        # (routstrd's staticProviders include our zai_proxy). Guard must
+        # fail-open for these; phantom reports stay informational.
+        "catalog_complete": False,
         "type": "ecash",
     },
     "routstrd": {
         "url": "http://127.0.0.1:8008/v1/models",
         "key_env": None,
-        "catalog_complete": True,
+        "catalog_complete": False,   # F4: same as routstr
         "type": "ecash",
     },
 }
@@ -122,12 +125,14 @@ _TAG_TRANS = {
     "deepseek-v4-pro:0813":   "deepseek/deepseek-v4-pro",
 }
 # Canonical aliases (mirror flat_router.MODEL_ALIASES semantics)
-_CANON_ALIASES = {
-    "gemma4:31b": "deepseek/gemma-4-31b",     # ollama tag → canonical gemma
-    "gemma-4-31b": "deepseek/gemma-4-31b",
-    "kimi-k2.6": "kimi-k3",                    # K2.6 → closest canonical (report-only)
-    "glm-5.3-flash": "glm-5.3-flash",          # already canonical
-}
+# NOTE: gemma forms intentionally NOT aliased across separators — ollama's
+# native tag IS "gemma4:31b" (verbatim-served), neuralwatt's is "gemma-4-31b"
+# (reverse-mapped via zai_proxy name map). Aliasing one to the other created
+# a false phantom on ollama (2026-08-30 rerun).
+# NOTE: kimi-k2.6 NOT aliased — ollama serves it verbatim (2026-08-30
+# catalog) and PROVIDER_MODELS routes it. Aliasing it to kimi-k3 created a
+# false phantom and would violate the never-substitute principle.
+_CANON_ALIASES = {}
 
 
 def _load_env_keys() -> dict[str, str]:
@@ -144,23 +149,64 @@ def _load_env_keys() -> dict[str, str]:
     return keys
 
 
+def _tag_trans_variants(mid: str) -> str | None:
+    """Reverse tag translation for BOTH separator forms (colon + dash).
+
+    ollama uses  deepseek-v4-flash:0731  (colon)
+    routstrd uses deepseek-v4-flash-0731 (dash)
+    """
+    base, sep, tag = mid.partition(":")
+    if not sep:
+        # try dash-form: split on LAST dash
+        base, _, tag = mid.rpartition("-")
+        if not _looks_like_date_tag(tag):
+            return None
+    return _TAG_TRANS.get(mid)
+
+
+def _looks_like_date_tag(tag: str) -> bool:
+    """0731 / 0813 style suffix → True."""
+    return bool(re.fullmatch(r"\d{4}", tag or ""))
+
+
 def to_canonical(raw_id: str, provider: str) -> str:
-    """Map an upstream model ID to the canonical short ID used in registries."""
+    """Map an upstream model ID to the canonical short ID used in registries.
+
+    Order of attempts (F1/F2 fixes — correctness before flagging):
+      1. exact tag translation (colon + dash forms)
+      2. exact reverse provider-name map (zai_proxy._PROVIDER_MODEL_NAMES)
+      3. CASE-INSENSITIVE reverse-map match (telnyx serves Kimi-K3 vs
+         canonical kimi-k3)
+      4. org-prefix strip + canonical-alias check
+      5. finally: lowercase passthrough if it matches an alias shape
+    """
     mid = raw_id.strip()
-    # Reverse tag translations (ollama tagged deepseek forms)
+    # 1. exact tag translation
     if mid in _TAG_TRANS:
         return _TAG_TRANS[mid]
-    # Reverse provider-name maps (import from zai_proxy if importable)
+    # Dash-form equivalence: 'deepseek-v4-flash-0731' → colon form → trans
+    if "-" in mid and mid.rsplit("-", 1)[-1].isdigit() and len(mid.rsplit("-", 1)[-1]) == 4:
+        base = mid.rsplit("-", 1)[0]
+        colon_form = base + ":" + mid.rsplit("-", 1)[1]
+        if colon_form_in := _TAG_TRANS.get(colon_form):
+            return colon_form_in
+    # 2./3. reverse provider-name map — exact then case-insensitive
     try:
         sys.path.insert(0, str(BOT))
         import zai_proxy as _zp
         pmap = _zp._PROVIDER_MODEL_NAMES.get(provider, {})
+        # exact
         for canon, prov_id in pmap.items():
             if prov_id == mid:
                 return canon
+        # case-insensitive
+        low = mid.lower()
+        for canon, prov_id in pmap.items():
+            if prov_id.lower() == low:
+                return canon
     except Exception:
         pass
-    # Strip org prefixes
+    # 4. org-prefix strip + alias
     changed = True
     while changed:
         changed = False
@@ -168,35 +214,93 @@ def to_canonical(raw_id: str, provider: str) -> str:
             if mid.startswith(pref):
                 mid = mid[len(pref):]
                 changed = True
+    if mid in _CANON_ALIASES:
+        return _CANON_ALIASES[mid]
+    # Case-insensitive alias / tag fallback (e.g. 'Kimi-K3' → 'kimi-k3')
+    low = mid.lower()
+    for alias_src, canon in _CANON_ALIASES.items():
+        if low == alias_src.lower():
+            return canon
+    if low in {c.lower() for c in _TAG_TRANS}:
+        return _TAG_TRANS[[c for c in _TAG_TRANS if c.lower() == low][0]]
     return mid
 
 
+# F5: non-chat families excluded from missing-rung reporting (they are real
+# catalog entries but can never be chat-completion candidates).
+_NOISE_PATTERNS = re.compile(
+    r"^(BAAI/|Bria|Audio|audio|openai/whisper|whisper|.*embedding.*|.*-tts$|"
+    r".*-tts-.*|.*embed$|.*encoder.*|.*reranker.*|.*guard.*|phash.*|"
+    r".*-vision-exp$|.*stable-.*|.*diffusion.*|.*sdxl.*|.*flux.*)",
+    re.IGNORECASE,
+)
+# Context-length noise: vendor IDs whose canonical form is not routable chat
+_NOISE_EXACT = {"o1", "o1-pro", "o3", "o3-pro", "o3-mini", "o3-mini-high",
+                "o4-mini", "o4-mini-high"}
+
+
+def _is_chat_model(mid: str) -> bool:
+    if mid in _NOISE_EXACT:
+        return False
+    return not _NOISE_PATTERNS.match(mid)
+
+
 def probe(url: str, key: str | None, provider: str) -> dict:
-    """Fetch a provider catalog. Returns FR-0-style probe record."""
+    """Fetch a provider catalog. Returns FR-0-style probe record.
+
+    F6: retries once on transient 403/5xx (baseline opencode_go probe hit a
+    spurious 403 that a manual retry cleared).
+    """
     t0 = time.time()
     rec: dict = {"url": url, "provider": provider}
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode()
-            rec["http_status"] = resp.status
-        data = json.loads(body)
-        ids = [m.get("id", "?") for m in data.get("data", [])]
-        rec["models"] = ids
-        # Pricing enrichment (best-effort: OpenAI-style pricing.prompt)
-        prices = {}
-        for m in data.get("data", []):
-            pr = m.get("pricing") or {}
-            if isinstance(pr, dict) and isinstance(pr.get("prompt"), (int, float)):
-                prices[m.get("id")] = pr["prompt"]
-        if prices:
-            rec["pricing"] = prices
-    except Exception as e:
-        rec["http_status"] = None
-        rec["error"] = str(e)
-        rec["models"] = []
+    statuses = []
+    data = None
+    err = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode()
+                statuses.append(resp.status)
+            data = json.loads(body)
+            err = None
+            break
+        except Exception as e:
+            err = str(e)
+            statuses.append(None)
+            if attempt == 0:
+                time.sleep(2)
+
     rec["elapsed_s"] = round(time.time() - t0, 2)
+    rec["attempts"] = statuses
+    if data is None:
+        rec["http_status"] = None
+        rec["error"] = err
+        rec["models"] = []
+        return rec
+
+    rec["http_status"] = statuses[-1]
+    entries = data.get("data", data if isinstance(data, list) else [])
+    ids = [m.get("id", "?") for m in entries]
+    rec["models"] = ids
+    # Pricing + context enrichment (best-effort, per model)
+    prices = {}
+    ctx = {}
+    for m in entries:
+        mid = m.get("id", "?")
+        pr = m.get("pricing") or {}
+        if isinstance(pr, dict) and isinstance(pr.get("prompt"), (int, float)):
+            prices[mid] = pr["prompt"]
+        # context fields vary: context_length / context_window / top_provider.context_length
+        cval = (m.get("context_length") or m.get("context_window")
+                or (m.get("top_provider") or {}).get("context_length"))
+        if isinstance(cval, (int, float)) and cval > 0:
+            ctx[to_canonical(mid, provider)] = int(cval)
+    if prices:
+        rec["pricing"] = prices
+    if ctx:
+        rec["context_lengths_canonical"] = ctx
     return rec
 
 
@@ -221,13 +325,16 @@ def main() -> int:
 
         if rec.get("http_status") == 200 and rec.get("models"):
             canonical = sorted({to_canonical(i, name) for i in rec["models"]})
+            chat_canonical = sorted(c for c in canonical if _is_chat_model(c))
             live[name] = {
                 "probe_status": "ok",
                 "raw_count": len(rec["models"]),
                 "canonical": canonical,
+                "chat_canonical": chat_canonical,
                 "catalog_complete": cfg["catalog_complete"],
                 "allowlist_extra": cfg.get("allowlist_extra", []),
                 "pricing": rec.get("pricing", {}),
+                "context_lengths": rec.get("context_lengths_canonical", {}),
             }
         else:
             live[name] = {
@@ -266,16 +373,32 @@ def main() -> int:
         extra = set(live_entry.get("allowlist_extra", []))
         routed = cfg
         if live_entry.get("catalog_complete"):
-            phantoms = sorted(routed - raw_set - extra)
+            phantoms = []
+            for m in routed:
+                if m in raw_set or m in extra:
+                    continue
+                # Translated-model exemption: if the provider's name map
+                # resolves m to a native ID that IS in the live catalog
+                # (e.g. telnyx kimi-k2.7-code → moonshotai/Kimi-K2.5),
+                # the model is servable — not a phantom.
+                native = name_maps.get(name, {}).get(m)
+                # native may itself be an alias of a raw entry — compare
+                # canonically against the raw set
+                if native and to_canonical(native, name) in raw_set:
+                    continue
+                phantoms.append(m)
             if phantoms:
-                drift["phantoms"][name] = phantoms
-        missing = sorted(raw_set - set(routed))
+                drift["phantoms"][name] = sorted(phantoms)
+        missing = sorted(c for c in (raw_set - set(routed)) if _is_chat_model(c))
         if missing:
             drift["missing_rungs"][name] = missing
-        # Translation gaps: routable models that have no entry in the
-        # provider's name map (only meaningful for providers WITH a map)
+        # Translation gaps (F3): flag a routable model ONLY when the provider's
+        # raw catalog does NOT contain the canonical name verbatim (meaning a
+        # translation is genuinely required) AND no map entry exists. Verbatim
+        # providers (catalog serves canonical names directly) are exempt.
+        raw_models = set(live_entry.get("canonical", []))
         for m in routed:
-            if name in name_maps and m not in name_maps[name]:
+            if name in name_maps and m not in name_maps[name] and m not in raw_models:
                 drift["translation_gaps"].setdefault(name, []).append(m)
         # Context gaps: routable models missing from the context registry
         cgaps = sorted(m for m in routed if m not in ctx_reg and ":"
@@ -283,20 +406,48 @@ def main() -> int:
         if cgaps:
             drift["context_gaps"][name] = cgaps
 
-    # Write live_catalog_state.json (runtime phantom guard input)
+    # Write live_catalog_state.json (runtime phantom guard input).
+    # Translated-servable models (routed canonical → mapped native → present
+    # in raw catalog) are added to allowlist_extra so the runtime guard
+    # passes them (D1 fix: telnyx kimi-k2.7-code → moonshotai/Kimi-K2.5).
     state = {"fetched_at": now, "providers": {}}
     for name, entry in live.items():
         if entry.get("probe_status") == "ok":
+            allowlist = list(entry.get("allowlist_extra", []))
+            if entry.get("catalog_complete"):
+                raw_set = set(entry["canonical"])
+                pmap = name_maps.get(name, {})
+                for m in PROVIDER_MODELS.get(name, set()):
+                    if m in raw_set or m in allowlist:
+                        continue
+                    native = pmap.get(m)
+                    if native and to_canonical(native, name) in raw_set:
+                        allowlist.append(m)
             state["providers"][name] = {
                 "models": entry["canonical"],
                 "fetched_at": now,
                 "catalog_complete": entry.get("catalog_complete", True),
-                "allowlist_extra": entry.get("allowlist_extra", []),
+                "allowlist_extra": sorted(set(allowlist)),
             }
     prev = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     STATE_FILE.write_text(json.dumps(state, indent=2))
     # Keep previous for drift-signature dedup
     PREV_STATE_FILE.write_text(json.dumps(prev, indent=2))
+
+    # G2 groundwork: collect context-length suggestions observed upstream for
+    # models missing from model_context_registry.json
+    ctx_suggestions: dict[str, int] = {}
+    for name, entry in live.items():
+        if entry.get("probe_status") != "ok":
+            continue
+        for model_id, clen in (entry.get("context_lengths") or {}).items():
+            if model_id not in ctx_reg and _is_chat_model(model_id):
+                existing = ctx_suggestions.get(model_id)
+                # prefer larger observed value (provider-specific truncation)
+                ctx_suggestions[model_id] = max(existing or 0, int(clen))
+    if ctx_suggestions:
+        print(f"[catalog-drift] context-suggestions available for: "
+              f"{', '.join(sorted(ctx_suggestions))[:120]}")
 
     # Drift signature: only alert when the ROUTABLE side changed vs previous
     # (i.e. our registries' relationship to upstream changed). Compare
@@ -315,6 +466,8 @@ def main() -> int:
         "is_new_vs_previous": new_drift,
         "probe_summary": {k: v.get("probe_status") for k, v in live.items()},
     }
+    if ctx_suggestions:
+        report["context_suggestions"] = ctx_suggestions
     (outdir / "drift-report.json").write_text(json.dumps(report, indent=2))
 
     # Signal alert — only when drift CHANGED vs previous report

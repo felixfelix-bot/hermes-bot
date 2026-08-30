@@ -121,13 +121,17 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # glm-4.6v: z.ai vision model, served on the coding endpoint but UNLISTED
     # in GET /models (live-verified 2026-08-27). Required by manager
     # auxiliary.vision — without it the flat router 503'd all vision requests.
+    # glm-4.7/glm-5/glm-5-turbo/glm-5.1/glm-5.3-flash: LIVE in z.ai /models
+    # (2026-08-30 catalog-drift baseline) — added as rungs (quota tier, $0).
     "ours": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
-        "glm-4.6v",
+        "glm-4.6v", "glm-4.7", "glm-5", "glm-5-turbo", "glm-5.1",
+        "glm-5.3-flash",
     },
     "friend": {
         "glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5",
-        "glm-4.6v",
+        "glm-4.6v", "glm-4.7", "glm-5", "glm-5-turbo", "glm-5.1",
+        "glm-5.3-flash",
     },
     # Ollama Cloud — included subscription, wide model catalog.
     # Canonical IDs only. glm-5.3 / glm-5.3-flash are LIVE on ollama
@@ -139,13 +143,17 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # deepseek-v4-flash:0731 (real tags).
     "ollama_cloud": {
         "glm-5.2", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
-        "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
+        "gpt-oss:120b", "gpt-oss:20b", "gemma4:31b", "qwen3.5:397b",
+        "glm-5.1", "kimi-k2.6", "minimax-m2.7", "mistral-large-3:675b",
+        "nemotron-3-nano:30b", "nemotron-3-super", "nemotron-3-ultra",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "minimax-m3",
     },
     "ollama_cloud_2": {
         "glm-5.2", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
-        "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
+        "gpt-oss:120b", "gpt-oss:20b", "gemma4:31b", "qwen3.5:397b",
+        "glm-5.1", "kimi-k2.6", "minimax-m2.7", "mistral-large-3:675b",
+        "nemotron-3-nano:30b", "nemotron-3-super", "nemotron-3-ultra",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "minimax-m3",
     },
@@ -160,9 +168,12 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # $1.45/M in, $4.50/M out, context 1048.576K, "Try Now" not
     # request-access). Adds the only paid glm-5.3 rung; was the missing
     # fallback during the 2026-08-30 503 incident.
+    # kimi-k2.7-code: LIVE (2026-08-30) — $0.95/M in, $4.00/M out; cheaper
+    # paid code rung than kimi-k3 ($3.00/$15.00).
     "neuralwatt": {
-        "glm-5.2", "glm-5.3", "kimi-k3", "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro", "deepseek/gemma-4-31b",
+        "glm-5.2", "glm-5.3", "kimi-k3", "kimi-k2.7-code",
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+        "deepseek/gemma-4-31b",
     },
     # DeepInfra — per-token, ~$1.30/M
     # glm-5.3: LIVE (2026-08-30 catalog probe — zai-org/GLM-5.3 present in

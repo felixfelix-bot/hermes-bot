@@ -711,6 +711,7 @@ _PROVIDER_MODEL_NAMES = {
     "neuralwatt": {
         "glm-5.2":                    "glm-5.2",
         "kimi-k3":                    "kimi-k3",
+        "kimi-k2.7-code":             "kimi-k2.7-code",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
         "deepseek/gemma-4-31b":        "gemma-4-31b",

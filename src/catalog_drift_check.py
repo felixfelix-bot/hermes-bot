@@ -42,6 +42,10 @@ BOT = HOME / ".hermes" / "bot"
 EVIDENCE = BOT / "evidence" / "catalog-drift"
 STATE_FILE = BOT / "live_catalog_state.json"
 PREV_STATE_FILE = BOT / "live_catalog_prev_state.json"
+# INTAKE-1: quarantine stage store (repo root, git-tracked). New upstream
+# models land here as STAGED (or REJECTED for non-chat) — NOT routable, NOT
+# advertised. Promotion is gated + human-batched (INTAKE-3).
+INTAKE_FILE = BOT / "model_intake.json"
 
 # ── Provider probe definitions ───────────────────────────────────────────────
 # key_env: manager/.env variable name  (needed for subscription-scoped truth)
@@ -245,6 +249,66 @@ def _is_chat_model(mid: str) -> bool:
     return not _NOISE_PATTERNS.match(mid)
 
 
+# ── INTAKE-1: quarantine stage store ────────────────────────────────────────
+# New upstream models (live probe, unknown to model_context_registry.json AND
+# flat_router PROVIDER_MODELS) are written to model_intake.json as STAGED.
+# Non-chat modality -> status=rejected immediately. STAGED = quarantine: NOT
+# in PROVIDER_MODELS, NOT in /v1/models, requests keep loud-503. Idempotent
+# reruns update last_seen only.
+def _load_intake() -> dict:
+    if INTAKE_FILE.exists():
+        try:
+            return json.loads(INTAKE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def stage_new_models(live: dict, provider_models: dict, ctx_reg: dict,
+                     now_iso: str | None = None) -> dict:
+    """Stage newly-discovered upstream models into the quarantine store.
+
+    A model is "new" iff it appears in a live (probe_status=ok) provider
+    catalog AND is unknown to BOTH flat_router.PROVIDER_MODELS AND
+    model_context_registry.json. Non-chat models are staged as rejected.
+
+    Idempotent: existing entries are preserved; only last_seen advances.
+    Returns the full updated store (also persisted to INTAKE_FILE).
+    """
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    store = _load_intake()
+
+    for provider, entry in live.items():
+        if entry.get("probe_status") != "ok":
+            continue
+        routed = set(provider_models.get(provider, set()))
+        for mid in entry.get("canonical", []):
+            if mid in routed or mid in ctx_reg:
+                continue  # known — not new
+            rec = store.get(mid)
+            if rec is None:
+                chat = _is_chat_model(mid)
+                store[mid] = {
+                    "raw_ids": {provider: mid},
+                    "modality": "chat" if chat else "non-chat",
+                    "status": "staged" if chat else "rejected",
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                    "missing_since": None,
+                    "probes": {},
+                    "advertised": False,
+                    "decided_by": "auto-rule" if not chat else None,
+                    "decided_at": now_iso if not chat else None,
+                }
+            else:
+                # idempotent rerun: preserve first_seen, advance last_seen
+                rec["last_seen"] = now_iso
+                rec.setdefault("raw_ids", {})[provider] = mid
+
+    INTAKE_FILE.write_text(json.dumps(store, indent=2))
+    return store
+
+
 def probe(url: str, key: str | None, provider: str) -> dict:
     """Fetch a provider catalog. Returns FR-0-style probe record.
 
@@ -363,6 +427,18 @@ def main() -> int:
                    json.loads((BOT / "model_context_registry.json").read_text()).items()}
     except Exception:
         pass
+
+    # INTAKE-1: stage newly-discovered upstream models into the quarantine
+    # store (model_intake.json). New = live probe, unknown to BOTH
+    # PROVIDER_MODELS and model_context_registry.json. Non-chat -> rejected.
+    # STAGED = quarantine: not routable, not advertised, requests keep loud-503.
+    intake = stage_new_models(live, PROVIDER_MODELS, ctx_reg)
+    new_staged = [m for m, r in intake.items() if r.get("status") == "staged"]
+    new_rejected = [m for m, r in intake.items() if r.get("status") == "rejected"]
+    if new_staged or new_rejected:
+        print(f"[catalog-drift] intake staged={len(new_staged)} "
+              f"rejected={len(new_rejected)} "
+              f"staged_ids={','.join(new_staged)[:120]}")
 
     drift = {"phantoms": {}, "missing_rungs": {}, "translation_gaps": {}, "context_gaps": {}}
     for name, cfg in PROVIDER_MODELS.items():

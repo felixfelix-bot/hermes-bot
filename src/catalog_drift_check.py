@@ -309,6 +309,135 @@ def stage_new_models(live: dict, provider_models: dict, ctx_reg: dict,
     return store
 
 
+# ── INTAKE-2: 1-token probe + cross-provider merge + eligibility ─────────────
+# Probe staged (chat) models per provider with a max_tokens=1 completion and
+# record ts/pass/http/model_field per probe in model_intake.json. The response
+# model field MUST match the requested canonical family (catches silent
+# substitution at probe time — mismatch = probe FAIL). Budget: ≤1 probe per
+# (model, provider) per run. Never probe non-chat/rejected. Eligibility: ≥2
+# DISTINCT providers w/ pass=true -> status=eligible; else stays staged
+# (probes retried next run, fail evidence kept).
+#
+# Chat-completion endpoints per provider (base + /chat/completions). Mirrors
+# the base URLs in zai_proxy.py. key_env is the manager/.env var holding the
+# API key (None = no auth header, e.g. local routstr/routstrd).
+CHAT_PROVIDERS: dict[str, dict] = {
+    "ollama_cloud": {"base_url": "https://ollama.com/v1", "key_env": "OLLAMA_CLOUD_API_KEY"},
+    "ollama_cloud_2": {"base_url": "https://ollama.com/v1", "key_env": "OLLAMA_CLOUD_API_KEY_2"},
+    "neuralwatt": {"base_url": "https://api.neuralwatt.com/v1", "key_env": "NEURALWATT_API_KEY"},
+    "deepinfra": {"base_url": "https://api.deepinfra.com/v1/openai", "key_env": "DEEPINFRA_API_KEY"},
+    "opencode_go": {"base_url": "https://opencode.ai/zen/go/v1", "key_env": "OPENCODE_GO_API_KEY"},
+    "ours": {"base_url": "https://api.z.ai/api/coding/paas/v4", "key_env": "ZAI_OUR_KEY"},
+    "telnyx": {"base_url": "https://api.telnyx.com/v2/ai", "key_env": "TELNYX_API_KEY"},
+}
+
+
+def _model_field_matches(canonical_family: str, model_field: str) -> bool:
+    """True if the provider's response model field belongs to the requested
+    canonical family (catches silent substitution at probe time).
+
+    Matching is tolerant of the canonical org-prefix (deepseek/deepseek-v5 vs
+    deepseek-v5) and of provider-native tag suffixes (deepseek-v5:0731). A
+    genuinely different family (glm-5.3 vs deepseek-v5) or an empty field is
+    a mismatch -> probe FAIL.
+    """
+    fam = (canonical_family or "").strip().lower()
+    field = (model_field or "").strip().lower()
+    if not fam or not field:
+        return False
+    # strip org prefix from both sides
+    fam_base = fam.split("/")[-1]
+    field_base = field.split("/")[-1]
+    # strip a date-tag suffix (e.g. deepseek-v5:0731 / deepseek-v5-0731)
+    for sep in (":", "-"):
+        if sep in field_base:
+            head, _, tail = field_base.rpartition(sep)
+            if _looks_like_date_tag(tail):
+                field_base = head
+    return fam_base == field_base
+
+
+def probe_chat(url: str, key: str | None, provider: str, model_id: str,
+               canonical_family: str) -> dict:
+    """Send a single max_tokens=1 chat completion to a provider.
+
+    Args:
+        url: full chat-completions endpoint (base + /chat/completions)
+        key: API key (None -> no Authorization header)
+        provider: provider name (for the probe record)
+        model_id: provider-native model ID to request
+        canonical_family: canonical store key the response model field must
+            match (silent-substitution guard)
+
+    Returns a probe record: {ts, pass, http, model_field}. pass is True only
+    when http==200 AND the response model field matches the canonical family.
+    """
+    t0 = time.time()
+    body = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }).encode()
+    hdrs = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    if key:
+        hdrs["Authorization"] = f"Bearer {key}"
+    http = None
+    model_field = ""
+    try:
+        req = urllib.request.Request(url, data=body, method="POST", headers=hdrs)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            http = resp.status
+            data = json.loads(resp.read().decode(errors="ignore"))
+        model_field = str(data.get("model", "") or "")
+    except urllib.error.HTTPError as he:
+        http = he.code
+    except Exception:
+        http = None
+    ok = (http == 200) and _model_field_matches(canonical_family, model_field)
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pass": ok,
+        "http": http,
+        "model_field": model_field,
+    }
+
+
+def run_intake_probes(store: dict, providers: dict, ctx_reg: dict, keys: dict,
+                      now_iso: str | None = None) -> dict:
+    """Probe every staged chat model across providers and compute eligibility.
+
+    For each store entry with status=='staged' and modality=='chat', send at
+    most ONE probe per (model, provider) this run (budget). Non-chat/rejected
+    entries are never probed. Probe records are appended to rec['probes'][provider]
+    (fail evidence kept). If ≥2 DISTINCT providers pass -> status=eligible
+    (decided_by=auto-rule). Otherwise the entry stays staged for the next run.
+
+    Returns the full updated store (also persisted to INTAKE_FILE).
+    """
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    for mid, rec in store.items():
+        if rec.get("status") != "staged" or rec.get("modality") != "chat":
+            continue  # never probe non-chat / rejected / already decided
+        passes = 0
+        for provider, cfg in providers.items():
+            key = keys.get(cfg.get("key_env")) if cfg.get("key_env") else None
+            if not key:
+                continue  # no key -> cannot probe this provider
+            # provider-native ID to request (raw upstream id if known)
+            model_id = rec.get("raw_ids", {}).get(provider, mid)
+            url = cfg["base_url"].rstrip("/") + "/chat/completions"
+            probe_rec = probe_chat(url, key, provider, model_id, mid)
+            rec.setdefault("probes", {})[provider] = probe_rec
+            if probe_rec.get("pass"):
+                passes += 1
+        if passes >= 2:
+            rec["status"] = "eligible"
+            rec["decided_by"] = "auto-rule"
+            rec["decided_at"] = now_iso
+    INTAKE_FILE.write_text(json.dumps(store, indent=2))
+    return store
+
+
 def probe(url: str, key: str | None, provider: str) -> dict:
     """Fetch a provider catalog. Returns FR-0-style probe record.
 
@@ -439,6 +568,15 @@ def main() -> int:
         print(f"[catalog-drift] intake staged={len(new_staged)} "
               f"rejected={len(new_rejected)} "
               f"staged_ids={','.join(new_staged)[:120]}")
+
+    # INTAKE-2: probe staged chat models (max_tokens=1) across providers and
+    # promote to eligible when ≥2 DISTINCT providers pass. Non-chat/rejected
+    # are never probed. Fail evidence is kept in rec['probes'] for retry.
+    intake = run_intake_probes(intake, CHAT_PROVIDERS, ctx_reg, keys)
+    newly_eligible = [m for m, r in intake.items() if r.get("status") == "eligible"]
+    if newly_eligible:
+        print(f"[catalog-drift] intake eligible={len(newly_eligible)} "
+              f"eligible_ids={','.join(newly_eligible)[:120]}")
 
     drift = {"phantoms": {}, "missing_rungs": {}, "translation_gaps": {}, "context_gaps": {}}
     for name, cfg in PROVIDER_MODELS.items():

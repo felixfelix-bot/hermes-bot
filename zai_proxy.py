@@ -674,6 +674,7 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
         "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
         "glm-5.2":                    "zai-org/GLM-5.2",
+        "glm-5.3":                    "zai-org/GLM-5.3",
     },
     # Telnyx is Kimi-only by operator decision (2026-08-20): glm-5.2 ran
     # ~$12/M blended here vs ~$0.26-1.30/M on deepinfra/ppq/openrouter.
@@ -715,12 +716,10 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/gemma-4-31b":        "gemma-4-31b",
     },
     "ollama_cloud": {
-        "glm-5.3":                    "glm-5.2",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
     "ollama_cloud_2": {
-        "glm-5.3":                    "glm-5.2",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
@@ -1732,9 +1731,9 @@ def _tier_to_task_type(tier_hint: str) -> str:
         * absent/unknown → ``\"coding\"`` (default — no downgrade assumed)
 
     The router only uses task_type for per-model pricing and model
-    mapping (model_mapping.get_model).  z.ai-exclusive models like
-    glm-5.3 (heavy) still get substituted to glm-5.2 on failover
-    providers regardless of this mapping.
+    mapping (model_mapping.get_model).  glm-5.3 is served verbatim on
+    failover providers (Ollama Cloud since 2026-08-29) — it is no longer
+    substituted to glm-5.2.
     """
     if tier_hint in ("heavy", "high"):
         return "coding"
@@ -4596,13 +4595,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # Map model names: z.ai names work directly on Ollama Cloud API
         # (glm-5.2 → glm-5.2, no :cloud suffix needed for direct API).
-        # glm-5.3 is NOT in Ollama Cloud's catalog — downgrade to glm-5.2
-        # (same 743B base; externals only have 5.2 until open weights land).
-        # For deepseek models, translate to Ollama's tagged IDs via
-        # _PROVIDER_MODEL_NAMES (e.g. deepseek/deepseek-v4-flash → deepseek-v4-flash:0731).
+        # glm-5.3 / glm-5.3-flash pass through verbatim — Ollama Cloud serves
+        # them natively (2026-08-29 live verification). For deepseek models,
+        # translate to Ollama's tagged IDs via _PROVIDER_MODEL_NAMES
+        # (e.g. deepseek/deepseek-v4-flash → deepseek-v4-flash:0731).
         ollama_model = model or "glm-5.2"
-        if ollama_model == "glm-5.3":
-            ollama_model = "glm-5.2"
         _oc_map = _PROVIDER_MODEL_NAMES.get(key_name, {})
         ollama_model = _oc_map.get(ollama_model, ollama_model)
 
@@ -4846,8 +4843,9 @@ class Handler(BaseHTTPRequestHandler):
                          reason: str | None = None) -> bool:
         """Forward request to OpenCode Go API (flat-rate $10/mo subscription).
 
-        OpenCode Go serves native glm-5.3 (unlike ollama_cloud which downgrades
-        to 5.2), has prompt caching, and 29 models including kimi-k3, deepseek-v4.
+        OpenCode Go serves native glm-5.3 (as does ollama_cloud since
+        2026-08-29), has prompt caching, and 29 models including kimi-k3,
+        deepseek-v4.
         No 403 paywall behavior observed — no Monday-reset flag needed.
 
         Returns True on success (response already sent),

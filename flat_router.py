@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import time
@@ -108,8 +109,10 @@ def canonicalize_model(model: str | None) -> str:
 # _resolve_model_for_provider() via zai_proxy._PROVIDER_MODEL_NAMES.
 # Evidence: FR-0 live probe (ollama_tags_key1.json) — ollama real tags are
 # kimi-k3 / minimax-m3 / deepseek-v4-flash:0731 / deepseek-v4-pro:0813.
-# kimi-k3:cloud, minimax-m3:cloud, glm-5.3, glm-4.5-flash are PHANTOM on
-# ollama (verbatim 404 or silent downgrade) and are removed here.
+# glm-5.3 / glm-5.3-flash are NO LONGER phantom on ollama (2026-08-29 live
+# verification: both served 5-token completions HTTP 200, listed in /v1/models).
+# kimi-k3:cloud, minimax-m3:cloud, glm-4.5-flash are PHANTOM on ollama
+# (verbatim 404 or silent downgrade) and are removed here.
 
 PROVIDER_MODELS: dict[str, set[str]] = {
     # z.ai keys — z.ai catalog only (deepseek/qwen/minimax/mimo are NOT
@@ -127,20 +130,21 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-4.6v",
     },
     # Ollama Cloud — included subscription, wide model catalog.
-    # Canonical IDs only. glm-5.3 / glm-4.5-flash / kimi-k3:cloud /
+    # Canonical IDs only. glm-5.3 / glm-5.3-flash are LIVE on ollama
+    # (2026-08-29 verification) — included. glm-4.5-flash / kimi-k3:cloud /
     # minimax-m3:cloud are PHANTOM on ollama (FR-0 live probe) — removed.
     # deepseek stays in SLASHED canonical form (FR-1 direction, do NOT
     # reverse to short). Dispatch translates kimi-k3 -> kimi-k3,
     # minimax-m3 -> minimax-m3, deepseek/deepseek-v4-flash ->
     # deepseek-v4-flash:0731 (real tags).
     "ollama_cloud": {
-        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
+        "glm-5.2", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "minimax-m3",
     },
     "ollama_cloud_2": {
-        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
+        "glm-5.2", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
         "gpt-oss:120b", "gemma4:31b", "qwen3.5:397b",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "minimax-m3",
@@ -152,14 +156,20 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
     },
     # NeuralWatt — per-token, deepseek-v4-flash $0.14/M
+    # glm-5.3: LIVE (2026-08-30 catalog + pricing page verification —
+    # $1.45/M in, $4.50/M out, context 1048.576K, "Try Now" not
+    # request-access). Adds the only paid glm-5.3 rung; was the missing
+    # fallback during the 2026-08-30 503 incident.
     "neuralwatt": {
-        "glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash",
+        "glm-5.2", "glm-5.3", "kimi-k3", "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro", "deepseek/gemma-4-31b",
     },
     # DeepInfra — per-token, ~$1.30/M
+    # glm-5.3: LIVE (2026-08-30 catalog probe — zai-org/GLM-5.3 present in
+    # their 190-model catalog; translation added to _PROVIDER_MODEL_NAMES).
     "deepinfra": {
         "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
-        "glm-5.2",
+        "glm-5.2", "glm-5.3",
     },
     # PPQ — per-token, ~$0.80/M
     "ppq": {
@@ -336,6 +346,58 @@ _ZAI_KEYS = frozenset({"ours", "friend"})
 _FLAT_RATE_PROVIDERS = frozenset({
     "ollama_cloud", "ollama_cloud_2", "opencode_go",
 })
+
+
+# ── Live-catalog phantom guard (catalog-drift D1) ────────────────────────────
+# catalog_drift_check.py writes ~/.hermes/bot/live_catalog_state.json with the
+# canonical model set each provider ACTUALLY serves. When fresh, candidates
+# absent from the live snapshot are skipped (fail-open otherwise).
+_LIVE_CATALOG_PATH = Path(__file__).resolve().parent / "live_catalog_state.json"
+_LIVE_CATALOG_MAX_AGE_S = 48 * 3600
+_live_catalog_cache: dict = {"mtime": 0.0, "providers": {}}
+
+
+def _load_live_catalog() -> dict:
+    """Read live_catalog_state.json with mtime caching. Never raises."""
+    try:
+        mtime = _LIVE_CATALOG_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if mtime == _live_catalog_cache["mtime"]:
+        return _live_catalog_cache["providers"]
+    try:
+        raw = json.loads(_LIVE_CATALOG_PATH.read_text())
+        age = time.time() - raw.get("fetched_at", 0)
+        if age > _LIVE_CATALOG_MAX_AGE_S:
+            _live_catalog_cache.update(mtime=mtime, providers={})
+        else:
+            _live_catalog_cache.update(mtime=mtime,
+                                       providers=raw.get("providers", {}))
+    except Exception:
+        _live_catalog_cache.update(mtime=mtime, providers={})
+    return _live_catalog_cache["providers"]
+
+
+def _passes_live_catalog_guard(provider: str, model_id: str) -> bool:
+    """Live-catalog phantom guard. Fail-open in every uncertain case.
+
+    Blocks a candidate ONLY when all of the following hold:
+      - a fresh (<48h) live-catalog snapshot exists for the provider
+      - the snapshot's upstream listing is marked catalog_complete
+      - model_id is absent from BOTH the snapshot and allowlist_extra
+    """
+    try:
+        providers = _load_live_catalog()
+        entry = providers.get(provider)
+        if not entry:
+            return True
+        if not entry.get("catalog_complete", False):
+            return True
+        models = set(entry.get("models", []))
+        models.update(entry.get("allowlist_extra", []))
+        return model_id in models
+    except Exception:
+        return True
 
 
 def _is_provider_healthy(name: str) -> bool:
@@ -855,9 +917,17 @@ def select_provider(
         for name, models in PROVIDER_MODELS.items():
             # 1. Model filter — only providers that can serve this model
             if model_id not in models:
-                # Also check if the model might be served under a different name
-                # (e.g., glm-5.3 → glm-5.2 on ollama_cloud)
-                # For now, exact match only — model translation happens at dispatch time
+                # Exact match only — model translation happens at dispatch time.
+                # (glm-5.3 is served verbatim on ollama since 2026-08-29; no
+                # downgrade-to-5.2 substitution exists anymore.)
+                continue
+
+            # 1b. Phantom-catalog guard — if a fresh live-catalog snapshot for
+            # this provider says it can NOT serve the model, skip despite the
+            # static registry (prevents route → 404 → key_health poison
+            # cascade; incident 2026-08-30). Fail-open: missing/stale snapshot
+            # or incomplete upstream listing → keep candidate as before.
+            if not _passes_live_catalog_guard(name, model_id):
                 continue
 
             # 2. Health gate — exclude unhealthy providers

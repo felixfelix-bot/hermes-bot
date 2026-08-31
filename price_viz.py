@@ -764,6 +764,209 @@ def render_headroom_weekly(outdir: Path) -> Path:
     return outpath
 
 
+# ── V9 model-mix + V10 model x lane ─────────────────────────────────────────
+# Per-model usage visualization. The model column is rich (48h calls:
+# glm-5.3=4966, dsv4-flash=3497, glm-5.2=1812, glm-4.5-flash=907, kimi-k3=313)
+# but was previously invisible. V9 shows token-share evolution over 7d; V10
+# shows who-uses-which-model-on-which-key-at-what-cost.
+
+def _load_model_token_series(hours_back: int = 168, bucket_s: int = 86400):
+    """Load per-model token totals bucketed over time.
+
+    Returns (series, boundaries) where:
+      series: {model: [tokens_per_bucket, ...]} aligned to boundaries
+      boundaries: list of bucket-end timestamps (len = hours_back*3600/bucket_s)
+    """
+    now = time.time()
+    cutoff = now - hours_back * 3600
+    n_buckets = max(1, int(hours_back * 3600 / bucket_s))
+    boundaries = [now - (n_buckets - i) * bucket_s for i in range(n_buckets)]
+
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute(
+            "SELECT model, ts, total_tokens FROM api_calls "
+            "WHERE ts > ? AND model IS NOT NULL AND model != '' ORDER BY ts",
+            (cutoff,)
+        ).fetchall()
+    finally:
+        db.close()
+
+    series: dict[str, list[float]] = {}
+    for r in rows:
+        m = r["model"]
+        tok = r["total_tokens"] or 0
+        if m not in series:
+            series[m] = [0.0] * n_buckets
+        # Find the bucket this event falls into (last bucket = most recent).
+        idx = int((r["ts"] - cutoff) // bucket_s)
+        idx = min(max(idx, 0), n_buckets - 1)
+        series[m][idx] += tok
+    return series, boundaries
+
+
+def render_model_mix(outdir: Path) -> Path:
+    """V9: 7-day stacked area of TOKENS by model (share evolution).
+
+    Answers "is glm-5.3 share growing". Each model is a stacked area; the
+    top edge of each band shows that model's cumulative token share over the
+    last 7 days. Filename model-mix-7d.png.
+    """
+    series, boundaries = _load_model_token_series(hours_back=168, bucket_s=86400)
+    n_buckets = len(boundaries)
+    x = range(n_buckets)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    if series:
+        # Order models by total tokens desc so the biggest sits at the bottom.
+        ordered = sorted(series.items(), key=lambda kv: -sum(kv[1]))
+        bottom = np.zeros(n_buckets)
+        palette = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd",
+                   "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+        for i, (model, vals) in enumerate(ordered):
+            arr = np.array(vals, dtype=np.float64)
+            color = palette[i % len(palette)]
+            ax.fill_between(x, bottom, bottom + arr, alpha=0.6, color=color,
+                            label=model)
+            ax.plot(x, bottom + arr, color=color, linewidth=0.8)
+            bottom = bottom + arr
+        ax.set_ylim(bottom=0)
+    else:
+        ax.text(0.5, 0.5, "No model token data in last 7d",
+                ha="center", va="center", transform=ax.transAxes)
+
+    ax.set_ylabel("Tokens (7d, stacked)")
+    ax.set_title("Model Mix — Token Share Evolution (last 7 days)")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(True, alpha=0.2)
+
+    xticks = range(0, n_buckets, max(1, n_buckets // 7))
+    ax.set_xticks(list(xticks))
+    ax.set_xticklabels([time.strftime("%m-%d", time.gmtime(boundaries[i]))
+                        for i in xticks], fontsize=8)
+    ax.set_xlabel("Date (UTC, last 7 days)")
+    ax.set_xlim(0, n_buckets - 1)
+
+    outpath = outdir / "model-mix-7d.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return outpath
+
+
+def _load_model_lane_tokens(hours_back: int = 168) -> dict[str, dict[str, float]]:
+    """Load per-model token volume split by lane (key_name).
+
+    Returns {model: {lane: total_tokens}} over the window.
+    """
+    now = time.time()
+    cutoff = now - hours_back * 3600
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute(
+            "SELECT model, key_name, SUM(total_tokens) AS tok FROM api_calls "
+            "WHERE ts > ? AND model IS NOT NULL AND model != '' "
+            "AND key_name IS NOT NULL AND key_name != '' "
+            "GROUP BY model, key_name",
+            (cutoff,)
+        ).fetchall()
+    finally:
+        db.close()
+    result: dict[str, dict[str, float]] = {}
+    for r in rows:
+        result.setdefault(r["model"], {})[r["key_name"]] = r["tok"] or 0.0
+    return result
+
+
+def _load_model_realized_pm(hours_back: int = 168) -> dict[str, float]:
+    """Load realized $/M per model from api_calls cost_usd.
+
+    Returns {model: dollars_per_million} for models with positive cost.
+    """
+    now = time.time()
+    cutoff = now - hours_back * 3600
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute(
+            "SELECT model, SUM(total_tokens) AS tok, SUM(cost_usd) AS cost "
+            "FROM api_calls WHERE ts > ? AND model IS NOT NULL AND model != '' "
+            "AND cost_usd > 0 GROUP BY model",
+            (cutoff,)
+        ).fetchall()
+    finally:
+        db.close()
+    result: dict[str, float] = {}
+    for r in rows:
+        tok = r["tok"] or 0
+        cost = r["cost"] or 0.0
+        if tok > 0:
+            result[r["model"]] = cost / tok * 1e6
+    return result
+
+
+def render_model_by_lane(outdir: Path) -> Path:
+    """V10: HORIZONTAL stacked bars per model, segments = lanes.
+
+    Right column annotates realized $/M per model (from api_calls cost_usd).
+    Answers who-uses-which-model-on-which-key-at-what-cost.
+    Filename model-by-lane.png.
+    """
+    m2l = _load_model_lane_tokens(hours_back=168)
+    realized_pm = _load_model_realized_pm(hours_back=168)
+
+    # Collect all lanes, ordered by total volume desc.
+    lane_totals: dict[str, float] = {}
+    for model, lanes in m2l.items():
+        for lane, tok in lanes.items():
+            lane_totals[lane] = lane_totals.get(lane, 0.0) + tok
+    lanes = sorted(lane_totals, key=lambda l: -lane_totals[l])
+
+    # Order models by total tokens desc (biggest at top).
+    models = sorted(m2l, key=lambda m: -sum(m2l[m].values()))
+
+    fig, ax = plt.subplots(figsize=(14, max(4, 0.5 * len(models) + 2)))
+    if models:
+        palette = ["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd",
+                   "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+        y_pos = range(len(models))
+        for i, model in enumerate(models):
+            left = 0.0
+            for j, lane in enumerate(lanes):
+                tok = m2l[model].get(lane, 0.0)
+                if tok <= 0:
+                    continue
+                color = palette[j % len(palette)]
+                ax.barh(i, tok, left=left, color=color, edgecolor="white",
+                        linewidth=0.3, label=lane if i == 0 else None)
+                left += tok
+        ax.set_yticks(list(y_pos))
+        ax.set_yticklabels(models, fontsize=9)
+        # Annotate realized $/M on the right of each bar.
+        for i, model in enumerate(models):
+            total = sum(m2l[model].values())
+            pm = realized_pm.get(model)
+            if pm is not None:
+                ax.text(total, i, f"  ${pm:.3f}/M", va="center", fontsize=8,
+                        color="#333333")
+        ax.set_xlim(0, max(sum(m2l[m].values()) for m in models) * 1.25)
+    else:
+        ax.text(0.5, 0.5, "No model x lane data in last 7d",
+                ha="center", va="center", transform=ax.transAxes)
+
+    ax.set_xlabel("Tokens (7d)")
+    ax.set_title("Model x Lane — Token Volume by Key (realized $/M on right)")
+    if lanes:
+        ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, axis="x", alpha=0.2)
+
+    outpath = outdir / "model-by-lane.png"
+    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return outpath
+
+
 # ── V11 ASCII insights strip ────────────────────────────────────────────────
 # Triggered-only suggestion engine. render_insights() returns an ASCII strip
 # that is EMPTY when no rule fires — it never fabricates a line.
@@ -1370,6 +1573,23 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
             rendered.append(p)
     except Exception as e:
         print(f"V8 headroom: {e}", file=sys.stderr)
+
+    # V9: model-mix-7d.png — 7d stacked area of tokens by model (share evolution)
+    try:
+        p = render_model_mix(outdir)
+        if p:
+            rendered.append(p)
+    except Exception as e:
+        print(f"V9 model mix: {e}", file=sys.stderr)
+
+    # V10: model-by-lane.png — horizontal stacked bars, model rows x lane cols,
+    # with realized $/M annotation column.
+    try:
+        p = render_model_by_lane(outdir)
+        if p:
+            rendered.append(p)
+    except Exception as e:
+        print(f"V10 model by lane: {e}", file=sys.stderr)
 
     return rendered
 

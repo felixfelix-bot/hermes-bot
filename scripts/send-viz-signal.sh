@@ -70,6 +70,8 @@ DEFAULT_PLOTS=(
 DIGEST_PLOTS=(
     "$VIZ_DIR/price-envelope.png"
     "$VIZ_DIR/quota-heatmap.png"
+    "$VIZ_DIR/model-mix-7d.png"
+    "$VIZ_DIR/model-by-lane.png"
 )
 
 # args parse

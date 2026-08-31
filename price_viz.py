@@ -540,57 +540,223 @@ def render_ascii() -> str:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+# ── V8b lane registry ────────────────────────────────────────────────────────
+# Single source of truth mapping every provider lane -> (kind, capacity).
+#   token: token caps (weekly token limit) — stacked in Panel A.
+#   usd:   balance lanes (routstrd/telnyx/ppq/neuralwatt) — absolute USD in
+#          Panel B, NEVER token-stacked.
+#   flat:  flat/included lanes (opencode_go) — hatched band, never stacked.
+# Capacity comes from the limits table (static weekly token caps); the live
+# /quota payload overlays used_pct/remaining and absorbs any extra lanes it
+# carries that aren't in the static registry.
+
+LANE_REGISTRY_STATIC = {
+    "ours":           {"kind": "token", "capacity": 14_000_000},
+    "friend":         {"kind": "token", "capacity": 14_000_000},
+    "ollama_cloud":   {"kind": "token", "capacity": 3_500_000_000},
+    "ollama_cloud_2": {"kind": "token", "capacity": 3_500_000_000},
+    "opencode_go":    {"kind": "flat",  "capacity": None},
+    "neuralwatt":     {"kind": "usd",   "capacity": None},
+    "routstrd":       {"kind": "usd",   "capacity": None},
+    "telnyx":         {"kind": "usd",   "capacity": None},
+    "ppq":            {"kind": "usd",   "capacity": None},
+}
+
+QUOTA_ENDPOINT = "http://localhost:9099/quota"
+
+
+def _fetch_quota_payload() -> Optional[dict]:
+    """Fetch the live /quota payload from the local proxy. None on failure."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(QUOTA_ENDPOINT, timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def build_lane_registry(payload: Optional[dict]) -> dict:
+    """Map every provider lane -> {kind, capacity}.
+
+    Merges the static registry with any lanes the /quota payload carries, so
+    extra lanes are absorbed automatically. Token capacities stay from the
+    limits table (the payload's ``total`` is the session cap, not weekly).
+    """
+    reg = {lane: dict(entry) for lane, entry in LANE_REGISTRY_STATIC.items()}
+    if payload:
+        for lane, info in payload.items():
+            if not isinstance(info, dict):
+                continue
+            if lane not in reg:
+                # Unknown lane from payload — classify by shape.
+                if "remaining_usd" in info or "total_credits_usd" in info:
+                    reg[lane] = {"kind": "usd", "capacity": None}
+                elif info.get("regime") == "included":
+                    reg[lane] = {"kind": "flat", "capacity": None}
+                else:
+                    reg[lane] = {"kind": "token", "capacity": None}
+    return reg
+
+
+def _rolling_window_sums(ts_arr, tok_arr, boundaries, window_s):
+    """In-memory rolling window sums (numpy) — replaces per-hour SQL scans.
+
+    ts_arr/tok_arr: parallel arrays of event timestamps and token counts.
+    boundaries: list of window-end timestamps.
+    Returns list of total tokens used in [b - window_s, b] for each b.
+    """
+    if len(ts_arr) == 0:
+        return [0.0] * len(boundaries)
+    order = np.argsort(ts_arr)
+    ts_s = ts_arr[order]
+    tok_s = tok_arr[order]
+    prefix = np.concatenate(([0.0], np.cumsum(tok_s)))
+    out = []
+    for b in boundaries:
+        i_end = int(np.searchsorted(ts_s, b, side="right"))
+        i_start = int(np.searchsorted(ts_s, b - window_s, side="right"))
+        out.append(float(prefix[i_end] - prefix[i_start]))
+    return out
+
+
+def _ffill_series(points, boundaries):
+    """Forward-fill sparse (ts, value) points onto boundaries.
+
+    Returns a list aligned to ``boundaries``; entries before the first point
+    are None (no data yet).
+    """
+    vals = []
+    idx = 0
+    for b in boundaries:
+        while idx < len(points) and points[idx][0] <= b:
+            idx += 1
+        vals.append(points[idx - 1][1] if idx > 0 else None)
+    return vals
+
+
 def render_headroom_weekly(outdir: Path) -> Path:
-    """V8: Total remaining quota headroom over last 7 days (stacked area)."""
-    db = _connect_usage_db()
-    db.row_factory = sqlite3.Row
+    """V8b: Dynamic 2-panel headroom over last 7 days.
+
+    Panel A: token lanes remaining-headroom stacked area.
+    Panel B: USD balance lanes as absolute USD (never stacked into tokens).
+    Flat lanes (opencode_go) drawn as a hatched band, never stacked.
+
+    Query fix: 1 query per pool (SELECT key_name, ts, total_tokens over the
+    window) + numpy cumulative/rolling sums in memory — replaces the old
+    168-bucket x N-pool per-hour SUM scan (the 1850-q bug).
+    """
+    payload = _fetch_quota_payload()
+    registry = build_lane_registry(payload)
+
     now = time.time()
     n_hours = 168
-    pools = [
-        ("ollama_cloud",   3_500_000_000, "#2ca02c"),
-        ("ollama_cloud_2", 3_500_000_000, "#90c3c4"),
-        ("ours",           14_000_000,    "#1f77b4"),
-    ]
+    window_s = 7 * 86400
     hour_bins = [now - (n_hours - i) * 3600 for i in range(n_hours)]
-    series = {}
-    for pool_name, cap, _ in pools:
-        vals = []
-        for h in range(n_hours):
-            t_end = now - (n_hours - h - 1) * 3600
-            used = db.execute(
-                "SELECT COALESCE(SUM(total_tokens),0) FROM api_calls "
-                "WHERE key_name=? AND ts BETWEEN ? AND ?",
-                (pool_name, t_end - 7*86400, t_end)
-            ).fetchone()[0]
-            vals.append(max(0, (cap - used) / 1e9))
-        series[pool_name] = vals
+
+    token_lanes = [l for l, e in registry.items() if e["kind"] == "token"]
+    usd_lanes = [l for l, e in registry.items() if e["kind"] == "usd"]
+    flat_lanes = [l for l, e in registry.items() if e["kind"] == "flat"]
+
+    # ── Panel A data: token lanes (1 query per pool) ──
+    token_series: dict[str, list[float]] = {}
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    for lane in token_lanes:
+        cap = registry[lane]["capacity"]
+        if not cap:
+            continue
+        rows = db.execute(
+            "SELECT ts, total_tokens FROM api_calls "
+            "WHERE key_name=? AND ts > ? ORDER BY ts",
+            (lane, now - window_s - 3600)
+        ).fetchall()
+        ts_arr = np.array([r["ts"] for r in rows], dtype=np.float64)
+        tok_arr = np.array([r["total_tokens"] or 0 for r in rows], dtype=np.float64)
+        used = _rolling_window_sums(ts_arr, tok_arr, hour_bins, window_s)
+        token_series[lane] = [max(0.0, (cap - u) / 1e9) for u in used]
+
+    # ── Panel B data: USD balance lanes (absolute USD) ──
+    usd_series: dict[str, list[Optional[float]]] = {}
+    burn_db = _connect_api_burn_db()
+    burn_db.row_factory = sqlite3.Row
+    for lane in usd_lanes:
+        if lane == "telnyx":
+            # Self-tracked: remaining = starting(10.0) - cumulative cost_usd.
+            rows = db.execute(
+                "SELECT ts, cost_usd FROM api_calls "
+                "WHERE key_name=? AND cost_usd IS NOT NULL AND ts > ? ORDER BY ts",
+                (lane, now - window_s - 3600)
+            ).fetchall()
+            spent = 0.0
+            points = []
+            for r in rows:
+                spent += r["cost_usd"] or 0.0
+                points.append((r["ts"], 10.0 - spent))
+            usd_series[lane] = _ffill_series(points, hour_bins)
+        else:
+            rows = burn_db.execute(
+                "SELECT collected_at, limit_remaining FROM provider_balances "
+                "WHERE provider=? AND collected_at > ? ORDER BY collected_at",
+                (lane, now - window_s - 3600)
+            ).fetchall()
+            points = [(r["collected_at"], r["limit_remaining"])
+                      for r in rows if r["limit_remaining"] is not None]
+            if not points and payload and isinstance(payload.get(lane), dict):
+                # Fall back to a single live point from the /quota payload.
+                rem = payload[lane].get("remaining_usd")
+                if rem is not None:
+                    points = [(now, rem)]
+            usd_series[lane] = _ffill_series(points, hour_bins)
     db.close()
+    burn_db.close()
 
-    fig, ax = plt.subplots(figsize=(14, 5))
+    # ── Figure: two panels ──
+    fig, (ax_a, ax_b) = plt.subplots(nrows=2, figsize=(14, 9), sharex=True)
     x = range(n_hours)
-    bottom = np.zeros(n_hours)
-    colors = []
-    labels = []
-    for pool_name, _, color in pools:
-        vals = series[pool_name]
-        ax.fill_between(x, bottom, bottom + np.array(vals), alpha=0.6, color=color, label=pool_name)
-        ax.plot(x, bottom + np.array(vals), color=color, linewidth=0.8)
-        bottom = bottom + np.array(vals)
 
-    ax.axhline(y=sum(bottom[-1:]), color="white", linestyle="--", alpha=0.3)
-    total_vals = sum(np.array(series[p[0]]) for p in pools)
-    ax.plot(x, total_vals, color="white", linewidth=2, alpha=0.7, label="Total")
+    # Panel A: token lanes stacked area
+    bottom = np.zeros(n_hours)
+    colors = ["#1f77b4", "#2ca02c", "#90c3c4", "#ff7f0e", "#d62728", "#9467bd"]
+    ci = 0
+    for lane in token_lanes:
+        vals = token_series.get(lane)
+        if vals is None:
+            continue
+        arr = np.array(vals)
+        color = colors[ci % len(colors)]
+        ci += 1
+        ax_a.fill_between(x, bottom, bottom + arr, alpha=0.6, color=color, label=lane)
+        ax_a.plot(x, bottom + arr, color=color, linewidth=0.8)
+        bottom = bottom + arr
+
+    # Flat lanes: hatched band, never stacked
+    for lane in flat_lanes:
+        ax_a.axhspan(0, max(float(bottom.max()), 1e-9), color="gray",
+                     alpha=0.15, hatch="//", label=f"{lane} (flat/included)")
+
+    ax_a.set_ylabel("Remaining Quota (B tokens)")
+    ax_a.set_title("Weekly Quota Headroom — Token Lanes (stacked)")
+    ax_a.legend(loc="upper right", fontsize=8)
+    ax_a.grid(True, alpha=0.2)
+    ax_a.set_ylim(bottom=0)
+
+    # Panel B: USD balance lanes (absolute, never stacked)
+    for lane in usd_lanes:
+        series = usd_series.get(lane)
+        if not series or all(v is None for v in series):
+            continue
+        arr = np.array([v if v is not None else np.nan for v in series], dtype=np.float64)
+        ax_b.plot(x, arr, linewidth=1.5, label=lane)
+    ax_b.set_ylabel("Balance (USD)")
+    ax_b.set_title("USD Balance Lanes (absolute, never token-stacked)")
+    ax_b.legend(loc="upper right", fontsize=8)
+    ax_b.grid(True, alpha=0.2)
 
     xticks = range(0, n_hours, 24)
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([time.strftime("%m-%d", time.gmtime(hour_bins[i])) for i in xticks], fontsize=8)
-    ax.set_xlabel("Date (UTC, last 7 days)")
-    ax.set_ylabel("Remaining Quota (B tokens)")
-    ax.set_title("Weekly Quota Headroom — Remaining vs Time")
-    ax.legend(loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.2)
-    ax.set_xlim(0, n_hours)
-    ax.set_ylim(bottom=0)
+    ax_b.set_xticks(xticks)
+    ax_b.set_xticklabels([time.strftime("%m-%d", time.gmtime(hour_bins[i])) for i in xticks], fontsize=8)
+    ax_b.set_xlabel("Date (UTC, last 7 days)")
+    ax_b.set_xlim(0, n_hours)
 
     outpath = outdir / "headroom-weekly.png"
     fig.savefig(outpath, dpi=150, bbox_inches="tight")

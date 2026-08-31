@@ -59,6 +59,7 @@ send() {
 }
 
 ASCII_FILE="$VIZ_DIR/ascii-summary.txt"
+INSIGHTS_FILE="$VIZ_DIR/insights-strip.txt"
 DEFAULT_PLOTS=(
     "$VIZ_DIR/price-envelope.png"
     "$VIZ_DIR/price-heatmap.png"
@@ -93,13 +94,24 @@ if [[ -f "$ASCII_FILE" ]]; then
     ASCII=$(cat "$ASCII_FILE")
 fi
 
+# Read V11 insights strip (triggered-only; empty when nothing fires).
+INSIGHTS=""
+if [[ -f "$INSIGHTS_FILE" ]]; then
+    INSIGHTS=$(cat "$INSIGHTS_FILE")
+fi
+
 case "$MODE" in
     all)
         MSG="${CUSTOM_MSG:-📊 Price Landscape Snapshot — $(date '+%H:%M %b %d %Z')}\n\n${ASCII}"
         PAYLOAD=$(build_payload "$MSG" "${DEFAULT_PLOTS[@]}")
         ;;
     digest)
-        MSG="${CUSTOM_MSG:-📈 Daily Digest — $(date '+%Y-%m-%d')}\n\n${ASCII}"
+        # Prepend the V11 insights strip (triggered-only) to the digest body.
+        DIGEST_BODY="${ASCII}"
+        if [[ -n "$INSIGHTS" ]]; then
+            DIGEST_BODY="🔎 Insights\n${INSIGHTS}\n\n${ASCII}"
+        fi
+        MSG="${CUSTOM_MSG:-📈 Daily Digest — $(date '+%Y-%m-%d')}\n\n${DIGEST_BODY}"
         PAYLOAD=$(build_payload "$MSG" "${DIGEST_PLOTS[@]}")
         ;;
     single)

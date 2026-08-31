@@ -764,6 +764,513 @@ def render_headroom_weekly(outdir: Path) -> Path:
     return outpath
 
 
+# ── V11 ASCII insights strip ────────────────────────────────────────────────
+# Triggered-only suggestion engine. render_insights() returns an ASCII strip
+# that is EMPTY when no rule fires — it never fabricates a line.
+#
+# Prefix semantics:
+#   ALERT   real money at risk (action needed)
+#   EST     derived estimate / trend (labeled as such)
+#   SUGGEST tunable waste (reweight / reclaim / tune)
+#   NAG     repeated unaddressed issue (weekly dedupe)
+#
+# Caps:
+#   hourly = red-only (ALERT) and <= 3 lines
+#   daily  = <= 12 lines and ~1900 chars
+#
+# Schema-safety: every rule that touches optional columns (cache_hit,
+# task_type, session_id, duration_ms) introspects PRAGMA table_info first and
+# gracefully skips when the column is absent. cached_tokens is NOT in the live
+# schema and is never assumed.
+
+# Rule thresholds (tunable via env for T4 later).
+INSIGHTS_MIN_CALLS = int(os.environ.get("VIZ_INSIGHTS_MIN_CALLS", "100"))
+INSIGHTS_L1_IDLE_PCT = float(os.environ.get("VIZ_L1_IDLE_PCT", "0.05"))   # twin < 5% used
+INSIGHTS_L1_ACTIVE_PCT = float(os.environ.get("VIZ_L1_ACTIVE_PCT", "0.20"))  # twin > 20% used
+INSIGHTS_L2_EXHAUST_PCT = float(os.environ.get("VIZ_L2_EXHAUST_PCT", "0.90"))
+INSIGHTS_L3_MIN_SAMPLES = int(os.environ.get("VIZ_L3_MIN_SAMPLES", "48"))
+INSIGHTS_L3_DAYS = int(os.environ.get("VIZ_L3_DAYS", "14"))
+INSIGHTS_L4_ZOMBIE_H = float(os.environ.get("VIZ_L4_ZOMBIE_H", "72"))
+INSIGHTS_C1_MIN_CALLS = int(os.environ.get("VIZ_C1_MIN_CALLS", "1000"))
+INSIGHTS_C3_MULT = float(os.environ.get("VIZ_C3_MULT", "10.0"))
+INSIGHTS_M1_PP = float(os.environ.get("VIZ_M1_PP", "15.0"))
+INSIGHTS_M1_MIN_SHARE = float(os.environ.get("VIZ_M1_MIN_SHARE", "0.05"))
+INSIGHTS_Q2_MULT = float(os.environ.get("VIZ_Q2_MULT", "2.0"))
+INSIGHTS_Q2_MIN_CALLS = int(os.environ.get("VIZ_Q2_MIN_CALLS", "50"))
+INSIGHTS_N1_NULL_PCT = float(os.environ.get("VIZ_N1_NULL_PCT", "0.90"))
+INSIGHTS_E1_OVER_PCT = float(os.environ.get("VIZ_E1_OVER_PCT", "100.0"))
+
+
+def _usage_columns() -> set:
+    """Introspect api_calls columns (schema-safe). Empty set on failure."""
+    try:
+        db = _connect_usage_db()
+        cols = {r[1] for r in db.execute("PRAGMA table_info(api_calls)").fetchall()}
+        db.close()
+        return cols
+    except Exception:
+        return set()
+
+
+def _build_insights_ctx() -> dict:
+    """Load live data into a ctx dict for the rule engine.
+
+    Schema-safe: optional columns are only queried if present in PRAGMA.
+    """
+    cols = _usage_columns()
+    now = time.time()
+    h48 = now - 48 * 3600
+    h7d = now - 7 * 86400
+    h72 = now - 72 * 3600
+    h14d = now - 14 * 86400
+
+    ctx = {
+        "now": now,
+        "usage_columns": cols,
+        "quota_state": load_current_quota_state(),
+        "seed_rates": dict(SEED_RATES),
+        "tiers": dict(PROVIDER_TIER),
+        "lane_registry": dict(LANE_REGISTRY_STATIC),
+        "quota_payload": _fetch_quota_payload() or {},
+        "model_counts_48h": {},
+        "model_counts_7d": {},
+        "model_latency_48h": {},
+        "lane_counts_48h": {},
+        "lane_last_seen": {},
+        "model_lane_48h": {},
+        "session_stats": None,
+        "balance_history": {},
+        "cache_stats": None,
+        "task_type_stats": None,
+        "overall_avg_ms": None,
+    }
+
+    db = _connect_usage_db()
+    db.row_factory = sqlite3.Row
+    try:
+        # Model counts (48h + 7d) and latency.
+        rows = db.execute(
+            "SELECT model, COUNT(*) c, AVG(duration_ms) avg_ms "
+            "FROM api_calls WHERE ts > ? AND model IS NOT NULL AND model != '' "
+            "GROUP BY model", (h48,)).fetchall()
+        for r in rows:
+            ctx["model_counts_48h"][r["model"]] = r["c"]
+            if r["avg_ms"] is not None:
+                ctx["model_latency_48h"][r["model"]] = (r["c"], r["avg_ms"])
+        rows = db.execute(
+            "SELECT model, COUNT(*) c FROM api_calls WHERE ts > ? "
+            "AND model IS NOT NULL AND model != '' GROUP BY model", (h7d,)).fetchall()
+        for r in rows:
+            ctx["model_counts_7d"][r["model"]] = r["c"]
+
+        # Lane counts + last-seen (48h) and model x lane.
+        rows = db.execute(
+            "SELECT key_name, model, COUNT(*) c, MAX(ts) last_ts "
+            "FROM api_calls WHERE ts > ? AND key_name IS NOT NULL "
+            "GROUP BY key_name, model", (h48,)).fetchall()
+        for r in rows:
+            lane = r["key_name"]
+            ctx["lane_counts_48h"][lane] = ctx["lane_counts_48h"].get(lane, 0) + r["c"]
+            ctx["lane_last_seen"][lane] = max(ctx["lane_last_seen"].get(lane, 0), r["last_ts"])
+            if r["model"]:
+                ctx["model_lane_48h"].setdefault(r["model"], {})[lane] = r["c"]
+
+        # Overall avg latency (48h).
+        row = db.execute(
+            "SELECT AVG(duration_ms) a FROM api_calls WHERE ts > ? AND duration_ms IS NOT NULL",
+            (h48,)).fetchone()
+        if row and row["a"] is not None:
+            ctx["overall_avg_ms"] = row["a"]
+
+        # Cache stats — only if cache_hit column exists.
+        if "cache_hit" in cols:
+            row = db.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(cache_hit),0) h FROM api_calls WHERE ts > ?",
+                (h48,)).fetchone()
+            if row:
+                ctx["cache_stats"] = (row["c"], row["h"])
+
+        # task_type stats — only if task_type column exists.
+        if "task_type" in cols:
+            row = db.execute(
+                "SELECT COUNT(*) c, SUM(CASE WHEN task_type IS NULL OR task_type='' "
+                "THEN 1 ELSE 0 END) n FROM api_calls WHERE ts > ?", (h48,)).fetchone()
+            if row:
+                ctx["task_type_stats"] = (row["c"], row["n"] or 0)
+
+        # Session stats — only if session_id column exists.
+        if "session_id" in cols:
+            row = db.execute(
+                "SELECT COUNT(*) n, AVG(cnt) avg_calls, MAX(cnt) max_calls FROM ("
+                "SELECT session_id, COUNT(*) cnt FROM api_calls WHERE ts > ? "
+                "AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id)",
+                (h48,)).fetchone()
+            if row and row["n"]:
+                ctx["session_stats"] = (row["n"], row["avg_calls"] or 0.0, row["max_calls"] or 0)
+    finally:
+        db.close()
+
+    # Balance history (14d) for USD lanes — OLS days-to-zero. Also enrich
+    # quota_state with balance-lane usage_fraction so L2 lane-exhaust catches
+    # balance-tier providers (e.g. neuralwatt 99.5%) that load_current_quota_state
+    # reports as 0.0.
+    try:
+        bdb = _connect_api_burn_db()
+        bdb.row_factory = sqlite3.Row
+        rows = bdb.execute(
+            "SELECT provider, collected_at, limit_remaining, usage_fraction "
+            "FROM provider_balances "
+            "WHERE collected_at > ? AND limit_remaining IS NOT NULL ORDER BY collected_at",
+            (h14d,)).fetchall()
+        bdb.close()
+        latest_frac = {}
+        for r in rows:
+            ctx["balance_history"].setdefault(r["provider"], []).append(
+                (r["collected_at"], r["limit_remaining"]))
+            # Only overlay usage_fraction if the sample is fresh (<=24h), so a
+            # stale balance (e.g. ppq last seen 260h ago) can't trigger a false
+            # lane-exhaust ALERT.
+            if r["usage_fraction"] is not None and (now - r["collected_at"]) <= 24 * 3600:
+                latest_frac[r["provider"]] = r["usage_fraction"]
+        # Overlay balance-lane usage_fraction onto quota_state (only where the
+        # static loader left 0.0, i.e. balance-tier lanes).
+        for prov, frac in latest_frac.items():
+            if ctx["quota_state"].get(prov, 0.0) == 0.0:
+                ctx["quota_state"][prov] = frac
+    except Exception:
+        pass
+
+    return ctx
+
+
+def _ols_slope(points):
+    """Least-squares slope of (ts, value) points. Returns (slope_per_s, n)."""
+    if len(points) < 2:
+        return None, 0
+    xs = np.array([p[0] for p in points], dtype=np.float64)
+    ys = np.array([p[1] for p in points], dtype=np.float64)
+    xm = xs.mean()
+    ym = ys.mean()
+    denom = float(((xs - xm) ** 2).sum())
+    if denom == 0:
+        return None, len(points)
+    slope = float(((xs - xm) * (ys - ym)).sum() / denom)
+    return slope, len(points)
+
+
+# ── Rules ───────────────────────────────────────────────────────────────────
+
+def rule_l1_idle_twin(ctx) -> Optional[str]:
+    """L1: idle twin — same-cost, same-tier lane nearly idle while its twin works.
+
+    Twins are lanes sharing the same seed rate AND the same tier (e.g. two
+    ``included`` lanes like ollama_cloud / ollama_cloud_2). A flat lane is not
+    a twin of an included lane even if the seed rate matches.
+    """
+    tiers = ctx["tiers"]
+    for lane, entry in ctx["lane_registry"].items():
+        tier = tiers.get(lane)
+        if tier not in ("included", "flat"):
+            continue
+        rate = ctx["seed_rates"].get(lane)
+        if rate is None:
+            continue
+        twins = [l for l in ctx["lane_registry"]
+                 if l != lane and tiers.get(l) == tier
+                 and ctx["seed_rates"].get(l) == rate]
+        if not twins:
+            continue
+        idle = ctx["quota_state"].get(lane, 0.0)
+        for twin in twins:
+            active = ctx["quota_state"].get(twin, 0.0)
+            if idle < INSIGHTS_L1_IDLE_PCT and active > INSIGHTS_L1_ACTIVE_PCT:
+                return (f"SUGGEST {lane} idle at {idle*100:.1f}% vs {twin} "
+                        f"{active*100:.1f}% (same ${rate:.2f}/mo) — reweight or reclaim")
+    return None
+
+
+def rule_l2_lane_exhaust(ctx) -> Optional[str]:
+    """L2: lane exhaust — a lane near/at its cap.
+
+    Emits one ALERT per exhausted lane (multi-line), so e.g. both ours (100%)
+    and neuralwatt (99.5%) surface rather than only the first in iteration order.
+    """
+    alerts = []
+    for lane, frac in sorted(ctx["quota_state"].items(), key=lambda kv: -kv[1]):
+        if frac >= INSIGHTS_L2_EXHAUST_PCT:
+            alerts.append(f"ALERT {lane} at {frac*100:.1f}% used — near exhaust, "
+                          f"reweight traffic off this lane")
+    return "\n".join(alerts) if alerts else None
+
+
+def rule_l3_days_to_zero_ols(ctx) -> Optional[str]:
+    """L3: days-to-zero OLS projection on rolling window (USD balance lanes)."""
+    for lane, hist in ctx["balance_history"].items():
+        if len(hist) < INSIGHTS_L3_MIN_SAMPLES:
+            continue
+        slope, n = _ols_slope(hist)
+        if slope is None or slope >= 0:
+            continue  # not draining
+        last = hist[-1][1]
+        if last <= 0:
+            continue
+        days = last / (-slope * 86400)
+        if days < 0:
+            continue
+        if days <= 14:  # only surface when meaningful
+            return (f"EST {lane} balance ${last:.2f} draining at ${-slope*86400:.2f}/day "
+                    f"→ ~{days:.0f} days to zero (OLS, {n} samples)")
+    return None
+
+
+def rule_l4_zombie_key(ctx) -> Optional[str]:
+    """L4: zombie key — lane carrying zero traffic for >72h."""
+    now = ctx["now"]
+    for lane, last_ts in ctx["lane_last_seen"].items():
+        if ctx["lane_counts_48h"].get(lane, 0) == 0 and (now - last_ts) > INSIGHTS_L4_ZOMBIE_H * 3600:
+            hrs = (now - last_ts) / 3600
+            return (f"SUGGEST {lane} zombie — zero traffic for {hrs:.0f}h, "
+                    f"reclaim or reweight")
+    return None
+
+
+def rule_c1_cache_worth(ctx) -> Optional[str]:
+    """C1: cache-worth — zero cache hits over many calls."""
+    if ctx["cache_stats"] is None:
+        return None  # cache_hit column absent — graceful skip
+    total, hits = ctx["cache_stats"]
+    if total < INSIGHTS_C1_MIN_CALLS:
+        return None
+    if hits == 0:
+        return (f"SUGGEST semantic cache 0 hits/{total} calls (48h) — "
+                f"enable/tune or drop")
+    return None
+
+
+def rule_c3_runaway_session(ctx) -> Optional[str]:
+    """C3: runaway session — single session consuming >> median."""
+    if ctx["session_stats"] is None:
+        return None
+    n, avg, mx = ctx["session_stats"]
+    if n < 10 or avg <= 0:
+        return None
+    if mx > INSIGHTS_C3_MULT * avg:
+        return (f"SUGGEST runaway session — top session {mx} calls vs avg {avg:.0f} "
+                f"({n} sessions, 48h)")
+    return None
+
+
+def rule_m1_mix_drift(ctx) -> Optional[str]:
+    """M1: model-mix drift — share change WoW (7d vs 48h) beyond threshold."""
+    if not ctx["model_counts_7d"] or not ctx["model_counts_48h"]:
+        return None
+    tot7 = sum(ctx["model_counts_7d"].values())
+    tot48 = sum(ctx["model_counts_48h"].values())
+    if tot7 <= 0 or tot48 <= 0:
+        return None
+    for model, c7 in ctx["model_counts_7d"].items():
+        share7 = c7 / tot7
+        if share7 < INSIGHTS_M1_MIN_SHARE:
+            continue
+        c48 = ctx["model_counts_48h"].get(model, 0)
+        share48 = c48 / tot48
+        delta_pp = (share48 - share7) * 100
+        if abs(delta_pp) >= INSIGHTS_M1_PP:
+            direction = "up" if delta_pp > 0 else "down"
+            return (f"SUGGEST model-mix drift — {model} share {share7*100:.0f}%→"
+                    f"{share48*100:.0f}% ({direction} {abs(delta_pp):.0f}pp WoW)")
+    return None
+
+
+def rule_m2_model_lane_mismatch(ctx) -> Optional[str]:
+    """M2: expensive model on a paid lane while a flat lane sits idle."""
+    # Find flat lanes with zero traffic.
+    flat_idle = [l for l, e in ctx["lane_registry"].items()
+                 if e.get("kind") == "flat" and ctx["lane_counts_48h"].get(l, 0) == 0]
+    if not flat_idle:
+        return None
+    # Find paid/quota lanes carrying traffic.
+    for model, lanes in ctx["model_lane_48h"].items():
+        for lane, cnt in lanes.items():
+            tier = ctx["tiers"].get(lane, "per_token")
+            if tier in ("quota", "per_token") and cnt >= INSIGHTS_MIN_CALLS:
+                return (f"SUGGEST {model} on {lane} (paid) while {flat_idle[0]} "
+                        f"(flat) idle — consider reweight")
+    return None
+
+
+def rule_q2_latency_outlier(ctx) -> Optional[str]:
+    """Q2: latency outlier — a model's avg latency >> overall avg."""
+    if ctx["overall_avg_ms"] is None or ctx["overall_avg_ms"] <= 0:
+        return None
+    for model, (calls, avg_ms) in ctx["model_latency_48h"].items():
+        if calls < INSIGHTS_Q2_MIN_CALLS:
+            continue
+        if avg_ms > INSIGHTS_Q2_MULT * ctx["overall_avg_ms"]:
+            return (f"SUGGEST {model} avg {avg_ms/1000:.1f}s/call vs overall "
+                    f"{ctx['overall_avg_ms']/1000:.1f}s — slow lane or giant context")
+    return None
+
+
+def rule_n1_task_type_nag(ctx) -> Optional[str]:
+    """N1: task_type NAG — most calls lack task_type (weekly dedupe)."""
+    if ctx["task_type_stats"] is None:
+        return None  # task_type column absent — graceful skip
+    total, null_calls = ctx["task_type_stats"]
+    if total < INSIGHTS_MIN_CALLS:
+        return None
+    if null_calls / total >= INSIGHTS_N1_NULL_PCT:
+        return (f"NAG {null_calls/total*100:.1f}% of calls lack task_type — "
+                f"1-line router fix unlocks per-task cost")
+    return None
+
+
+def rule_e1_weekly_over_budget(ctx) -> Optional[str]:
+    """E1: weekly over-budget projection from the /quota payload."""
+    for lane, info in ctx["quota_payload"].items():
+        if not isinstance(info, dict):
+            continue
+        for pred in info.get("predictions", []):
+            if pred.get("window") != "weekly":
+                continue
+            if pred.get("will_exhaust") and pred.get("projected_total_pct", 0) >= INSIGHTS_E1_OVER_PCT:
+                return (f"ALERT {lane} weekly projected {pred['projected_total_pct']:.0f}% "
+                        f"of quota — over budget, reweight now")
+    return None
+
+
+def rule_m3_heavy_on_locked_lane(ctx) -> Optional[str]:
+    """M3: heavy traffic on a locked / over-budget lane while a cheaper twin idles.
+
+    Catches the "54% of traffic on 'ours' while z.ai quota probe inactive" case:
+    a quota lane that is locked (weekly 100%) or over-budget still carries a
+    large share of 48h traffic, while a same-tier twin (e.g. ollama_cloud) has
+    headroom. Suggests reweighting off the exhausted lane.
+    """
+    # Identify locked / over-budget quota lanes from the payload.
+    locked = set()
+    for lane, info in ctx["quota_payload"].items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("locked") or info.get("locked_pct", 0) >= 100:
+            locked.add(lane)
+        for pred in info.get("predictions", []):
+            if pred.get("window") == "weekly" and pred.get("will_exhaust"):
+                locked.add(lane)
+    if not locked:
+        return None
+
+    total = sum(ctx["lane_counts_48h"].values())
+    if total <= 0:
+        return None
+    for lane in locked:
+        cnt = ctx["lane_counts_48h"].get(lane, 0)
+        share = cnt / total
+        if share >= 0.30:  # >=30% of traffic on an exhausted lane
+            return (f"SUGGEST {share*100:.0f}% of 48h traffic on {lane} (locked/"
+                    f"over-budget) — reweight to a lane with headroom")
+    return None
+
+
+# All rules, in display order. Each returns a line string or None.
+_INSIGHT_RULES = [
+    rule_l2_lane_exhaust,      # ALERT
+    rule_e1_weekly_over_budget,  # ALERT
+    rule_l3_days_to_zero_ols,  # EST
+    rule_l1_idle_twin,         # SUGGEST
+    rule_l4_zombie_key,        # SUGGEST
+    rule_c1_cache_worth,       # SUGGEST
+    rule_c3_runaway_session,   # SUGGEST
+    rule_m1_mix_drift,         # SUGGEST
+    rule_m2_model_lane_mismatch,  # SUGGEST
+    rule_m3_heavy_on_locked_lane,  # SUGGEST
+    rule_q2_latency_outlier,   # SUGGEST
+    rule_n1_task_type_nag,     # NAG
+]
+
+
+def _load_nag_state(path) -> dict:
+    path = Path(path)
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_nag_state(path, state: dict):
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def render_insights(mode: str = "daily", ctx: Optional[dict] = None,
+                    nag_state_file: Optional[Path] = None) -> str:
+    """V11: triggered-only ASCII insights strip.
+
+    Returns an empty string when no rule fires. ``mode`` is "hourly" (red-only
+    ALERT, <=3 lines) or "daily" (<=12 lines, ~1900 chars). NAG rules are
+    deduped weekly via a persistent state file.
+    """
+    if ctx is None:
+        ctx = _build_insights_ctx()
+
+    if nag_state_file is None:
+        nag_state_file = DEFAULT_OUTDIR / "insights-nag-state.json"
+
+    lines = []
+    for rule in _INSIGHT_RULES:
+        try:
+            out = rule(ctx)
+        except Exception:
+            continue  # a rule must never crash the strip
+        if not out:
+            continue
+        # A rule may return multiple lines (e.g. L2 one ALERT per exhausted lane).
+        for ln in out.split("\n"):
+            if ln.strip():
+                lines.append(ln)
+
+    # NAG weekly dedupe.
+    if nag_state_file is not None:
+        state = _load_nag_state(nag_state_file)
+        week = int(ctx["now"] // (7 * 86400))
+        deduped = []
+        for line in lines:
+            if line.startswith("NAG"):
+                key = line.split(" ", 1)[0] + ":" + line.split(" ", 1)[1][:40]
+                if state.get(key) == week:
+                    continue  # already nagged this week
+                state[key] = week
+                deduped.append(line)
+            else:
+                deduped.append(line)
+        lines = deduped
+        _save_nag_state(nag_state_file, state)
+
+    if not lines:
+        return ""
+
+    if mode == "hourly":
+        # Red-only (ALERT) and <= 3 lines.
+        lines = [l for l in lines if l.startswith("ALERT")][:3]
+    else:
+        # Daily: <= 12 lines, ~1900 chars.
+        lines = lines[:12]
+
+    if not lines:
+        return ""
+
+    strip = "\n".join(lines)
+    if len(strip) > 1900:
+        strip = strip[:1900]
+    return strip
+
+
 def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
     """Render all visualizations. Returns list of output file paths."""
     if outdir is None:
@@ -798,6 +1305,17 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
     ascii_text = render_ascii()
     (outdir / "ascii-summary.txt").write_text(ascii_text)
     rendered.append(outdir / "ascii-summary.txt")
+
+    # V11: ASCII insights strip — triggered-only, prepended to the digest.
+    # Silent (empty) when no rule fires. Written to insights-strip.txt so the
+    # sender can prepend it to the digest message.
+    try:
+        insights = render_insights(mode="daily")
+        (outdir / "insights-strip.txt").write_text(insights)
+        if insights:
+            rendered.append(outdir / "insights-strip.txt")
+    except Exception as e:
+        print(f"V11 insights: {e}", file=sys.stderr)
 
     # B4 (provider-clock-alignment): shadow validation — log rolling vs
     # anchored weekly % for any provider with a known anchor. Hourly cron
@@ -869,3 +1387,8 @@ if __name__ == "__main__":
         print(f"  {f}")
     print()
     print(render_ascii())
+    print()
+    insights = render_insights(mode="daily")
+    if insights:
+        print("── INSIGHTS ──")
+        print(insights)

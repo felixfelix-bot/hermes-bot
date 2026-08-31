@@ -157,11 +157,18 @@ class TestThresholdEnvVars(unittest.TestCase):
 
     def test_insights_l3_days_envable(self):
         """INSIGHTS_L3_DAYS loads from env VIZ_L3_DAYS."""
+        # Load a fresh module straight off the worktree path under a unique name
+        # so the read isn't polluted by (a) other viz test files overwriting
+        # sys.modules["price_viz"] with their own module object, nor (b) the
+        # shared ~/.hermes/bot live tree getting reloaded instead of this copy.
+        # importlib.reload() on the file-level module object is too fragile for
+        # that — a hermetic exec_module from REPO_ROOT is deterministic.
+        import importlib.util as _iu
         with patch.dict(os.environ, {"VIZ_L3_DAYS": "7.5"}):
-            import importlib
-            importlib.reload(price_viz)
-            self.assertEqual(price_viz.INSIGHTS_L3_DAYS, 7.5)
-        importlib.reload(price_viz)  # restore defaults
+            _spec = _iu.spec_from_file_location("price_viz_envtest", REPO_ROOT / "price_viz.py")
+            _m = _iu.module_from_spec(_spec)
+            _spec.loader.exec_module(_m)
+            self.assertEqual(_m.INSIGHTS_L3_DAYS, 7.5)
 
 
 # ── Helpers (mirror the other viz test files) ─────────────────────────────

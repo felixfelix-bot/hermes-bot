@@ -5,9 +5,9 @@
 #   send-viz-signal.sh [--digest] [--plot NAME] [--message "text"]
 #
 # Modes:
-#   (default)   Send all 4 plots + ASCII summary table
+#   (default)   Send all plots + ASCII summary table
 #   --digest    Send envelope + quota-heatmap + ASCII (daily digest)
-#   --plot NAME Send a single named plot (price-envelope|price-heatmap|quota-heatmap|surface-ollama_cloud)
+#   --plot NAME Send a single named plot (price-envelope|price-heatmap|quota-heatmap|headroom-weekly)
 #
 # signal-cli daemon v0.14.5 on 127.0.0.1:8080 supports attachments as local file paths.
 
@@ -64,7 +64,6 @@ DEFAULT_PLOTS=(
     "$VIZ_DIR/price-envelope.png"
     "$VIZ_DIR/price-heatmap.png"
     "$VIZ_DIR/quota-heatmap.png"
-    "$VIZ_DIR/surface-ollama_cloud.png"
     "$VIZ_DIR/headroom-weekly.png"
 )
 DIGEST_PLOTS=(

@@ -11,8 +11,13 @@ Visualizations:
   V1: 2D price-vs-quota envelope curves (LOG/LINEAR toggle)
   V2: Price heatmap (time × provider, LogNorm)
   V3: Quota heatmap (time × provider, linear 0-100%)
-  V4: 3D surface (session × weekly → price, per provider)
   V7: ASCII block for Signal/terminal embedding
+  V8b: Dynamic 2-panel headroom (token lanes + USD balance lanes)
+  V9: Model-mix 7d stacked area (tokens by model)
+  V10: Model x lane stacked bars (with $/M column)
+  V11: ASCII insights strip (triggered-only suggestion engine)
+  (V4 3D pressure surface retired — theoretical single-provider model, no
+   measured data; message already covered by V1 y-axis.)
 
 Usage:
   python3 price_viz.py [--linear] [--outdir DIR]
@@ -166,17 +171,11 @@ def load_quota_series(hours_back: int = 48) -> dict[str, list[tuple[float, float
         pass
 
     # --- Fallback: synthesize from api_calls for quota-tier providers ---
-    # Mirror load_current_quota_state's limits (2M/14M for ours+friend,
-    # 500M/3.5B for general quota/included/flat providers).
-    QUOTA_LIMITS = {
-        "ours":           (2_000_000,    14_000_000),
-        "friend":         (2_000_000,    14_000_000),
-        "ollama_cloud":   (500_000_000, 3_500_000_000),
-        "ollama_cloud_2": (500_000_000, 3_500_000_000),
-        "opencode_go":    (500_000_000, 3_500_000_000),
-    }
+    # Limits come from LANE_REGISTRY_STATIC (single source of truth) via
+    # _lane_limits — the hardcoded QUOTA_LIMITS dict is retired.
+    registry = dict(LANE_REGISTRY_STATIC)
     for prov in ("ours", "friend", "ollama_cloud", "ollama_cloud_2", "opencode_go"):
-        sess_limit, weekly_limit = QUOTA_LIMITS.get(prov, (5_000_000, 35_000_000))
+        sess_limit, weekly_limit = _lane_limits(prov, registry)
         synth: list[tuple[float, float]] = []
         try:
             udb = _connect_usage_db()
@@ -232,6 +231,7 @@ def load_current_quota_state() -> dict[str, float]:
     db.row_factory = sqlite3.Row
     now = time.time()
     result = {}
+    registry = dict(LANE_REGISTRY_STATIC)
     for provider in PROVIDER_TIER:
         if PROVIDER_TIER[provider] in ("quota", "flat", "included"):
             sess_start = now - 5 * 3600     # session stays rolling (no provider publishes a session anchor)
@@ -244,11 +244,7 @@ def load_current_quota_state() -> dict[str, float]:
                 "SELECT COALESCE(SUM(total_tokens), 0) as t FROM api_calls "
                 "WHERE key_name=? AND ts > ?", (provider, weekly_start)
             ).fetchone()["t"]
-            sess_limit = 500_000_000
-            weekly_limit = 3_500_000_000
-            if provider in ("ours", "friend"):
-                sess_limit = 2_000_000
-                weekly_limit = 14_000_000
+            sess_limit, weekly_limit = _lane_limits(provider, registry)
             sess_pct = min(100.0, sess_tokens / sess_limit * 100) if sess_limit > 0 else 0
             weekly_pct = min(100.0, weekly_tokens / weekly_limit * 100) if weekly_limit > 0 else 0
             result[provider] = max(sess_pct, weekly_pct) / 100.0
@@ -428,57 +424,6 @@ def render_quota_heatmap(outdir: Path) -> Path:
     return outpath
 
 
-def render_pressure_surface(outdir: Path, provider: str = "ollama_cloud", log_z: bool = True) -> Path:
-    """V4: 3D surface — session quota × weekly quota → price for a single provider."""
-    from mpl_toolkits.mplot3d import Axes3D
-
-    sess_vals = np.linspace(0, 1.2, 80)
-    weekly_vals = np.linspace(0, 1.2, 80)
-    S, W = np.meshgrid(sess_vals, weekly_vals)
-    Z = np.zeros_like(S)
-
-    onset = QUOTA_PRESSURE_ONSET
-    asymptote = QUOTA_PRESSURE_ASYMPTOTE
-    k = asymptote - 1.0
-
-    for i in range(len(sess_vals)):
-        for j in range(len(weekly_vals)):
-            s, w = S[i, j], W[i, j]
-            if s >= 1.0 or w >= 1.0:
-                Z[i, j] = MIN_EFFECTIVE_PRICE * asymptote
-            elif s > onset and w > onset:
-                ts = (s - onset) / (1.0 - onset)
-                tw = (w - onset) / (1.0 - onset)
-                fs = 1.0 + k * ts / max(1e-6, 1.0 - ts)
-                fw = 1.0 + k * tw / max(1e-6, 1.0 - tw)
-                Z[i, j] = MIN_EFFECTIVE_PRICE * fs * fw
-            elif s > onset:
-                ts = (s - onset) / (1.0 - onset)
-                Z[i, j] = MIN_EFFECTIVE_PRICE * (1.0 + k * ts / max(1e-6, 1.0 - ts))
-            elif w > onset:
-                tw = (w - onset) / (1.0 - onset)
-                Z[i, j] = MIN_EFFECTIVE_PRICE * (1.0 + k * tw / max(1e-6, 1.0 - tw))
-            else:
-                Z[i, j] = MIN_EFFECTIVE_PRICE
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    surf = ax.plot_surface(S * 100, W * 100, Z, cmap="YlOrRd", alpha=0.7,
-                           linewidth=0, antialiased=True)
-    ax.set_xlabel("Session Quota (%)")
-    ax.set_ylabel("Weekly Quota (%)")
-    ax.set_zlabel("$/M tokens")
-    ax.set_title(f"Pressure Surface — {provider}" + (" (log z)" if log_z else " (linear z)"))
-    if log_z:
-        ax.set_zscale("log")
-    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label="$/M")
-
-    outpath = outdir / f"surface-{provider}.png"
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return outpath
-
-
 def render_ascii() -> str:
     """V7: ASCII block for Signal/terminal embedding.
 
@@ -550,17 +495,39 @@ def render_ascii() -> str:
 # /quota payload overlays used_pct/remaining and absorbs any extra lanes it
 # carries that aren't in the static registry.
 
+# ``capacity`` is the weekly token limit for token kind lanes (single source
+# of truth — replaces the old hardcoded QUOTA_LIMITS dict in the loaders).
+# ``session_capacity`` is the rolling 5h session cap used by load_current_
+# quota_state for the max(session, weekly) usage fraction. Flat lanes carry
+# numeric caps too (they ARE token-capped at the same 3.5B/500M as the other
+# z.ai general lanes) but are rendered as a hatched band, never stacked.
 LANE_REGISTRY_STATIC = {
-    "ours":           {"kind": "token", "capacity": 14_000_000},
-    "friend":         {"kind": "token", "capacity": 14_000_000},
-    "ollama_cloud":   {"kind": "token", "capacity": 3_500_000_000},
-    "ollama_cloud_2": {"kind": "token", "capacity": 3_500_000_000},
-    "opencode_go":    {"kind": "flat",  "capacity": None},
-    "neuralwatt":     {"kind": "usd",   "capacity": None},
-    "routstrd":       {"kind": "usd",   "capacity": None},
-    "telnyx":         {"kind": "usd",   "capacity": None},
-    "ppq":            {"kind": "usd",   "capacity": None},
+    "ours":           {"kind": "token", "capacity": 14_000_000,     "session_capacity": 2_000_000},
+    "friend":         {"kind": "token", "capacity": 14_000_000,     "session_capacity": 2_000_000},
+    "ollama_cloud":   {"kind": "token", "capacity": 3_500_000_000,  "session_capacity": 500_000_000},
+    "ollama_cloud_2": {"kind": "token", "capacity": 3_500_000_000,  "session_capacity": 500_000_000},
+    "opencode_go":    {"kind": "flat",  "capacity": 3_500_000_000,  "session_capacity": 500_000_000},
+    "neuralwatt":     {"kind": "usd",   "capacity": None,           "session_capacity": None},
+    "routstrd":       {"kind": "usd",   "capacity": None,           "session_capacity": None},
+    "telnyx":         {"kind": "usd",   "capacity": None,           "session_capacity": None},
+    "ppq":            {"kind": "usd",   "capacity": None,           "session_capacity": None},
 }
+
+# Fallbacks for a lane absent from the registry (shouldn't happen in practice).
+_DEFAULT_WEEKLY_LIMIT = 3_500_000_000
+_DEFAULT_SESSION_LIMIT = 500_000_000
+
+
+def _lane_limits(lane: str, registry: dict) -> tuple[int, int]:
+    """Return (session_limit, weekly_limit) for a lane from the registry.
+
+    Single source of truth; falls back to the generic z.ai general-lane caps
+    only when the lane is absent entirely (never for a registry present lane).
+    """
+    entry = registry.get(lane) or {}
+    sess = entry.get("session_capacity") or _DEFAULT_SESSION_LIMIT
+    wkly = entry.get("capacity") or _DEFAULT_WEEKLY_LIMIT
+    return int(sess), int(wkly)
 
 QUOTA_ENDPOINT = "http://localhost:9099/quota"
 
@@ -590,11 +557,11 @@ def build_lane_registry(payload: Optional[dict]) -> dict:
             if lane not in reg:
                 # Unknown lane from payload — classify by shape.
                 if "remaining_usd" in info or "total_credits_usd" in info:
-                    reg[lane] = {"kind": "usd", "capacity": None}
+                    reg[lane] = {"kind": "usd", "capacity": None, "session_capacity": None}
                 elif info.get("regime") == "included":
-                    reg[lane] = {"kind": "flat", "capacity": None}
+                    reg[lane] = {"kind": "flat", "capacity": None, "session_capacity": None}
                 else:
-                    reg[lane] = {"kind": "token", "capacity": None}
+                    reg[lane] = {"kind": "token", "capacity": None, "session_capacity": None}
     return reg
 
 
@@ -986,18 +953,22 @@ def render_model_by_lane(outdir: Path) -> Path:
 # gracefully skips when the column is absent. cached_tokens is NOT in the live
 # schema and is never assumed.
 
-# Rule thresholds (tunable via env for T4 later).
+# Rule thresholds (all tunable via env; defaults documented inline).
+# These are the 14 suggestion-engine thresholds from VIZ-P0B plus the two
+# min-sample / share floor constants that keep rules false-positive damped.
 INSIGHTS_MIN_CALLS = int(os.environ.get("VIZ_INSIGHTS_MIN_CALLS", "100"))
 INSIGHTS_L1_IDLE_PCT = float(os.environ.get("VIZ_L1_IDLE_PCT", "0.05"))   # twin < 5% used
 INSIGHTS_L1_ACTIVE_PCT = float(os.environ.get("VIZ_L1_ACTIVE_PCT", "0.20"))  # twin > 20% used
 INSIGHTS_L2_EXHAUST_PCT = float(os.environ.get("VIZ_L2_EXHAUST_PCT", "0.90"))
 INSIGHTS_L3_MIN_SAMPLES = int(os.environ.get("VIZ_L3_MIN_SAMPLES", "48"))
-INSIGHTS_L3_DAYS = int(os.environ.get("VIZ_L3_DAYS", "14"))
+INSIGHTS_L3_DAYS = float(os.environ.get("VIZ_L3_DAYS", "14.0"))  # days-to-zero trigger
 INSIGHTS_L4_ZOMBIE_H = float(os.environ.get("VIZ_L4_ZOMBIE_H", "72"))
 INSIGHTS_C1_MIN_CALLS = int(os.environ.get("VIZ_C1_MIN_CALLS", "1000"))
 INSIGHTS_C3_MULT = float(os.environ.get("VIZ_C3_MULT", "10.0"))
+INSIGHTS_C3_MIN_SESSIONS = int(os.environ.get("VIZ_C3_MIN_SESSIONS", "10"))
 INSIGHTS_M1_PP = float(os.environ.get("VIZ_M1_PP", "15.0"))
 INSIGHTS_M1_MIN_SHARE = float(os.environ.get("VIZ_M1_MIN_SHARE", "0.05"))
+INSIGHTS_M3_MIN_SHARE = float(os.environ.get("VIZ_M3_MIN_SHARE", "0.30"))  # >=30% traffic on locked lane
 INSIGHTS_Q2_MULT = float(os.environ.get("VIZ_Q2_MULT", "2.0"))
 INSIGHTS_Q2_MIN_CALLS = int(os.environ.get("VIZ_Q2_MIN_CALLS", "50"))
 INSIGHTS_N1_NULL_PCT = float(os.environ.get("VIZ_N1_NULL_PCT", "0.90"))
@@ -1220,7 +1191,7 @@ def rule_l3_days_to_zero_ols(ctx) -> Optional[str]:
         days = last / (-slope * 86400)
         if days < 0:
             continue
-        if days <= 14:  # only surface when meaningful
+        if days <= INSIGHTS_L3_DAYS:  # only surface when meaningful
             return (f"EST {lane} balance ${last:.2f} draining at ${-slope*86400:.2f}/day "
                     f"→ ~{days:.0f} days to zero (OLS, {n} samples)")
     return None
@@ -1255,7 +1226,7 @@ def rule_c3_runaway_session(ctx) -> Optional[str]:
     if ctx["session_stats"] is None:
         return None
     n, avg, mx = ctx["session_stats"]
-    if n < 10 or avg <= 0:
+    if n < INSIGHTS_C3_MIN_SESSIONS or avg <= 0:
         return None
     if mx > INSIGHTS_C3_MULT * avg:
         return (f"SUGGEST runaway session — top session {mx} calls vs avg {avg:.0f} "
@@ -1369,7 +1340,7 @@ def rule_m3_heavy_on_locked_lane(ctx) -> Optional[str]:
     for lane in locked:
         cnt = ctx["lane_counts_48h"].get(lane, 0)
         share = cnt / total
-        if share >= 0.30:  # >=30% of traffic on an exhausted lane
+        if share >= INSIGHTS_M3_MIN_SHARE:  # >= threshold share of traffic on an exhausted lane
             return (f"SUGGEST {share*100:.0f}% of 48h traffic on {lane} (locked/"
                     f"over-budget) — reweight to a lane with headroom")
     return None
@@ -1498,11 +1469,6 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
             rendered.append(p)
     except Exception as e:
         print(f"V3 quota heatmap: {e}", file=sys.stderr)
-    try:
-        p = render_pressure_surface(outdir, provider="ollama_cloud", log_z=log_y)
-        rendered.append(p)
-    except Exception as e:
-        print(f"V4 surface: {e}", file=sys.stderr)
 
     # ASCII always
     ascii_text = render_ascii()

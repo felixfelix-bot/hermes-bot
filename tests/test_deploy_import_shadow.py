@@ -42,12 +42,19 @@ class CleanImportTests(unittest.TestCase):
         """Shadow optimizer is a non-None instance (initialized at import time)."""
         self.assertIsNotNone(z._shadow_optimizer, "shadow optimizer is None — init failed")
 
-    def test_kill_switch_absent(self):
-        """.enable_live_routing must be absent (Phase 1: shadow-only)."""
+    def test_enable_live_routing_present(self):
+        """.enable_live_routing must be PRESENT (Phase 3: flat router primary).
+
+        The Phase-3 cutover (2026-08-24) made the flat router the primary
+        routing system, and zai-proxy.service touches this flag in
+        ExecStartPost. The original Phase-1 test asserted absence
+        (shadow-only); that invariant was inverted at cutover and this test
+        had been failing stale ever since.
+        """
         flag = z._LIVE_ROUTING_FLAG
-        self.assertFalse(
+        self.assertTrue(
             os.path.exists(flag),
-            f"Kill switch {flag} found — should be absent for shadow mode",
+            f"Kill switch {flag} missing — live routing disabled?",
         )
 
 

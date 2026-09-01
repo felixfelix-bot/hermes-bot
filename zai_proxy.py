@@ -4667,17 +4667,46 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(resp.status)
                 self._response_started = True  # response bytes committed — no retry
                 for h, v in resp.headers.items():
-                    if h.lower() not in ("transfer-encoding", "connection"):
+                    if h.lower() not in ("transfer-encoding", "connection", "content-length"):
                         self.send_header(h, v)
                 self.send_header("X-Provider", key_name)
-                self.end_headers()
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    response_buffer.extend(chunk)
-                    self.wfile.write(chunk)
+                # FIX-1b (2026-09-02): ollama reasoning models (glm-5.3,
+                # qwen3.5:397b, ...) can spend the entire completion budget
+                # in the separate "reasoning" field and return content="" —
+                # clients that only read message.content then store empty
+                # assistant turns (the degenerate-delegate mechanism from
+                # tonight's incidents). For NON-streaming requests, buffer
+                # the body and inject reasoning into content before
+                # forwarding (same treatment _try_zai_key gives
+                # "reasoning_content"). Streaming requests forward unchanged.
+                if not body_json.get("stream"):
+                    full_body = resp.read()
+                    try:
+                        resp_json = json.loads(full_body.decode("utf-8", errors="ignore"))
+                        _msg = (resp_json.get("choices") or [{}])[0].get("message", {})
+                        _content = _msg.get("content", "")
+                        if not _content or not _content.strip():
+                            _reason = (_msg.get("reasoning_content")
+                                      or _msg.get("reasoning") or "")
+                            if isinstance(_reason, str) and _reason.strip():
+                                _msg["content"] = _reason
+                                full_body = json.dumps(resp_json).encode()
+                    except Exception:
+                        pass
+                    response_buffer.extend(full_body)
+                    self.send_header("Content-Length", str(len(full_body)))
+                    self.end_headers()
+                    self.wfile.write(full_body)
                     self.wfile.flush()
+                else:
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        response_buffer.extend(chunk)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
 
                 # Parse usage for spend tracking
                 ollama_usage = _parse_usage(bytes(response_buffer))
@@ -4798,8 +4827,14 @@ class Handler(BaseHTTPRequestHandler):
                                 if finish_reason == "length":
                                     is_truncated = True
                                 if not content or not content.strip():
-                                    reasoning = msg_obj.get("reasoning_content", "")
-                                    if reasoning and reasoning.strip():
+                                    # FIX-1 (2026-09-02): z.ai names the field
+                                    # "reasoning_content"; ollama + neuralwatt
+                                    # name it "reasoning". Accept either so
+                                    # ollama-routed glm responses with
+                                    # content="" are not treated as empty.
+                                    reasoning = (msg_obj.get("reasoning_content")
+                                                 or msg_obj.get("reasoning") or "")
+                                    if isinstance(reasoning, str) and reasoning.strip():
                                         msg_obj["content"] = reasoning
                                         full_body = json.dumps(resp_json).encode()
                                         is_empty = False
@@ -6207,8 +6242,12 @@ class Handler(BaseHTTPRequestHandler):
                                         if not content or not content.strip():
                                             # Content is empty — check if reasoning
                                             # has value we can use instead
-                                            reasoning = msg_obj.get("reasoning_content", "")
-                                            if reasoning and reasoning.strip():
+                                            # FIX-1 (2026-09-02): also accept the
+                                            # ollama/neuralwatt field name "reasoning"
+                                            # (z.ai uses "reasoning_content").
+                                            reasoning = (msg_obj.get("reasoning_content")
+                                                         or msg_obj.get("reasoning") or "")
+                                            if isinstance(reasoning, str) and reasoning.strip():
                                                 # Inject reasoning as content so
                                                 # the tokens aren't wasted
                                                 msg_obj["content"] = reasoning

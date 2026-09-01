@@ -1680,6 +1680,52 @@ def _snapshot_quota() -> dict:
         pass
     return snap
 
+# ── Ollama pool-weighted key ordering (2026-09-02, plan B1) ──────────────────
+# Orders _OLLAMA_CLOUD_KEYS by REMAINING quota (most remaining first) so the
+# dispatcher equalizes burn across subscriptions. Falls back to the static
+# registration order on any error. Oc3's monthly scarcity gate and per-key
+# disable flags still apply per attempt inside _try_ollama_cloud — ordering
+# only decides WHO is tried first, never bypasses protection.
+_ollama_order_cache: dict = {"order": None, "ts": 0.0}
+_OLLAMA_ORDER_TTL = 120.0  # seconds — quota snapshots are not free
+
+
+def _ollama_cloud_key_order() -> list[tuple[str, str]]:
+    """Return (key_name, api_key) pairs ordered by remaining quota (desc).
+
+    Uses a TTL-cached slice of _snapshot_quota() for the three ollama keys.
+    Unknown remaining (inf / missing data) sorts LAST (conservative), and
+    the static registration order breaks ties.
+    """
+    now = time.time()
+    cached = _ollama_order_cache.get("order")
+    if cached and now - _ollama_order_cache["ts"] < _OLLAMA_ORDER_TTL:
+        return cached
+    base = list(_OLLAMA_CLOUD_KEYS)  # (name, key) pairs, static registration order
+    order = base
+    try:
+        rem: dict[str, float] = {}
+        for name, _key in base:
+            status = _get_ollama_quota_status(name)
+            if name == "ollama_cloud_3":
+                used_pct = float(status.get("monthly_used_pct", 0.0))
+                total = status.get("monthly_tokens", 0) or 0
+            else:
+                used_pct = max(float(status.get("session_used_pct", 0.0)),
+                               float(status.get("weekly_used_pct", 0.0)))
+                total = _OC_SESSION_LIMIT
+            if _ollama_paywall_active(name):
+                used_pct = 100.0  # paywalled → zero remaining → sinks last
+            rem[name] = (total * (1.0 - used_pct / 100.0)) if total else 0.0
+        base_pos = {name: i for i, (name, _k) in enumerate(base)}
+        order = sorted(
+            base,
+            key=lambda nk: (-rem.get(nk[0], 0.0), base_pos[nk[0]]))
+    except Exception:
+        order = base
+    _ollama_order_cache.update({"order": order, "ts": now})
+    return order
+
 def _snapshot_health() -> dict:
     """Snapshot health state for all providers. Thread-safe read."""
     h = {}
@@ -1713,10 +1759,38 @@ def _snapshot_health() -> dict:
         h["openrouter"] = True
         h["telnyx"] = _is_key_healthy("telnyx")
         h["routstr"] = _is_key_healthy("routstr")
-        h["routstrd"] = _is_key_healthy("routstrd")
+        # DAILY SUB-CAP for routstrd (2026-09-02, plan B3): routstrd is the
+        # cheapest METERED provider ($0.53/M measured), so during ollama
+        # burst-flaps it became the default overflow catch-basin — $47.67 of
+        # real Cashu over 7 days (2026-08-26→09-02). This doesn't distort the
+        # cost ordering (routstrd stays cheapest-metered when healthy); it just
+        # self-demotes the key for the rest of the UTC day once it has burned
+        # ROUTSTRD_DAILY_CAP of real cash, mirroring the neuralwatt daily-cap
+        # guardrail pattern. The ollama pool rebalance (B1) upstream makes
+        # hitting this cap rare.
+        h["routstrd"] = _is_key_healthy("routstrd") and not _routstrd_daily_cap_tripped()
     except Exception:
         pass
     return h
+
+
+def _routstrd_daily_cap_tripped(cap: float | None = None) -> bool:
+    """True when today's routstrd metered spend exceeded its sub-cap.
+
+    env ROUTSTRD_DAILY_CAP (USD/day, default 10.0). Reads the daily_spend
+    tier row (UTC day). Never raises — on any DB error returns False so
+    routing is never broken by the guard.
+    """
+    try:
+        _cap = float(cap if cap is not None
+                     else os.environ.get("ROUTSTRD_DAILY_CAP", "10.0"))
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = _usage_db().execute(
+            "SELECT spend_usd FROM daily_spend WHERE date=? AND tier='routstrd'",
+            (today,)).fetchone()
+        return bool(row and row[0] and float(row[0]) >= _cap)
+    except Exception:
+        return False
 
 
 def _snapshot_failures() -> dict[str, int]:
@@ -3217,6 +3291,15 @@ def _estimate_cost_usd(key_name: str | None, total_tokens: int,
         return 0.0
     if key_name == "ollama_cloud":
         cost_per_1m = _get_ollama_cloud_cost_per_1m()
+    elif key_name == "ollama_cloud_3":
+        # 2026-09-02 (plan B2): oc3 shares the $20/mo ollama plan family and
+        # the same marginal $/M (~$0.0155/M measured). Its own tracker entry
+        # has no independent measured basis, and UNKNOWN_PROVIDER_FALLBACK
+        # ($1.00/M) poisoned its attributed rows on 2026-09-01/02 ($9.8/day
+        # phantom spend corrupting dashboards and the cost governor's ratio
+        # inputs). Attribute at the measured oc-family rate; scarcity gating
+        # for oc3 stays where it belongs (monthly-budget dispatch guard).
+        cost_per_1m = _rpt_rate("ollama_cloud")
     elif key_name == "neuralwatt" and model:
         # Try exact match, then stripped prefix (deepseek/deepseek-v4-flash → deepseek-v4-flash)
         rates = NEURALWATT_RATES.get(model) or NEURALWATT_RATES.get(model.split("/")[-1])
@@ -4909,10 +4992,19 @@ class Handler(BaseHTTPRequestHandler):
                                reason: str | None = None) -> bool:
         """Try all registered Ollama Cloud keys until one succeeds.
 
-        Iterates over (key_name, api_key) pairs in _OLLAMA_CLOUD_KEYS.
+        Iterates over (key_name, api_key) pairs in _ollama_cloud_key_order()
+        — pool-weighted (most remaining quota first) since 2026-09-02 (plan
+        B1). The previous static [oc, oc2, oc3-LAST] order drained oc at
+        2.3× its weekly pool (1,143M tokens/7d vs ~500M/wk nominal) while
+        oc2/oc3 sat nearly idle — a root cause of the ollama-burst flapping
+        that spilled metered traffic into routstrd. Remaining-pool ordering
+        equalizes burn across subscriptions (~800M tokens/wk of paid-but-
+        unused combined capacity recovered) without touching the per-key
+        scarcity guards (oc3 monthly gate, .key_disabled_* flags, per-key
+        disable) — those still apply inside _try_ollama_cloud per attempt.
         Returns True on the first success, False if all keys fail.
         """
-        for _kn, _kk in _OLLAMA_CLOUD_KEYS:
+        for _kn, _kk in _ollama_cloud_key_order():
             if not _kk:
                 continue
             if self._try_ollama_cloud(body, model, response_buffer, t0,

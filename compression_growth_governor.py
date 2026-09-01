@@ -5,7 +5,12 @@ Tracks the median context growth rate (tokens/call) from zai_usage.db
 using a 1-D Kalman filter. Adjusts compression.threshold via
 ``hermes config set`` based on whether sessions are dense (high growth →
 lower threshold → compact sooner) or sparse (low growth → raise threshold
-→ preserve context longer).
+→ preserve context longer), plus a bounded price-aware nudge from the
+realized $/M of recent traffic (expensive lanes compact sooner).
+
+2026-09-02 convergence fix: the target threshold is now computed from the
+BASE (FALLBACK_THRESHOLD), not the current value — the old form was an
+unbounded integrator that ratcheted every profile to MAX_THRESHOLD.
 
 **Multi-profile**: iterates over ALL profiles in ~/.hermes/profiles/*/
 and applies the same growth-rate-based threshold to each. The growth
@@ -54,8 +59,29 @@ MINIMUM_CONTEXT_LENGTH = 64000  # Hard floor in context_compressor
 
 # Safety bounds (MIN_THRESHOLD is dynamic: MINIMUM_CONTEXT_LENGTH / context_length)
 MAX_THRESHOLD = 0.70
-FALLBACK_THRESHOLD = 0.60
+# Calibrated 2026-09-02 from 0.60 → 0.45: the 0.60 base was tuned for the
+# 200k-ctx profile ecosystem; at 1M-ctx manager sessions a 0.60-0.70 fill is
+# the degeneration-risk zone (zombie tool-loops ballooned sessions to 12M
+# tokens there on 2026-09-01/02). Post RC-1 (reasoning-injection fix) the
+# thrash drivers are gone, so a mid-range base is safe and preserves context.
+FALLBACK_THRESHOLD = 0.45
 HYSTERESIS = 0.02          # Only change config if delta > this
+
+# Deliberate overrides: profiles the governor must NOT touch (hand-tuned
+# thresholds for specific lanes). 2026-09-02: kimi-consultant runs at a
+# deliberate 0.15 (aggressive compaction, cheap bursty lane) that the old
+# ratcheting governor kept stomping upward.
+EXEMPT_PROFILES: frozenset = frozenset({"kimi-consultant"})
+
+# ── Price-aware nudging (2026-09-02, plan C1) ────────────────────────────────
+# Compaction decisions should care about the REALIZED $/M of the traffic at
+# stake: expensive lanes make big contexts costly to re-prefill every call
+# (compact sooner); cheap lanes make context preservation nearly free (compact
+# later). A bounded, log-scaled nudge computed from recent provenance.
+PRICE_NUDGE_MAX = 0.10            # max threshold adjustment (positive = later compaction)
+PRICE_REF_USD_PER_M = 0.02        # reference realized price ($/M)
+PRICE_SATURATION_RATIO = 8.0      # price/ref ratio where the nudge saturates
+PRICE_MIN_TOKENS = 1_000_000      # need ≥1M tokens in window for a measurement
 
 # Growth-rate bounds
 G_BASELINE = 1800          # Measured average (tokens/call)
@@ -266,20 +292,77 @@ def compute_threshold(growth_rate: float, context_length: int,
 
     Control law (composes with cost governor)::
 
-        base = current_threshold or FALLBACK_THRESHOLD
-        threshold = base + K × (G_BASELINE − g_estimate)
+        threshold = FALLBACK + K × (G_BASELINE − g_estimate) − price_nudge
+
+    CONVERGENT (2026-09-02 fix): the target is computed from the BASE, NOT
+    from the current threshold. The original ``base = current_threshold``
+    made this an unbounded integrator (ratchet) — with a sparse-growth
+    estimate every run added the same +delta, drifting all 75 profiles to
+    MAX_THRESHOLD (0.7) within hours. The target now depends only on the
+    Kalman estimate (and the price nudge); ``current_threshold`` is retained
+    in the signature for compatibility but is ignored here — hysteresis in
+    :func:`apply_threshold` guards write churn.
 
     Dense sessions (high *g*) → lower threshold → compact sooner.
     Sparse sessions (low *g*) → raise threshold → preserve context.
+    Expensive lanes (high realized $/M) → compact sooner (price nudge).
 
     Result is clamped to ``[MIN_THRESHOLD, MAX_THRESHOLD]`` where
     ``MIN_THRESHOLD = MINIMUM_CONTEXT_LENGTH / context_length``.
     """
     min_threshold = MINIMUM_CONTEXT_LENGTH / context_length
-    base = current_threshold if current_threshold is not None else FALLBACK_THRESHOLD
     delta = K_SENSITIVITY * (G_BASELINE - growth_rate)
-    new_threshold = base + delta
+    new_threshold = FALLBACK_THRESHOLD + delta + _price_nudge()
     return max(min_threshold, min(MAX_THRESHOLD, new_threshold))
+
+
+def _realized_price_per_m(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> float | None:
+    """Measure realized $/M across recent successful traffic (all providers).
+
+    Returns None when there is insufficient data (< PRICE_MIN_TOKENS),
+    so the price nudge degrades to neutral (0.0) rather than guessing.
+    """
+    if not db_path.exists():
+        return None
+    try:
+        cutoff = time.time() - hours * 3600
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT SUM(cost_usd), SUM(total_tokens) FROM api_calls "
+            "WHERE ts >= ? AND status_code = 200 "
+            "AND cost_usd IS NOT NULL AND total_tokens > 0",
+            (cutoff,)).fetchone()
+        conn.close()
+        cost = float(row[0] or 0.0)
+        tokens = int(row[1] or 0)
+        if tokens < PRICE_MIN_TOKENS or cost <= 0:
+            return None
+        return cost / (tokens / 1_000_000)
+    except Exception:
+        return None
+
+
+def _price_nudge(price: float | None = None) -> float:
+    """Signed threshold adjustment from realized price (added to the target).
+
+    NEGATIVE = compact sooner (expensive traffic — costly to re-prefill).
+    POSITIVE = preserve context longer (cheap traffic). Saturates at
+    ±PRICE_NUDGE_MAX when price deviates from PRICE_REF_USD_PER_M by
+    PRICE_SATURATION_RATIO× in either direction. Neutral (0.0) when the
+    price is unknown.
+    """
+    if price is None or price <= 0:
+        return 0.0
+    try:
+        ratio = price / PRICE_REF_USD_PER_M
+        if ratio <= 0:
+            return 0.0
+        import math
+        scaled = math.log(ratio) / math.log(PRICE_SATURATION_RATIO)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+    scaled = max(-1.0, min(1.0, scaled))
+    return -PRICE_NUDGE_MAX * scaled
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +466,8 @@ def main(profiles: list[str] | None = None):
 
     # Measure global growth rate (DB doesn't track per-profile)
     measured_g = measure_growth_rate(DB_PATH)
+    # Measure realized $/M for the price-aware nudge (plan C1, 2026-09-02)
+    measured_price = _realized_price_per_m(DB_PATH)
 
     # Skip Kalman update when DB is missing (fake G_BASELINE measurement)
     if measured_g == G_BASELINE and not DB_PATH.exists():
@@ -406,6 +491,14 @@ def main(profiles: list[str] | None = None):
             continue
 
         context_length, old_threshold = read_config(config_path)
+        if profile_name in EXEMPT_PROFILES:
+            profile_results.append({
+                "profile": profile_name,
+                "skipped": True,
+                "reason": "exempt (deliberate threshold)",
+                "threshold": old_threshold,
+            })
+            continue
         new_threshold = compute_threshold(g_estimate, context_length, old_threshold)
         applied = apply_threshold(
             new_threshold, config_path, profile_name,
@@ -427,10 +520,12 @@ def main(profiles: list[str] | None = None):
 
     # Update persisted state
     history: list = state.get("threshold_history", [])
+    last_governed = next(
+        (r for r in reversed(profile_results) if "new_threshold" in r), None)
     history.append({
         "ts": time.time(),
-        "new_threshold": round(profile_results[-1]["new_threshold"], 4)
-            if profile_results and "new_threshold" in profile_results[-1]
+        "new_threshold": round(last_governed["new_threshold"], 4)
+            if last_governed and "new_threshold" in last_governed
             else None,
         "applied": any(r.get("applied") for r in profile_results),
     })
@@ -438,6 +533,7 @@ def main(profiles: list[str] | None = None):
 
     state["kalman"] = kf.to_dict()
     state["last_measurement"] = round(measured_g, 1)
+    state["last_price_per_m"] = round(measured_price, 4) if measured_price else None
     state["last_ts"] = time.time()
     state["profiles_processed"] = len(profile_results)
     state["threshold_history"] = history
@@ -447,14 +543,17 @@ def main(profiles: list[str] | None = None):
     except Exception as e:
         print(f"[growth-governor] save_state failed: {e}", file=sys.stderr)
 
-    # Print JSON summary (consumed by cron / health scripts)
+    # Print JSON summary (consumed by cron / health scripts).
+    # Also returned so programmatic callers (tests, watchdogs) can use it.
     summary = {
         "growth_rate": round(measured_g, 1),
         "kalman_estimate": round(g_estimate, 1),
-        "profiles_processed": len(profile_results),
+        "price_per_m": round(measured_price, 4) if measured_price else None,
+        "profiles_processed": len(profiles),
         "profile_results": profile_results,
     }
     print(json.dumps(summary, indent=2))
+    return summary
 
 
 if __name__ == "__main__":

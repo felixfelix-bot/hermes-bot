@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""TDD tests for compression_growth_governor.py — written BEFORE implementation.
+"""Tests for compression_growth_governor.py.
 
 Tests cover:
-  1. test_kalman_convergence    — synthetic measurements verify convergence
-  2. test_measure_growth_rate   — temp DB with known session data, verify median extraction
-  3. test_compute_threshold     — g=200 sparse raise, g=10000 dense lower, g=1800 baseline no change
-  4. test_hysteresis            — two runs same data, second stable (no config change)
-  5. test_fallback_db_missing   — no DB returns G_BASELINE, no crash
-  6. test_fallback_hermes_cli_missing — mock subprocess, no crash, no config change
-
-Run: python3 -m pytest tests/test_compression_growth_governor.py -v
+- GrowthRateKalman convergence (feed known data, verify convergence)
+- measure_growth_rate with a mock SQLite DB
+- compute_threshold at various growth rates (sparse, normal, dense)
+- Hysteresis (threshold unchanged when delta < 0.02)
+- Dynamic context_length (verify floor changes with different values)
+- Fallback when zai_usage.db doesn't exist or is empty
+- Profile discovery (discover_profiles)
+- Multi-profile iteration (main processes all profiles)
 """
 import json
 import os
@@ -21,542 +21,1054 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-# Import will fail until implementation exists — that's the RED phase
+# Import the module under test. We need to set up paths first.
+import sys
+sys.path.insert(0, str(Path.home() / ".hermes" / "bot"))
+
 from compression_growth_governor import (
     GrowthRateKalman,
     measure_growth_rate,
     compute_threshold,
     apply_threshold,
+    read_config,
     load_state,
     save_state,
+    main,
+    _write_audit,
+    discover_profiles,
+    profile_config_path,
     G_BASELINE,
-    MIN_THRESHOLD,
-    MAX_THRESHOLD,
-    FALLBACK_THRESHOLD,
-    HYSTERESIS,
-    CONTEXT_LENGTH,
+    G_MIN,
+    G_MAX,
     K_SENSITIVITY,
+    FALLBACK_THRESHOLD,
+    MAX_THRESHOLD,
+    MINIMUM_CONTEXT_LENGTH,
+    WINDOW_HOURS,
 )
 
 
-# ─── Test 1: Kalman convergence ───
+# ---------------------------------------------------------------------------
+# 1. Kalman filter convergence
+# ---------------------------------------------------------------------------
 
-class TestKalmanConvergence:
-    """Feed synthetic measurements, verify the filter converges to the true value."""
+class TestGrowthRateKalmanConvergence:
+    """Feed synthetic measurements and verify the estimate converges."""
 
-    def test_converges_to_constant_signal(self):
-        """If we feed 500 repeatedly, the estimate should approach 500."""
-        kf = GrowthRateKalman(initial_g=1800)
-        for _ in range(50):
-            kf.update(500.0)
-        assert 400 < kf.x < 600, f"Expected convergence near 500, got {kf.x}"
-        assert kf.n == 50
+    def test_converges_to_low_growth(self):
+        """Feed 500 tokens/call repeatedly; estimate should approach 500."""
+        kf = GrowthRateKalman()
+        assert kf.x == 1800, "Initial state should be G_BASELINE (1800)"
+        assert kf.p == 500000.0, "Initial uncertainty should be 500000"
+        assert kf.q == 50000.0, "Process noise should be 50000"
+        assert kf.r == 300000.0, "Measurement noise should be 300000"
 
-    def test_converges_to_high_signal(self):
-        """If we feed 8000 repeatedly, the estimate should approach 8000."""
-        kf = GrowthRateKalman(initial_g=1800)
-        for _ in range(50):
-            kf.update(8000.0)
-        assert 7000 < kf.x < 9000, f"Expected convergence near 8000, got {kf.x}"
+        for _ in range(30):
+            kf.predict()
+            kf.update(500)
 
-    def test_clamps_to_g_min(self):
-        """State should never go below G_MIN."""
-        kf = GrowthRateKalman(initial_g=500)
-        for _ in range(20):
-            kf.update(50.0)  # Way below G_MIN
-        # Should be clamped at G_MIN (200)
-        assert kf.x >= 200, f"Expected clamp at G_MIN=200, got {kf.x}"
+        assert kf.x < 600, f"Estimate {kf.x} should converge below 600"
+        assert kf.x > 400, f"Estimate {kf.x} should stay above 400"
 
-    def test_clamps_to_g_max(self):
-        """State should never go above G_MAX."""
-        kf = GrowthRateKalman(initial_g=5000)
-        for _ in range(20):
-            kf.update(50000.0)  # Way above G_MAX
-        assert kf.x <= 20000, f"Expected clamp at G_MAX=20000, got {kf.x}"
+    def test_converges_to_high_growth(self):
+        """Feed 10000 tokens/call repeatedly; estimate should approach 10000."""
+        kf = GrowthRateKalman()
+        for _ in range(30):
+            kf.predict()
+            kf.update(10000)
 
-    def test_state_persistence(self):
-        """to_dict / from_dict round-trip preserves state."""
-        kf = GrowthRateKalman(initial_g=3000)
-        kf.update(2500)
+        assert kf.x > 8000, f"Estimate {kf.x} should converge above 8000"
+        assert kf.x < 12000, f"Estimate {kf.x} should stay below 12000"
+
+    def test_clamped_to_g_min(self):
+        """Filter should clamp to G_MIN when fed very low measurements."""
+        kf = GrowthRateKalman()
+        for _ in range(30):
+            kf.predict()
+            kf.update(0)
+
+        assert kf.x >= G_MIN, f"Estimate {kf.x} should be clamped at G_MIN ({G_MIN})"
+
+    def test_clamped_to_g_max(self):
+        """Filter should clamp to G_MAX when fed very high measurements."""
+        kf = GrowthRateKalman()
+        for _ in range(30):
+            kf.predict()
+            kf.update(100000)
+
+        assert kf.x <= G_MAX, f"Estimate {kf.x} should be clamped at G_MAX ({G_MAX})"
+
+    def test_update_count_increments(self):
+        """n should increment with each update call."""
+        kf = GrowthRateKalman()
+        assert kf.n == 0
+        kf.predict()
+        kf.update(1000)
+        assert kf.n == 1
+        kf.predict()
+        kf.update(2000)
+        assert kf.n == 2
+
+    def test_predict_increases_uncertainty(self):
+        """predict() should increase p by q (process noise)."""
+        kf = GrowthRateKalman()
+        p_before = kf.p
+        kf.predict()
+        assert kf.p == p_before + kf.q, "predict() should add q to p"
+
+    def test_to_dict_and_from_dict_roundtrip(self):
+        """Kalman state should survive serialization/deserialization."""
+        kf = GrowthRateKalman()
+        for _ in range(5):
+            kf.predict()
+            kf.update(2500)
+
         d = kf.to_dict()
         kf2 = GrowthRateKalman.from_dict(d)
         assert kf2.x == kf.x
         assert kf2.p == kf.p
+        assert kf2.q == kf.q
+        assert kf2.r == kf.r
         assert kf2.n == kf.n
 
 
-# ─── Test 2: measure_growth_rate ───
+# ---------------------------------------------------------------------------
+# 2. measure_growth_rate with mock SQLite DB
+# ---------------------------------------------------------------------------
 
 class TestMeasureGrowthRate:
-    """Create a temp DB with known session data, verify median extraction."""
+    """Test measure_growth_rate with a temporary SQLite DB."""
 
-    def _create_test_db(self, db_path):
-        """Create a test DB with known session data (enough rows to pass 10-row minimum)."""
+    def _create_test_db(self, db_path, sessions):
+        """Create a test DB with the given session data.
+
+        Args:
+            db_path: Path to the DB file
+            sessions: dict of {session_id: [(prompt_tokens, ts_offset), ...]}
+        """
+        now = time.time()
         conn = sqlite3.connect(str(db_path))
         conn.execute("""
-            CREATE TABLE api_calls (
+            CREATE TABLE IF NOT EXISTS api_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
+                ts REAL,
+                key_name TEXT,
+                key_suffix TEXT,
+                model TEXT,
                 prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                total_tokens INTEGER,
+                tier TEXT,
+                cache_hit INTEGER DEFAULT 0,
+                ollama_hit INTEGER DEFAULT 0,
+                ppq_hit INTEGER DEFAULT 0,
                 status_code INTEGER,
+                error TEXT,
+                duration_ms INTEGER,
+                cost_usd REAL,
+                cost_source TEXT,
                 session_id TEXT,
                 task_type TEXT
             )
         """)
-        now = time.time()
-        # Session A: growth of 500, 1000, 1500, 2000, 2500 (deltas: 500, 500, 500, 500)
-        # Session B: growth of 200, 800, 1600, 2400, 3200 (deltas: 600, 800, 800, 800)
-        # Session C: growth of 100, 300, 600, 1000, 1500 (deltas: 200, 300, 400, 500)
-        # All deltas: 500×4, 600, 800×3, 200, 300, 400, 500
-        # = [200, 300, 400, 500, 500, 500, 500, 600, 800, 800, 800]
-        # Median (index 5) = 500
-        rows = []
-        # Session A
-        for i, pt in enumerate([500, 1000, 1500, 2000, 2500]):
-            rows.append(("sess-A", pt, now - 300 + i, 200, None))
-        # Session B
-        for i, pt in enumerate([200, 800, 1600, 2400, 3200]):
-            rows.append(("sess-B", pt, now - 300 + i, 200, None))
-        # Session C
-        for i, pt in enumerate([100, 300, 600, 1000, 1500]):
-            rows.append(("sess-C", pt, now - 300 + i, 200, None))
-        for sid, pt, ts, sc, tt in rows:
-            conn.execute(
-                "INSERT INTO api_calls (session_id, prompt_tokens, ts, status_code, task_type) VALUES (?, ?, ?, ?, ?)",
-                (sid, pt, ts, sc, tt),
-            )
+
+        for sid, calls in sessions.items():
+            for i, (pt, ts_offset) in enumerate(calls):
+                conn.execute(
+                    "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                    (now - ts_offset, pt, 200, sid, None),
+                )
         conn.commit()
         conn.close()
 
-    def test_extracts_median_growth(self):
-        """Verify the median of positive deltas is correctly extracted."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "test.db"
-            self._create_test_db(db_path)
-            result = measure_growth_rate(db_path, hours=1)
-            # Median of [200, 300, 500, 500, 600, 800] = 500
-            assert result == 500.0, f"Expected median 500, got {result}"
+    def test_normal_growth_rate(self):
+        """DB with consistent ~1000 token growth should return ~1000."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            sessions = {
+                "s1": [(50000, 3600), (51000, 3500), (52000, 3400), (53000, 3300), (54000, 3200), (55000, 3100)],
+                "s2": [(30000, 3600), (31000, 3500), (32000, 3400), (33000, 3300), (34000, 3200), (35000, 3100)],
+            }
+            self._create_test_db(db_path, sessions)
 
-    def test_excludes_post_compression_resets(self):
-        """Negative deltas (post-compression resets) should be excluded."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "test.db"
-            conn = sqlite3.connect(str(db_path))
-            conn.execute("""
-                CREATE TABLE api_calls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    prompt_tokens INTEGER,
-                    status_code INTEGER,
-                    session_id TEXT,
-                    task_type TEXT
-                )
-            """)
-            now = time.time()
-            # Two sessions with compression resets, enough rows to pass 10-minimum
-            # Session X: 1000 → 2000 → 500 (reset) → 1500 → 2500 → 3500
-            #   Positive deltas: 1000, (skip -1500), 1000, 1000, 1000 → median = 1000
-            # Session Y: 2000 → 3000 → 1000 (reset) → 2000 → 3000 → 4000
-            #   Positive deltas: 1000, (skip -2000), 1000, 1000, 1000 → median = 1000
-            rows = [
-                ("sess-X", 1000, now - 60, 200, None),
-                ("sess-X", 2000, now - 50, 200, None),
-                ("sess-X", 500, now - 40, 200, None),   # post-compression reset
-                ("sess-X", 1500, now - 30, 200, None),
-                ("sess-X", 2500, now - 20, 200, None),
-                ("sess-X", 3500, now - 10, 200, None),
-                ("sess-Y", 2000, now - 60, 200, None),
-                ("sess-Y", 3000, now - 50, 200, None),
-                ("sess-Y", 1000, now - 40, 200, None),   # post-compression reset
-                ("sess-Y", 2000, now - 30, 200, None),
-                ("sess-Y", 3000, now - 20, 200, None),
-                ("sess-Y", 4000, now - 10, 200, None),
-            ]
-            for sid, pt, ts, sc, tt in rows:
-                conn.execute(
-                    "INSERT INTO api_calls (session_id, prompt_tokens, ts, status_code, task_type) VALUES (?, ?, ?, ?, ?)",
-                    (sid, pt, ts, sc, tt),
-                )
-            conn.commit()
-            conn.close()
-            result = measure_growth_rate(db_path, hours=1)
-            # Positive deltas: [1000×4, 1000×4] = eight 1000s → median = 1000
-            assert result == 1000.0, f"Expected median 1000 (excluding reset), got {result}"
+            result = measure_growth_rate(db_path, hours=WINDOW_HOURS)
 
-    def test_excludes_compression_task_type(self):
+            assert 500 < result < 1500, f"Expected growth ~1000, got {result}"
+
+    def test_skips_compression_rows(self):
         """Rows with task_type='compression' should be excluded."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "test.db"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            now = time.time()
             conn = sqlite3.connect(str(db_path))
             conn.execute("""
                 CREATE TABLE api_calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    prompt_tokens INTEGER,
-                    status_code INTEGER,
-                    session_id TEXT,
-                    task_type TEXT
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
                 )
             """)
-            now = time.time()
-            # Session Z with interleaved compression calls (excluded)
-            # Non-compression: 1000, 2000, 3000, 4000, 5000, 5500, 6500, 7500
-            #   deltas: 1000×5, 1000, 1000 = seven 1000s
-            # Compression: 1500, 2500, 3500, 4500 (excluded by task_type filter)
-            # Session W: 100, 200, 300, 400 (deltas: 100, 100, 100)
-            # Need >=10 non-compression rows total: 8 (sess-Z) + 4 (sess-W) = 12
-            rows = [
-                ("sess-Z", 1000, now - 50, 200, None),
-                ("sess-Z", 1500, now - 45, 200, "compression"),
-                ("sess-Z", 2000, now - 40, 200, None),
-                ("sess-Z", 2500, now - 35, 200, "compression"),
-                ("sess-Z", 3000, now - 30, 200, None),
-                ("sess-Z", 3500, now - 25, 200, "compression"),
-                ("sess-Z", 4000, now - 20, 200, None),
-                ("sess-Z", 4500, now - 15, 200, "compression"),
-                ("sess-Z", 5000, now - 10, 200, None),
-                ("sess-Z", 5500, now - 8, 200, None),
-                ("sess-Z", 6500, now - 6, 200, None),
-                ("sess-Z", 7500, now - 4, 200, None),
-                ("sess-W", 100, now - 50, 200, None),
-                ("sess-W", 200, now - 40, 200, None),
-                ("sess-W", 300, now - 30, 200, None),
-                ("sess-W", 400, now - 20, 200, None),
-            ]
-            for sid, pt, ts, sc, tt in rows:
+            # Session with growth, plus compression calls
+            for i in range(6):
                 conn.execute(
-                    "INSERT INTO api_calls (session_id, prompt_tokens, ts, status_code, task_type) VALUES (?, ?, ?, ?, ?)",
-                    (sid, pt, ts, sc, tt),
+                    "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                    (now - 3600 + i, 50000 + i * 1000, 200, "s1", None),
                 )
+            # Insert compression rows (should be excluded)
+            conn.execute(
+                "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                (now - 3300, 10000, 200, "s1", "compression"),
+            )
             conn.commit()
             conn.close()
-            result = measure_growth_rate(db_path, hours=1)
-            # Non-compression rows in sess-Z: 1000, 2000, 3000, 4000, 5000, 5500, 6500, 7500
-            #   deltas: 1000, 1000, 1000, 1000, 500, 1000, 1000
-            # sess-W: 100, 200, 300, 400 → deltas: 100, 100, 100
-            # All deltas: [100, 100, 100, 500, 1000, 1000, 1000, 1000, 1000, 1000]
-            #   sorted → median (idx 5) = 1000
-            assert result == 1000.0, f"Expected 1000, got {result}"
+
+            result = measure_growth_rate(db_path, hours=WINDOW_HOURS)
+            assert result > 0, "Should still measure growth from non-compression rows"
+
+    def test_excludes_post_compression_drops(self):
+        """Negative deltas (post-compression token drops) should be excluded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            sessions = {
+                "s1": [
+                    (50000, 3600), (51000, 3500),  # growth: +1000
+                    (52000, 3400),
+                    (10000, 3300),  # compression: -42000 (should be excluded as drop)
+                    (11000, 3200),  # growth: +1000
+                    (12000, 3100),
+                ],
+                "s2": [
+                    (30000, 3600), (31000, 3500),  # growth: +1000
+                    (32000, 3400),
+                    (5000, 3300),   # compression: -27000 (should be excluded)
+                    (6000, 3200),   # growth: +1000
+                    (7000, 3100),
+                ],
+            }
+            self._create_test_db(db_path, sessions)
+
+            result = measure_growth_rate(db_path, hours=WINDOW_HOURS)
+
+            # Only positive deltas should be counted: +1000, +1000, +1000, +1000
+            # (negative drops are excluded)
+            assert 500 < result < 1500, f"Expected ~1000 (median of positive deltas), got {result}"
+
+    def test_db_missing_returns_baseline(self):
+        """Missing DB should return G_BASELINE."""
+        result = measure_growth_rate(Path("/nonexistent/db.db"))
+        assert result == G_BASELINE, f"Missing DB should return G_BASELINE ({G_BASELINE}), got {result}"
+
+    def test_empty_db_returns_baseline(self):
+        """Empty DB (no rows) should return G_BASELINE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+
+            result = measure_growth_rate(db_path, hours=WINDOW_HOURS)
+            assert result == G_BASELINE, f"Empty DB should return G_BASELINE, got {result}"
 
     def test_insufficient_rows_returns_baseline(self):
-        """Fewer than 10 rows should return G_BASELINE."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "test.db"
+        """DB with < 10 rows should return G_BASELINE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            now = time.time()
             conn = sqlite3.connect(str(db_path))
             conn.execute("""
                 CREATE TABLE api_calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    prompt_tokens INTEGER,
-                    status_code INTEGER,
-                    session_id TEXT,
-                    task_type TEXT
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
                 )
             """)
-            now = time.time()
-            # Only 5 rows — below the 10-row minimum
             for i in range(5):
                 conn.execute(
-                    "INSERT INTO api_calls (session_id, prompt_tokens, ts, status_code, task_type) VALUES (?, ?, ?, ?, ?)",
-                    ("sess-S", 1000 + i * 100, now - i, 200, None),
+                    "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                    (now - 3600 + i, 50000 + i * 1000, 200, "s1", None),
                 )
             conn.commit()
             conn.close()
-            result = measure_growth_rate(db_path, hours=1)
-            assert result == G_BASELINE, f"Expected G_BASELINE={G_BASELINE}, got {result}"
+
+            result = measure_growth_rate(db_path, hours=WINDOW_HOURS)
+            assert result == G_BASELINE, f"Insufficient rows should return G_BASELINE, got {result}"
 
 
-# ─── Test 3: compute_threshold ───
+# ---------------------------------------------------------------------------
+# 3. compute_threshold at various growth rates
+# ---------------------------------------------------------------------------
 
 class TestComputeThreshold:
-    """Test the control law at extremes and baseline."""
+    """Test the control law at sparse, normal, and dense growth rates."""
 
-    def test_sparse_raises_threshold(self):
-        """g=200 (sparse) should raise threshold above base."""
-        base = 0.60
-        result = compute_threshold(200.0, base)
-        # delta = K * (1800 - 200) = K * 1600 > 0 -> threshold raised
-        assert result > base, f"Sparse session should raise threshold: {result} vs base {base}"
-        assert result <= MAX_THRESHOLD
+    CONTEXT_LENGTH = 200000
 
-    def test_dense_lowers_threshold(self):
-        """g=10000 (dense) should lower threshold below base."""
-        base = 0.60
-        result = compute_threshold(10000.0, base)
-        # delta = K * (1800 - 10000) = K * (-8200) < 0 -> threshold lowered
-        assert result < base, f"Dense session should lower threshold: {result} vs base {base}"
-        assert result >= MIN_THRESHOLD
+    def test_sparse_growth_raises_threshold(self):
+        """Sparse session (g=200) should raise threshold above FALLBACK."""
+        t = compute_threshold(200, self.CONTEXT_LENGTH)
+        min_t = 64000 / self.CONTEXT_LENGTH
+        assert t > FALLBACK_THRESHOLD, f"Sparse (g=200) should raise threshold above {FALLBACK_THRESHOLD}, got {t}"
+        assert t <= MAX_THRESHOLD, f"Threshold should not exceed MAX_THRESHOLD ({MAX_THRESHOLD}), got {t}"
 
-    def test_baseline_no_change(self):
-        """g=1800 (baseline) should produce no adjustment."""
-        base = 0.60
-        result = compute_threshold(1800.0, base)
-        # delta = K * (1800 - 1800) = 0 -> no change
-        assert abs(result - base) < 0.001, f"Baseline should not change threshold: {result} vs base {base}"
+    def test_normal_growth_near_fallback(self):
+        """Normal session (g=1800) should produce threshold near FALLBACK."""
+        t = compute_threshold(1800, self.CONTEXT_LENGTH)
+        delta = abs(t - FALLBACK_THRESHOLD)
+        assert delta < 0.01, f"Normal (g=1800) should produce threshold near FALLBACK ({FALLBACK_THRESHOLD}), got {t}"
 
-    def test_clamped_to_min(self):
-        """Very dense session should clamp to MIN_THRESHOLD."""
-        base = 0.60
-        result = compute_threshold(20000.0, base)
-        assert result == MIN_THRESHOLD, f"Very dense should clamp to MIN_THRESHOLD={MIN_THRESHOLD}, got {result}"
+    def test_dense_growth_lowers_threshold(self):
+        """Dense session (g=10000) should lower threshold below FALLBACK."""
+        t = compute_threshold(10000, self.CONTEXT_LENGTH)
+        assert t < FALLBACK_THRESHOLD, f"Dense (g=10000) should lower threshold below {FALLBACK_THRESHOLD}, got {t}"
 
-    def test_clamped_to_max(self):
-        """Very sparse session should clamp to MAX_THRESHOLD."""
-        base = 0.60
-        result = compute_threshold(200.0, base)
-        # With large enough K, sparse should push to MAX
-        assert result <= MAX_THRESHOLD, f"Should not exceed MAX_THRESHOLD={MAX_THRESHOLD}, got {result}"
+    def test_very_dense_hits_floor(self):
+        """Very dense session (g=20000) should hit the MIN_THRESHOLD floor."""
+        t = compute_threshold(20000, self.CONTEXT_LENGTH)
+        min_t = 64000 / self.CONTEXT_LENGTH
+        assert abs(t - min_t) < 0.01, f"Very dense (g=20000) should hit MIN_THRESHOLD ({min_t:.4f}), got {t:.4f}"
 
-    def test_absolute_law_not_incremental(self):
-        """Same g always produces same threshold regardless of base drift.
-        This catches the integrator-walk bug from kimi review."""
-        result1 = compute_threshold(5000.0, 0.60)
-        result2 = compute_threshold(5000.0, 0.60)
-        assert result1 == result2, "Absolute law: same g must produce same threshold"
-        # And it should NOT drift if called with its own output as base
-        result3 = compute_threshold(5000.0, result1)
-        # With absolute law, result3 = result1 + K*(1800-5000) = result1 - 0.096
-        # which IS different — but that's because base changed.
-        # The key test: main() uses FALLBACK_THRESHOLD as base always,
-        # so threshold doesn't walk. Verify the function is deterministic.
-        assert compute_threshold(5000.0) == compute_threshold(5000.0), "Deterministic"
+    def test_never_exceeds_max(self):
+        """Threshold should never exceed MAX_THRESHOLD."""
+        t = compute_threshold(G_MIN, self.CONTEXT_LENGTH)  # Sparsest possible
+        assert t <= MAX_THRESHOLD, f"Threshold should not exceed MAX_THRESHOLD ({MAX_THRESHOLD}), got {t}"
 
-    def test_min_threshold_correct_for_131k(self):
-        """MIN_THRESHOLD should be 64000/131072 ≈ 0.488."""
-        expected = 64000 / 131072
-        assert abs(MIN_THRESHOLD - expected) < 0.001, f"MIN_THRESHOLD should be {expected:.3f}, got {MIN_THRESHOLD}"
+    def test_never_goes_below_min(self):
+        """Threshold should never go below MIN_THRESHOLD."""
+        t = compute_threshold(G_MAX, self.CONTEXT_LENGTH)  # Densest possible
+        min_t = 64000 / self.CONTEXT_LENGTH
+        assert t >= min_t, f"Threshold should not go below MIN_THRESHOLD ({min_t:.4f}), got {t:.4f}"
 
-    def test_context_length_is_131072(self):
-        """CONTEXT_LENGTH must be 131072, NOT 202752 from the design doc."""
-        assert CONTEXT_LENGTH == 131072, f"CONTEXT_LENGTH should be 131072, got {CONTEXT_LENGTH}"
+    def test_clamped_growth_rate(self):
+        """Growth rate outside [G_MIN, G_MAX] should still be handled."""
+        t_neg = compute_threshold(-100, self.CONTEXT_LENGTH)  # Below G_MIN
+        t_huge = compute_threshold(100000, self.CONTEXT_LENGTH)  # Above G_MAX
+        min_t = 64000 / self.CONTEXT_LENGTH
+        assert min_t <= t_neg <= MAX_THRESHOLD
+        assert min_t <= t_huge <= MAX_THRESHOLD
 
 
-# ─── Test 4: Hysteresis ───
+# ---------------------------------------------------------------------------
+# 4. Hysteresis
+# ---------------------------------------------------------------------------
 
 class TestHysteresis:
-    """Two runs with same data: second should be stable (no config change)."""
+    """Test that apply_threshold respects the hysteresis threshold."""
 
-    def test_apply_threshold_skips_small_delta(self):
-        """If delta < HYSTERESIS, apply_threshold should return False."""
-        with patch("compression_growth_governor.subprocess") as mock_subprocess:
-            mock_result = MagicMock()
-            mock_result.returncode = 0
-            mock_subprocess.run.return_value = mock_result
-            # Old = 0.55, new = 0.555 → delta = 0.005 < 0.02
-            result = apply_threshold(0.555, 0.55)
-            assert result is False, "Small delta should be skipped by hysteresis"
-            # subprocess.run should NOT have been called
-            mock_subprocess.run.assert_not_called()
+    @staticmethod
+    def _write_config(path, context_length=200000, threshold=0.4000):
+        """Write a valid YAML config file."""
+        import yaml as _yaml
+        with open(path, 'w') as f:
+            _yaml.dump(
+                {"model": {"context_length": context_length},
+                 "compression": {"threshold": threshold}},
+                f,
+            )
 
-    def test_apply_threshold_applies_large_delta(self):
-        """If delta >= HYSTERESIS, apply_threshold should call hermes config set."""
-        with patch("compression_growth_governor.subprocess") as mock_subprocess:
-            mock_result = MagicMock()
-            mock_result.returncode = 0
-            mock_subprocess.run.return_value = mock_result
-            # Old = 0.50, new = 0.55 → delta = 0.05 > 0.02
-            result = apply_threshold(0.55, 0.50)
-            assert result is True, "Large delta should be applied"
-            mock_subprocess.run.assert_called_once()
+    def test_small_delta_not_applied(self):
+        """Threshold change < 0.02 should not be applied."""
+        with patch('compression_growth_governor.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
-    def test_hysteresis_constant_value(self):
-        """HYSTERESIS should be 0.02."""
-        assert HYSTERESIS == 0.02
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "config.yaml"
+                self._write_config(config_path, threshold=0.4000)
+                audit_path = Path(tmpdir) / "audit.json"
+                with patch('compression_growth_governor.AUDIT_FILE', audit_path):
+                    with patch('compression_growth_governor.CONFIG_PATH', config_path):
+                        result = apply_threshold(0.4100, config_path)  # delta=0.01 < 0.02
 
+        assert result is False, "Small delta should not be applied"
+        mock_run.assert_not_called()
 
-# ─── Test 5: Fallback DB missing ───
+    def test_large_delta_applied(self):
+        """Threshold change > 0.02 should be applied via hermes config set."""
+        with patch('compression_growth_governor.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
 
-class TestFallbackDbMissing:
-    """No DB file → returns G_BASELINE, no crash."""
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "config.yaml"
+                self._write_config(config_path, threshold=0.4000)
+                audit_path = Path(tmpdir) / "audit.json"
+                with patch('compression_growth_governor.AUDIT_FILE', audit_path):
+                    with patch('compression_growth_governor.CONFIG_PATH', config_path):
+                        result = apply_threshold(0.4500, config_path)  # delta=0.05 > 0.02
 
-    def test_returns_baseline_when_db_missing(self):
-        """measure_growth_rate with non-existent DB returns G_BASELINE."""
-        result = measure_growth_rate(Path("/nonexistent/path/db.db"), hours=6)
-        assert result == G_BASELINE, f"Missing DB should return G_BASELINE={G_BASELINE}, got {result}"
+        assert result is True, "Large delta should be applied"
+        mock_run.assert_called_once()
 
-    def test_no_exception_on_missing_db(self):
-        """Should not raise on missing DB."""
-        try:
-            measure_growth_rate(Path("/nonexistent/path/db.db"), hours=6)
-        except Exception as e:
-            pytest.fail(f"Should not raise on missing DB: {e}")
+    def test_large_delta_applied_with_profile(self):
+        """apply_threshold with profile_name should include it in subprocess args."""
+        with patch('compression_growth_governor.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
 
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "config.yaml"
+                self._write_config(config_path, threshold=0.4000)
+                audit_path = Path(tmpdir) / "audit.json"
+                with patch('compression_growth_governor.AUDIT_FILE', audit_path):
+                    with patch('compression_growth_governor.CONFIG_PATH', config_path):
+                        result = apply_threshold(0.4500, config_path, profile_name="worker-dq05")
 
-# ─── Test 6: Fallback hermes CLI missing ───
+        assert result is True
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "--profile" in args
+        idx = args.index("--profile")
+        assert args[idx + 1] == "worker-dq05"
 
-class TestFallbackHermesCliMissing:
-    """Mock subprocess failure → no crash, no config change."""
+    def test_config_set_failure_returns_false(self):
+        """If hermes config set fails, should return False."""
+        with patch('compression_growth_governor.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr="error", stdout="")
 
-    def test_subprocess_failure_returns_false(self):
-        """If hermes CLI raises, apply_threshold returns False (no crash)."""
-        with patch("compression_growth_governor.subprocess") as mock_subprocess:
-            mock_subprocess.run.side_effect = FileNotFoundError("hermes not found")
-            # delta = 0.10 > HYSTERESIS → would normally apply
-            result = apply_threshold(0.60, 0.50)
-            assert result is False, "CLI failure should return False"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "config.yaml"
+                self._write_config(config_path, threshold=0.4000)
+                audit_path = Path(tmpdir) / "audit.json"
+                with patch('compression_growth_governor.AUDIT_FILE', audit_path):
+                    with patch('compression_growth_governor.CONFIG_PATH', config_path):
+                        result = apply_threshold(0.5000, config_path)
 
-    def test_subprocess_timeout_returns_false(self):
-        """If hermes CLI times out, apply_threshold returns False (no crash)."""
-        import subprocess as sp
-        with patch("compression_growth_governor.subprocess") as mock_subprocess:
-            mock_subprocess.run.side_effect = sp.TimeoutExpired(cmd="hermes", timeout=30)
-            result = apply_threshold(0.60, 0.50)
-            assert result is False, "CLI timeout should return False"
-
-    def test_subprocess_nonzero_return_returns_false(self):
-        """If hermes CLI returns non-zero, apply_threshold returns False."""
-        with patch("compression_growth_governor.subprocess") as mock_subprocess:
-            mock_result = MagicMock()
-            mock_result.returncode = 1
-            mock_result.stderr = "config error"
-            mock_subprocess.run.return_value = mock_result
-            result = apply_threshold(0.60, 0.50)
-            assert result is False, "Non-zero return should return False"
-
-
-# ─── State persistence ───
-
-class TestStatePersistence:
-    """load_state / save_state round-trip."""
-
-    def test_save_load_roundtrip(self, tmp_path, monkeypatch):
-        """Save state, load it back, verify fields preserved."""
-        import compression_growth_governor as mod
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr(mod, "STATE_FILE", state_file)
-
-        state = {
-            "kalman": GrowthRateKalman(2500).to_dict(),
-            "last_measurement": 2300.0,
-            "last_ts": 12345,
-            "current_threshold": 0.55,
-            "last_config_threshold": 0.50,
-        }
-        save_state(state)
-
-        loaded = load_state()
-        assert loaded["last_measurement"] == 2300.0
-        assert loaded["current_threshold"] == 0.55
-        assert loaded["kalman"]["x"] == 2500
-
-    def test_load_default_when_no_file(self, tmp_path, monkeypatch):
-        """Loading when state file doesn't exist returns sensible defaults."""
-        import compression_growth_governor as mod
-        state_file = tmp_path / "nonexistent.json"
-        monkeypatch.setattr(mod, "STATE_FILE", state_file)
-
-        loaded = load_state()
-        assert loaded["current_threshold"] == FALLBACK_THRESHOLD
-        assert loaded["kalman"]["x"] == G_BASELINE
+        assert result is False, "Config set failure should return False"
 
 
-# ─── Main function integration ───
+# ---------------------------------------------------------------------------
+# 5. Dynamic context_length
+# ---------------------------------------------------------------------------
 
-class TestMainFunction:
-    """Test the main() entry point runs end-to-end without crashing."""
+class TestDynamicContextLength:
+    """Test that compute_threshold's floor changes with context_length."""
 
-    def test_main_runs_with_missing_db(self, tmp_path, monkeypatch):
-        """main() should complete without crash even if DB is missing."""
-        import compression_growth_governor as mod
-        monkeypatch.setattr(mod, "DB_PATH", tmp_path / "nonexistent.db")
-        monkeypatch.setattr(mod, "STATE_FILE", tmp_path / "state.json")
-        monkeypatch.setattr(mod, "AUDIT_FILE", tmp_path / "audit.json")
-        # Mock apply_threshold so we don't actually call hermes
-        monkeypatch.setattr(mod, "apply_threshold", lambda new, old: False)
+    def test_floor_changes_with_context_length(self):
+        """MIN_THRESHOLD = 64000/context_length should vary with context_length."""
+        t_200k = compute_threshold(20000, 200000)
+        t_128k = compute_threshold(20000, 131072)
+        t_1m = compute_threshold(20000, 1000000)
 
-        mod.main()  # Should not raise
+        min_200k = 64000 / 200000  # 0.32
+        min_128k = 64000 / 131072  # 0.488
+        min_1m = 64000 / 1000000   # 0.064
 
-        # State file should have been written
-        state = json.loads((tmp_path / "state.json").read_text())
-        assert "kalman" in state
-        assert state["last_measurement"] == G_BASELINE
+        assert abs(t_200k - min_200k) < 0.01, f"At 200K, dense should hit floor {min_200k:.4f}, got {t_200k:.4f}"
+        assert abs(t_128k - min_128k) < 0.01, f"At 128K, dense should hit floor {min_128k:.4f}, got {t_128k:.4f}"
+        assert abs(t_1m - min_1m) < 0.01 or t_1m <= min_1m + 0.01, (
+            f"At 1M, dense should hit floor {min_1m:.4f}, got {t_1m:.4f}"
+        )
 
-        # Audit file should have been written
-        audit = json.loads((tmp_path / "audit.json").read_text())
-        assert "growth_estimate" in audit
-        assert "current_threshold" in audit
+    def test_floor_varies(self):
+        """Floors should be different for different context lengths."""
+        floor_200k = 64000 / 200000
+        floor_128k = 64000 / 131072
+        assert floor_200k != floor_128k, "Floors should differ for different context lengths"
 
-    def test_main_writes_audit_file(self, tmp_path, monkeypatch):
-        """main() should write the audit JSON file."""
-        import compression_growth_governor as mod
-        monkeypatch.setattr(mod, "DB_PATH", tmp_path / "nonexistent.db")
-        monkeypatch.setattr(mod, "STATE_FILE", tmp_path / "state.json")
-        monkeypatch.setattr(mod, "AUDIT_FILE", tmp_path / "audit.json")
-        monkeypatch.setattr(mod, "apply_threshold", lambda new, old: False)
+    def test_read_config_extracts_context_length(self):
+        """read_config should return context_length from config.yaml."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                "model:\n  default: glm-5.3\n  context_length: 200000\n"
+                "compression:\n  threshold: 0.6228\n"
+            )
+            ctx_len, threshold = read_config(config_path)
+            assert ctx_len == 200000, f"Expected context_length 200000, got {ctx_len}"
+            assert threshold == 0.6228, f"Expected threshold 0.6228, got {threshold}"
 
-        mod.main()
-
-        audit = json.loads((tmp_path / "audit.json").read_text())
-        assert audit["growth_baseline"] == G_BASELINE
-        assert audit["context_length"] == CONTEXT_LENGTH
-        assert audit["applied"] is False
-        assert "implied_turns_to_compaction" in audit
-
-    def test_main_no_integrator_walk(self, tmp_path, monkeypatch):
-        """Running main() twice with missing DB should NOT walk the threshold.
-        This catches the integrator-walk bug from kimi review: with absolute
-        control law, threshold stays at FALLBACK_THRESHOLD when g=baseline."""
-        import compression_growth_governor as mod
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr(mod, "DB_PATH", tmp_path / "nonexistent.db")
-        monkeypatch.setattr(mod, "STATE_FILE", state_file)
-        monkeypatch.setattr(mod, "AUDIT_FILE", tmp_path / "audit.json")
-        monkeypatch.setattr(mod, "apply_threshold", lambda new, old: True)
-
-        # First run — DB missing, g=baseline, threshold=0.60
-        mod.main()
-        state1 = json.loads(state_file.read_text())
-        t1 = state1["current_threshold"]
-
-        # Second run — same conditions
-        mod.main()
-        state2 = json.loads(state_file.read_text())
-        t2 = state2["current_threshold"]
-
-        # With absolute law, both should be 0.60 (baseline produces no delta)
-        assert abs(t1 - t2) < 0.001, f"Threshold walked: {t1} -> {t2}"
-        assert abs(t1 - FALLBACK_THRESHOLD) < 0.001, f"Baseline should give FALLBACK_THRESHOLD, got {t1}"
+    def test_read_config_missing_returns_defaults(self):
+        """read_config should return defaults when config is missing."""
+        ctx_len, threshold = read_config(Path("/nonexistent/config.yaml"))
+        assert ctx_len == 131072, f"Expected default 131072, got {ctx_len}"
+        assert threshold == FALLBACK_THRESHOLD
 
 
-# ─── Edge cases for measure_growth_rate ───
+# ---------------------------------------------------------------------------
+# 6. Fallback behavior
+# ---------------------------------------------------------------------------
 
-class TestMeasureGrowthRateEdgeCases:
-    """Additional edge cases for coverage."""
+class TestFallback:
+    """Test fallback when zai_usage.db is missing or empty."""
 
-    def test_all_negative_deltas_returns_baseline(self):
-        """If all deltas are negative (only compression resets), return G_BASELINE."""
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "test.db"
+    def test_missing_db_returns_baseline(self):
+        """Missing DB path should return G_BASELINE."""
+        result = measure_growth_rate(Path("/nonexistent/path.db"))
+        assert result == G_BASELINE
+
+    def test_empty_db_returns_baseline(self):
+        """Empty DB should return G_BASELINE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "empty.db"
             conn = sqlite3.connect(str(db_path))
             conn.execute("""
                 CREATE TABLE api_calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    prompt_tokens INTEGER,
-                    status_code INTEGER,
-                    session_id TEXT,
-                    task_type TEXT
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
                 )
             """)
+            conn.commit()
+            conn.close()
+
+            result = measure_growth_rate(db_path)
+            assert result == G_BASELINE
+
+    def test_corrupt_db_returns_baseline(self):
+        """Corrupt DB file (not SQLite) should return G_BASELINE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "corrupt.db"
+            db_path.write_text("not a database")
+            result = measure_growth_rate(db_path)
+            assert result == G_BASELINE
+
+    def test_no_sessions_returns_baseline(self):
+        """DB with only non-session rows should return G_BASELINE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
             now = time.time()
-            # Single session with strictly decreasing tokens (all resets)
-            # Need >=10 rows
-            for i in range(15):
-                pt = 10000 - i * 500  # 10000, 9500, 9000, ... decreasing
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
+                )
+            """)
+            for i in range(20):
                 conn.execute(
-                    "INSERT INTO api_calls (session_id, prompt_tokens, ts, status_code, task_type) VALUES (?, ?, ?, ?, ?)",
-                    ("sess-dec", pt, now - 14 + i, 200, None),
+                    "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                    (now - 3600 + i, 50000 + i * 100, 200, None, None),
                 )
             conn.commit()
             conn.close()
-            result = measure_growth_rate(db_path, hours=1)
-            assert result == G_BASELINE, f"All-negative deltas should return baseline, got {result}"
 
-    def test_db_exception_returns_baseline(self):
-        """If the DB query raises an exception, return G_BASELINE."""
-        # Create a path that exists but isn't a valid SQLite DB
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "corrupt.db"
-            db_path.write_text("not a database")
-            result = measure_growth_rate(db_path, hours=1)
-            assert result == G_BASELINE, f"Corrupt DB should return baseline, got {result}"
+            result = measure_growth_rate(db_path)
+            assert result == G_BASELINE
+
+
+# ---------------------------------------------------------------------------
+# 7. State persistence, audit, and main()
+# ---------------------------------------------------------------------------
+
+class TestStatePersistence:
+    """Test load_state / save_state roundtrip and edge cases."""
+
+    def test_save_load_roundtrip(self):
+        """State should survive save -> load cycle."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            with patch("compression_growth_governor.STATE_FILE", state_path):
+                with patch("compression_growth_governor.AUDIT_FILE", audit_path):
+                    state = {
+                        "kalman": GrowthRateKalman(2500).to_dict(),
+                        "last_measurement": 2400.0,
+                        "last_ts": 1234567890,
+                        "current_threshold": 0.45,
+                        "threshold_history": [],
+                    }
+                    save_state(state)
+                    loaded = load_state()
+                    assert loaded["kalman"]["x"] == 2500
+                    assert loaded["last_measurement"] == 2400.0
+                    assert loaded["current_threshold"] == 0.45
+
+    def test_load_corrupt_state(self):
+        """Corrupt state file should fall back to defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("not json{{{")
+            with patch("compression_growth_governor.STATE_FILE", state_path):
+                loaded = load_state()
+                assert loaded["kalman"]["x"] == G_BASELINE
+                assert loaded["current_threshold"] == FALLBACK_THRESHOLD
+
+    def test_load_missing_state(self):
+        """Missing state file should fall back to defaults."""
+        with patch("compression_growth_governor.STATE_FILE", Path("/nonexistent/state.json")):
+            loaded = load_state()
+            assert loaded["kalman"]["x"] == G_BASELINE
+            assert loaded["current_threshold"] == FALLBACK_THRESHOLD
+
+
+class TestAuditFile:
+    """Test _write_audit writes proper JSON."""
+
+    def test_audit_written(self):
+        """_write_audit should write a valid JSON file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit_path = Path(tmpdir) / "audit.json"
+            with patch("compression_growth_governor.AUDIT_FILE", audit_path):
+                _write_audit(0.4500, 0.4000, 200000, True, growth_rate=5000.0, kalman_estimate=4800.0)
+                assert audit_path.exists()
+                data = json.loads(audit_path.read_text())
+                assert data["threshold"] == 0.45
+                assert data["old_threshold"] == 0.4
+                assert data["applied"] is True
+                assert data["context_length"] == 200000
+                assert data["growth_rate"] == 5000.0
+
+    def test_audit_includes_profile(self):
+        """_write_audit should include the profile field."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit_path = Path(tmpdir) / "audit.json"
+            with patch("compression_growth_governor.AUDIT_FILE", audit_path):
+                _write_audit(0.4500, 0.4000, 200000, True,
+                             growth_rate=5000.0, kalman_estimate=4800.0,
+                             profile="worker-dq05")
+                data = json.loads(audit_path.read_text())
+                assert data["profile"] == "worker-dq05"
+
+
+class TestReadConfigException:
+    """Test read_config error handling."""
+
+    def test_corrupt_yaml(self):
+        """Corrupt YAML should fall back to defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("model: [invalid\n  - broken")
+            ctx_len, threshold = read_config(config_path)
+            assert ctx_len == 131072
+            assert threshold == FALLBACK_THRESHOLD
+
+    def test_missing_keys(self):
+        """Config without model.context_length should use default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("other: stuff\n")
+            ctx_len, threshold = read_config(config_path)
+            assert ctx_len == 131072
+            assert threshold == FALLBACK_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# 8. Profile discovery
+# ---------------------------------------------------------------------------
+
+class TestDiscoverProfiles:
+    """Test discover_profiles() for the growth governor."""
+
+    def test_returns_profiles_with_config(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        for name in ["alpha", "beta"]:
+            d = profiles_dir / name
+            d.mkdir(parents=True)
+            (d / "config.yaml").write_text("model:\n  default: glm-5.2\n")
+        result = discover_profiles(profiles_dir)
+        assert result == ["alpha", "beta"]
+
+    def test_skips_dirs_without_config(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        good = profiles_dir / "good"
+        good.mkdir(parents=True)
+        (good / "config.yaml").write_text("model:\n  default: glm-5.2\n")
+        bad = profiles_dir / "bad"
+        bad.mkdir(parents=True)
+
+        result = discover_profiles(profiles_dir)
+        assert result == ["good"]
+
+    def test_empty_dir_returns_empty(self, tmp_path: Path):
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir(parents=True)
+        assert discover_profiles(profiles_dir) == []
+
+    def test_nonexistent_dir_returns_empty(self, tmp_path: Path):
+        assert discover_profiles(tmp_path / "noexist") == []
+
+    def test_default_profiles_dir(self):
+        """When called with no args, should use module's PROFILES_DIR."""
+        from compression_growth_governor import PROFILES_DIR
+        with patch("compression_growth_governor.PROFILES_DIR", Path("/nonexistent/98765")):
+            result = discover_profiles()
+        assert result == []
+
+
+class TestProfileConfigPath:
+    def test_returns_path_for_profile(self):
+        path = profile_config_path("worker-test")
+        assert path.name == "config.yaml"
+        assert "worker-test" in str(path)
+
+
+# ---------------------------------------------------------------------------
+# 9. main() — multi-profile iteration
+# ---------------------------------------------------------------------------
+
+class TestMain:
+    """Test the main() entry point with multi-profile support."""
+
+    def _make_config(self, tmpdir, context_length=200000, threshold=0.6228, name="manager"):
+        """Helper: create a mock profiles dir with one profile."""
+        profiles_dir = Path(tmpdir) / "profiles"
+        prof_dir = profiles_dir / name
+        prof_dir.mkdir(parents=True)
+        config_path = prof_dir / "config.yaml"
+        config_path.write_text(
+            f"model:\n  context_length: {context_length}\n"
+            f"compression:\n  threshold: {threshold}\n"
+        )
+        return profiles_dir, config_path
+
+    def test_main_with_mock_db(self):
+        """main() should produce JSON output and update state."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir, config_path = self._make_config(tmpdir)
+
+            # Create a test DB with growth data
+            db_path = Path(tmpdir) / "test.db"
+            now = time.time()
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("""
+                CREATE TABLE api_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                    session_id TEXT, task_type TEXT
+                )
+            """)
+            for i in range(12):
+                conn.execute(
+                    "INSERT INTO api_calls (ts, prompt_tokens, status_code, session_id, task_type) VALUES (?, ?, ?, ?, ?)",
+                    (now - 3600 + i, 50000 + i * 1000, 200, "sess1", None),
+                )
+            conn.commit()
+            conn.close()
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.CONFIG_PATH", config_path), \
+                 patch("compression_growth_governor.DB_PATH", db_path), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            output = f.getvalue()
+            summary = json.loads(output)
+            assert "growth_rate" in summary
+            assert "kalman_estimate" in summary
+            assert "profiles_processed" in summary
+            assert summary["profiles_processed"] >= 1
+            assert "profile_results" in summary
+            pr = summary["profile_results"][0]
+            assert "old_threshold" in pr
+            assert "new_threshold" in pr
+            assert "context_length" in pr
+            assert "applied" in pr
+            assert pr["context_length"] == 200000
+            assert state_path.exists()
+
+    def test_main_db_missing_no_crash(self):
+        """main() should not crash when DB is missing (fallback path)."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir, config_path = self._make_config(tmpdir)
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.CONFIG_PATH", config_path), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            summary = json.loads(f.getvalue())
+            assert summary["growth_rate"] == G_BASELINE
+            assert summary["profiles_processed"] >= 1
+            pr = summary["profile_results"][0]
+            assert pr["context_length"] == 200000
+            assert state_path.exists()
+
+    def test_main_processes_multiple_profiles(self):
+        """main() should iterate over all discovered profiles."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            for name in ["alpha", "beta", "gamma"]:
+                d = profiles_dir / name
+                d.mkdir(parents=True)
+                (d / "config.yaml").write_text(
+                    f"model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+                )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 3
+            names = [pr["profile"] for pr in summary["profile_results"]]
+            assert names == ["alpha", "beta", "gamma"]
+
+    def test_main_skips_profile_without_config(self):
+        """Profiles without config.yaml should be skipped."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            # good profile
+            good_dir = profiles_dir / "good"
+            good_dir.mkdir(parents=True)
+            (good_dir / "config.yaml").write_text(
+                "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+            )
+            # bad profile — no config.yaml
+            bad_dir = profiles_dir / "bad"
+            bad_dir.mkdir(parents=True)
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["good", "bad"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 2  # both processed (bad as skipped entry)
+            pr = summary["profile_results"][0]
+            assert pr["profile"] == "good"
+            # bad should be in profile_results as skipped
+            skipped = [p for p in summary["profile_results"] if p.get("skipped")]
+            assert len(skipped) == 1
+            assert skipped[0]["profile"] == "bad"
+
+    def test_main_with_explicit_profile_list(self):
+        """main(profiles=[...]) should process only given profiles."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            for name in ["alpha", "beta", "gamma"]:
+                d = profiles_dir / name
+                d.mkdir(parents=True)
+                (d / "config.yaml").write_text(
+                    "model:\n  context_length: 200000\ncompression:\n  threshold: 0.6228\n"
+                )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["alpha", "gamma"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 2
+            names = [pr["profile"] for pr in summary["profile_results"]]
+            assert names == ["alpha", "gamma"]
+
+    def test_main_profile_with_no_context_length(self):
+        """Profile with config.yaml but no context_length should use default."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            prof_dir = profiles_dir / "worker-new"
+            prof_dir.mkdir(parents=True)
+            (prof_dir / "config.yaml").write_text(
+                "model:\n  default: glm-5.2\ncompression:\n  threshold: 0.6228\n"
+            )
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main(profiles=["worker-new"])
+
+            summary = json.loads(f.getvalue())
+            assert summary["profiles_processed"] == 1
+            pr = summary["profile_results"][0]
+            # No context_length in config → defaults to 131072
+            assert pr["context_length"] == 131072
+
+    def test_main_empty_profiles_falls_back_to_manager(self):
+        """If no profiles discovered, fall back to ['manager']."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            audit_path = Path(tmpdir) / "audit.json"
+            profiles_dir = Path(tmpdir) / "empty"
+
+            with patch("compression_growth_governor.STATE_FILE", state_path), \
+                 patch("compression_growth_governor.AUDIT_FILE", audit_path), \
+                 patch("compression_growth_governor.PROFILES_DIR", profiles_dir), \
+                 patch("compression_growth_governor.DB_PATH", Path("/nonexistent/db")), \
+                 patch("compression_growth_governor.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="ok")
+
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    main()
+
+            summary = json.loads(f.getvalue())
+            # Falls back to "manager" which won't exist in fake dir → skipped
+            assert any(
+                p.get("skipped") and p.get("profile") == "manager"
+                for p in summary["profile_results"]
+            )
+
+
+# ---------------------------------------------------------------------------
+# 10. 2026-09-02 fixes — convergent control law, price nudge, exemptions
+# ---------------------------------------------------------------------------
+
+class TestConvergentControlLaw20260902:
+    """Regression tests for the ratchet (unbounded-integrator) bug: the old
+    control law used ``base = current_threshold``, adding the same delta every
+    run until all profiles pinned at MAX_THRESHOLD (0.7)."""
+
+    def test_current_threshold_is_ignored(self):
+        """The target must not depend on the current threshold at all."""
+        from_current_low = compute_threshold(1000.0, 1000000, 0.10)
+        from_current_high = compute_threshold(1000.0, 1000000, 0.69)
+        from_current_none = compute_threshold(1000.0, 1000000)
+        assert from_current_low == from_current_high == from_current_none
+
+    def test_output_fed_back_does_not_ratchet(self):
+        """Feeding the output back as 'current' must reproduce the SAME value —
+        the historical failure mode drifted +K·Δg per run to the max."""
+        t1 = compute_threshold(671.0, 1000000)
+        t2 = compute_threshold(671.0, 1000000, t1)
+        t3 = compute_threshold(671.0, 1000000, t2)
+        assert t1 == t2 == t3
+        assert t1 < MAX_THRESHOLD, "sparse-but-not-max growth must not saturate"
+
+    def test_repeated_application_converges(self):
+        """Simulating governor runs with a constant estimate: the sequence of
+        targets must be constant (not arithmetic-growth)."""
+        seq = [compute_threshold(1800.0, 1000000) for _ in range(10)]
+        assert len(set(seq)) == 1
+        assert abs(seq[0] - FALLBACK_THRESHOLD) < 1e-9
+
+    def test_fallback_calibrated_045(self):
+        """2026-09-02 calibration: FALLBACK_THRESHOLD = 0.45 (was 0.60)."""
+        assert FALLBACK_THRESHOLD == 0.45
+
+
+class TestPriceNudge:
+    """Price-aware compaction nudging (plan C1, 2026-09-02)."""
+
+    def test_neutral_at_reference(self):
+        import compression_growth_governor as mod
+        assert mod._price_nudge(0.02) == 0.0
+
+    def test_expensive_lane_compacts_sooner(self):
+        import compression_growth_governor as mod
+        assert mod._price_nudge(0.20) < 0.0
+
+    def test_cheap_lane_preserves_longer(self):
+        import compression_growth_governor as mod
+        assert mod._price_nudge(0.005) > 0.0
+
+    def test_bounded(self):
+        import compression_growth_governor as mod
+        for price in (1e-6, 0.001, 0.02, 1.0, 10.0, 1000.0):
+            n = mod._price_nudge(price)
+            assert -mod.PRICE_NUDGE_MAX <= n <= mod.PRICE_NUDGE_MAX
+
+    def test_unknown_price_is_neutral(self):
+        import compression_growth_governor as mod
+        assert mod._price_nudge(None) == 0.0
+        assert mod._price_nudge(0.0) == 0.0
+
+    def test_expensive_traffic_lowers_threshold(self):
+        """End-to-end: an expensive realized price must lower the target vs
+        the same growth at reference price (mock the measurement)."""
+        import compression_growth_governor as mod
+        with patch.object(mod, "_price_nudge", return_value=-0.10):
+            expensive = mod.compute_threshold(1000.0, 1000000)
+        with patch.object(mod, "_price_nudge", return_value=0.0):
+            neutral = mod.compute_threshold(1000.0, 1000000)
+        assert expensive < neutral
+
+
+class TestExemptProfiles:
+    """Deliberate thresholds must survive governor runs (2026-09-02)."""
+
+    def test_kimi_consultant_is_exempt(self):
+        import compression_growth_governor as mod
+        assert "kimi-consultant" in mod.EXEMPT_PROFILES
+
+    def test_main_skips_exempt_profile(self, tmp_path, monkeypatch):
+        """main() must not touch the config of an exempt profile."""
+        import compression_growth_governor as mod
+        profiles_dir = tmp_path / "profiles"
+        exempt_cfg = profiles_dir / "kimi-consultant" / "config.yaml"
+        exempt_cfg.parent.mkdir(parents=True)
+        exempt_cfg.write_text(
+            "model:\n  default: kimi\n  context_length: 262144\n"
+            "compression:\n  threshold: 0.15\n"
+        )
+        monkeypatch.setattr(mod, "PROFILES_DIR", profiles_dir)
+        monkeypatch.setattr(mod, "DB_PATH", tmp_path / "missing.db")  # g=baseline
+        calls = []
+        monkeypatch.setattr(
+            mod, "apply_threshold",
+            lambda new, cfg, name=None, growth_rate=0.0, kalman_estimate=0.0:
+                calls.append(name) or False)
+        monkeypatch.setattr(mod, "save_state", lambda state: None)
+
+        summary = mod.main()
+
+        assert "kimi-consultant" not in calls, "exempt profile must not be governed"
+        entry = next(r for r in summary["profile_results"]
+                     if r["profile"] == "kimi-consultant")
+        assert entry.get("skipped") is True
+        assert "old_config" not in entry

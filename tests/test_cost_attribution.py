@@ -169,3 +169,29 @@ class TestCostAttributionNeverNull(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestOllamaCloud3FamilyAttribution(unittest.TestCase):
+    """2026-09-02 (plan B2): ollama_cloud_3 must attribute at the measured oc
+    family rate (~$0.0155/M) — NEVER the UNKNOWN_PROVIDER_FALLBACK ($1.00/M)
+    that poisoned 134 rows / $9.8 phantom spend on 2026-09-01/02."""
+
+    def test_oc3_uses_family_rate_not_fallback(self):
+        with patch.object(z, "_rpt_rate", return_value=0.0155), \
+             patch.object(z, "_get_ollama_cloud_cost_per_1m", return_value=0.0155):
+            cost = z._estimate_cost_usd("ollama_cloud_3", 1_000_000)
+        self.assertAlmostEqual(cost, 0.0155, places=4)
+        self.assertLess(cost, 0.10,
+                        "oc3 attribution must stay in the included-lane range, "
+                        "never the $1.00/M UNKNOWN fallback")
+
+    def test_oc3_cost_scales_with_tokens(self):
+        with patch.object(z, "_rpt_rate", return_value=0.0155):
+            one_m = z._estimate_cost_usd("ollama_cloud_3", 1_000_000)
+            ten_m = z._estimate_cost_usd("ollama_cloud_3", 10_000_000)
+        self.assertAlmostEqual(ten_m, one_m * 10, places=4)
+
+    def test_oc_unchanged_by_oc3_fix(self):
+        # The primary key keeps its regime-aware pricing path.
+        with patch.object(z, "_get_ollama_cloud_cost_per_1m", return_value=0.02):
+            cost = z._estimate_cost_usd("ollama_cloud", 1_000_000)
+        self.assertAlmostEqual(cost, 0.02, places=4)

@@ -107,14 +107,18 @@ def state_file(tmp_path: Path):
 def patched_config_paths(tmp_path: Path):
     """Patch PROFILES_DIR and CONFIG_PATH so real config is never touched.
 
-    Creates a mock profiles directory with a single 'manager' profile
-    that has config.yaml with context_length=200000.
+    Creates a mock profiles directory with a 'manager' profile (exempt)
+    and a 'worker-test' profile (non-exempt), each with config.yaml
+    context_length=200000.
     """
     profiles_dir = tmp_path / "profiles"
     mgr_dir = profiles_dir / "manager"
     mgr_dir.mkdir(parents=True)
     cfg = mgr_dir / "config.yaml"
     cfg.write_text("model:\n  context_length: 200000\n")
+    worker_dir = profiles_dir / "worker-test"
+    worker_dir.mkdir(parents=True)
+    (worker_dir / "config.yaml").write_text("model:\n  context_length: 200000\n")
     with mock.patch.object(dclg, "PROFILES_DIR", profiles_dir), \
          mock.patch.object(dclg, "CONFIG_PATH", cfg):
         yield cfg
@@ -514,7 +518,7 @@ class TestProcessProfile:
         ])
         with mock.patch.object(dclg, "DB_PATH", tmp_db), \
              mock.patch("subprocess.run") as mock_run:
-            output = dclg.process_profile("manager")
+            output = dclg.process_profile("worker-test")
         assert output["detected_model"] == "glm-5.2"
         assert output["registry_ctx"] == 200000
         assert output["applied"] is False
@@ -530,7 +534,7 @@ class TestProcessProfile:
              mock.patch("subprocess.run") as mock_run, \
              mock.patch.object(dclg, "get_current_context_length", return_value=200000):
             mock_run.return_value = mock.MagicMock(returncode=0, stdout="ok", stderr="")
-            output = dclg.process_profile("manager")
+            output = dclg.process_profile("worker-test")
         assert output["detected_model"] == "glm-5.3"
         assert output["registry_ctx"] == 1000000
         assert output["new_ctx"] == 1000000
@@ -541,7 +545,7 @@ class TestProcessProfile:
         missing = tmp_path / "nonexistent.db"
         with mock.patch.object(dclg, "DB_PATH", missing), \
              mock.patch("subprocess.run") as mock_run:
-            output = dclg.process_profile("manager")
+            output = dclg.process_profile("worker-test")
         assert output["detected_model"] is None
         assert output["applied"] is False
         mock_run.assert_not_called()
@@ -562,7 +566,7 @@ class TestProcessProfile:
              mock.patch("subprocess.run") as mock_run, \
              mock.patch.object(dclg, "get_current_context_length", return_value=200000):
             mock_run.return_value = mock.MagicMock(returncode=0, stdout="ok", stderr="")
-            output = dclg.process_profile("manager")
+            output = dclg.process_profile("worker-test")
         assert output["detected_model"] == "glm-5.3"
         assert output["413_count"] == 4
         # 90% of 1000000 = 900000
@@ -735,3 +739,104 @@ class TestMainMultiProfile:
         # Error should be captured in skipped
         assert len(output["profiles_skipped"]) == 1
         assert "error" in output["profiles_skipped"][0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# DELIBERATE_CONTEXT_LENGTHS — exemption mechanism
+# ---------------------------------------------------------------------------
+
+class TestDeliberateContextLengths:
+    """Deliberate context_lengths must survive governor runs (2026-09-02)."""
+
+    def test_manager_is_exempt(self):
+        assert "manager" in dclg.DELIBERATE_CONTEXT_LENGTHS
+        assert dclg.DELIBERATE_CONTEXT_LENGTHS["manager"] == 200000
+
+    def test_process_profile_skips_exempt(self, tmp_db, registry_file, state_file, patched_config_paths):
+        """process_profile must not touch config of an exempt profile."""
+        now = time.time()
+        make_test_db(tmp_db, [
+            (now - 10, None, None, "glm-5.3", 200, 20, 220, None, 0, 0, 0, 200, None, 600, None, None, None, None),
+        ])
+        with mock.patch.object(dclg, "DB_PATH", tmp_db), \
+             mock.patch("subprocess.run") as mock_run:
+            output = dclg.process_profile("manager")
+        assert output["applied"] is False
+        assert output["reason"] == "exempt (deliberate context_length)"
+        assert output["detected_model"] is None
+        mock_run.assert_not_called()
+
+    def test_main_skips_exempt_profile(self, tmp_db, registry_file, state_file, tmp_path: Path):
+        """main() must not govern an exempt profile."""
+        profiles_dir = tmp_path / "profiles"
+        mgr_dir = profiles_dir / "manager"
+        mgr_dir.mkdir(parents=True)
+        (mgr_dir / "config.yaml").write_text("model:\n  context_length: 200000\n")
+
+        now = time.time()
+        make_test_db(tmp_db, [
+            (now - 10, None, None, "glm-5.3", 200, 20, 220, None, 0, 0, 0, 200, None, 600, None, None, None, None),
+        ])
+        with mock.patch.object(dclg, "PROFILES_DIR", profiles_dir), \
+             mock.patch.object(dclg, "DB_PATH", tmp_db), \
+             mock.patch("subprocess.run") as mock_run:
+            output = dclg.main(profiles=["manager"])
+
+        assert output["profiles_updated"] == []
+        assert len(output["profiles_skipped"]) == 1
+        assert output["profiles_skipped"][0]["reason"] == "exempt (deliberate context_length)"
+        mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# detect_active_model_for_profile() — cron-filter behavior
+# ---------------------------------------------------------------------------
+
+class TestDetectActiveModelForProfile:
+
+    def test_excludes_cron_sessions(self, tmp_db):
+        """Cron sessions must not stamp the interactive model signal."""
+        now = time.time()
+        make_test_db(tmp_db, [
+            # Most recent is a cron session (deepseek) — must be excluded
+            (now - 5, None, None, "deepseek-v4-pro", 100, 10, 110, None, 0, 0, 0, 200, None, 500, None, None, "cron_abc123", None),
+            # Older interactive session (glm-5.3) — should win
+            (now - 10, None, None, "glm-5.3", 200, 20, 220, None, 0, 0, 0, 200, None, 600, None, None, "20260901_150640_b4d817eb", None),
+        ])
+        model = dclg.detect_active_model_for_profile("worker-test", db_path=tmp_db)
+        assert model == "glm-5.3"
+
+    def test_null_session_id_is_kept(self, tmp_db):
+        """Rows with NULL session_id are interactive and must be kept."""
+        now = time.time()
+        make_test_db(tmp_db, [
+            (now - 5, None, None, "glm-5.2", 100, 10, 110, None, 0, 0, 0, 200, None, 500, None, None, None, None),
+        ])
+        model = dclg.detect_active_model_for_profile("worker-test", db_path=tmp_db)
+        assert model == "glm-5.2"
+
+    def test_only_cron_sessions_returns_none(self, tmp_db):
+        """If only cron sessions exist, returns None (no interactive signal)."""
+        now = time.time()
+        make_test_db(tmp_db, [
+            (now - 5, None, None, "deepseek-v4-pro", 100, 10, 110, None, 0, 0, 0, 200, None, 500, None, None, "cron_abc123", None),
+        ])
+        model = dclg.detect_active_model_for_profile("worker-test", db_path=tmp_db)
+        assert model is None
+
+    def test_profile_mapping_restricts_to_mapped_sessions(self, tmp_db):
+        """When SESSION_PROFILE_MAP has entries, restrict to those sessions."""
+        now = time.time()
+        make_test_db(tmp_db, [
+            # A different interactive session (glm-5.3) — not mapped to worker-test
+            (now - 5, None, None, "glm-5.3", 200, 20, 220, None, 0, 0, 0, 200, None, 600, None, None, "20260901_150640_b4d817eb", None),
+            # Mapped session (glm-5.2) — should win for worker-test
+            (now - 10, None, None, "glm-5.2", 100, 10, 110, None, 0, 0, 0, 200, None, 500, None, None, "sess_worker_1", None),
+        ])
+        with mock.patch.object(dclg, "SESSION_PROFILE_MAP", {"sess_worker_1": "worker-test"}):
+            model = dclg.detect_active_model_for_profile("worker-test", db_path=tmp_db)
+        assert model == "glm-5.2"
+
+    def test_db_missing_returns_none(self, tmp_path: Path):
+        missing = tmp_path / "nonexistent.db"
+        assert dclg.detect_active_model_for_profile("worker-test", db_path=missing) is None

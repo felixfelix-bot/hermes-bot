@@ -63,6 +63,22 @@ FAMILY_FALLBACKS: dict[str, int] = {
 # Safe fallback when config can't be read
 DEFAULT_CONTEXT_LENGTH = 200_000
 
+# Deliberate overrides: profiles the governor must NOT touch (hand-tuned
+# context_length for specific lanes). Mirrors compression_growth_governor's
+# EXEMPT_PROFILES. 2026-09-02: manager runs at a deliberate 200000 that the
+# global model-detection path kept stomping to 1M (cron/consultant calls
+# pollute the global latest-model signal). The value is informational only —
+# process_profile() skips these profiles entirely.
+DELIBERATE_CONTEXT_LENGTHS: dict[str, int] = {
+    "manager": 200_000,
+}
+
+# session_id → profile mapping for per-profile model attribution.
+# The api_calls table has NO profile column, so exact per-profile attribution
+# requires this mapping. When a profile has no entries here, detection falls
+# back to excluding cron sessions only (the global interactive signal).
+SESSION_PROFILE_MAP: dict[str, str] = {}
+
 
 # ---------------------------------------------------------------------------
 # Profile discovery
@@ -158,6 +174,68 @@ def detect_active_model(
         model = _probe_proxy(proxy_url)
         if model:
             return model
+
+    return None
+
+
+def detect_active_model_for_profile(
+    profile_hint: str,
+    db_path: Path | None = None,
+) -> str | None:
+    """Detect the active model attributable to a specific profile.
+
+    The api_calls table has NO profile column, so exact per-profile
+    attribution requires a session_id → profile mapping. Resolution:
+
+    1. Exclude cron sessions (``session_id LIKE 'cron_%'``) — those are
+       background jobs, not interactive traffic, and must never stamp the
+       interactive model signal.
+    2. If *profile_hint* has entries in :data:`SESSION_PROFILE_MAP`, restrict
+       to the session_ids mapped to that profile.
+    3. If no mapping exists for the profile, fall back to the global
+       interactive signal (all non-cron sessions).
+
+    Returns the most recent matching model, or ``None`` if no rows match.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    if not db_path or not db_path.exists():
+        return None
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+
+        # Build the session filter. Always exclude cron sessions.
+        mapped_sids = [
+            sid for sid, prof in SESSION_PROFILE_MAP.items()
+            if prof == profile_hint
+        ]
+        if mapped_sids:
+            placeholders = ",".join("?" for _ in mapped_sids)
+            row = conn.execute(
+                "SELECT model FROM api_calls "
+                "WHERE status_code = 200 AND model IS NOT NULL "
+                "AND session_id IN (%s) "
+                "ORDER BY ts DESC LIMIT 1" % placeholders,
+                mapped_sids,
+            ).fetchone()
+        else:
+            # No mapping → exclude cron sessions only (global interactive).
+            row = conn.execute(
+                "SELECT model FROM api_calls "
+                "WHERE status_code = 200 AND model IS NOT NULL "
+                "AND (session_id IS NULL OR session_id NOT LIKE 'cron_%%') "
+                "ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+
+        if row and row[0]:
+            return row[0]
+    except Exception as e:
+        print(f"[ctx-governor] per-profile DB query failed: {e}")
+    finally:
+        if conn:
+            conn.close()
 
     return None
 
@@ -382,8 +460,28 @@ def process_profile(profile_name: str) -> dict:
     """
     config_path = profile_config_path(profile_name)
 
-    # 1. Detect active model
-    model = detect_active_model(db_path=DB_PATH, allow_probe=False)
+    # 0. Exemption: profiles with a deliberate hand-tuned context_length
+    #    must never be touched (mirrors compression_growth_governor's
+    #    EXEMPT_PROFILES). Leave config untouched.
+    if profile_name in DELIBERATE_CONTEXT_LENGTHS:
+        current_ctx = get_current_context_length(config_path)
+        print(f"[ctx-governor] {profile_name}: exempt (deliberate context_length)")
+        return {
+            "profile": profile_name,
+            "detected_model": None,
+            "registry_ctx": None,
+            "current_ctx": current_ctx,
+            "new_ctx": None,
+            "applied": False,
+            "413_count": 0,
+            "reason": "exempt (deliberate context_length)",
+        }
+
+    # 1. Detect active model — per-profile first (excludes cron sessions),
+    #    falling back to the global detect when no session rows match.
+    model = detect_active_model_for_profile(profile_name, db_path=DB_PATH)
+    if model is None:
+        model = detect_active_model(db_path=DB_PATH, allow_probe=False)
     current_ctx = get_current_context_length(config_path)
 
     if model is None:
@@ -485,7 +583,8 @@ def main(profiles: list[str] | None = None) -> dict:
             else:
                 skipped.append({
                     "profile": profile_name,
-                    "reason": "no change or model not detected",
+                    "reason": result.get("reason")
+                              or "no change or model not detected",
                 })
 
             # Track state from last successfully processed profile

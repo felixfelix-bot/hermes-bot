@@ -149,16 +149,22 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
     Thread-safe.
 
     Returns a dict with: regime, session_used_pct, weekly_used_pct,
-    session_tokens, weekly_tokens. Falls back to an 'included' default
-    on any error so routing is never broken.
+    monthly_used_pct, session_tokens, weekly_tokens, monthly_tokens. Falls
+    back to an 'included' default on any error so routing is never broken.
+
+    For monthly-budget plans (ollama_cloud_3) the monthly_used_pct is driven
+    by the server /api/usage ``limits.monthly.usage`` fraction (authoritative);
+    oc/oc2 use session+weekly windows as before.
     """
     if _get_quota_status is None or not _OLLAMA_EXTRA_USAGE_ENABLED:
         return {
             "regime": "included",
             "session_used_pct": 0.0,
             "weekly_used_pct": 0.0,
+            "monthly_used_pct": 0.0,
             "session_tokens": 0,
             "weekly_tokens": 0,
+            "monthly_tokens": 0,
         }
     now = time.time()
     cached = _ollama_quota_cache.get(key_name)
@@ -167,6 +173,23 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
         return cached
     try:
         status = _get_quota_status(str(USAGE_DB), key_name=key_name)
+        # Monthly-budget key (ollama_cloud_3): override monthly_used_pct with the
+        # authoritative server fraction (limits.monthly.usage); fall back to the
+        # local rolling estimate if the server fetch is unavailable.
+        if key_name == "ollama_cloud_3":
+            _moly = status.get("monthly_used_pct", 0.0)
+            try:
+                from src.ollama_extra_usage import fetch_ollama_usage
+                if OLLAMA_CLOUD_KEY_3:
+                    _usage = fetch_ollama_usage(api_key=OLLAMA_CLOUD_KEY_3, now=now)
+                    if _usage and _usage.get("limits", {}).get("monthly", {}):
+                        _frac = float(_usage["limits"]["monthly"].get("usage", 0) or 0)
+                        _moly = _frac * 100.0
+            except Exception:
+                pass
+            status["monthly_used_pct"] = _moly
+            status["regime"] = "exhausted" if _moly >= 100.0 else status.get("regime", "included")
+            status["monthly_tokens"] = int(status.get("monthly_tokens", 0))
         _ollama_quota_cache[key_name] = status
         _ollama_quota_cache_ts[key_name] = now
         return status
@@ -177,8 +200,10 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
             "regime": "included",
             "session_used_pct": 0.0,
             "weekly_used_pct": 0.0,
+            "monthly_used_pct": 0.0,
             "session_tokens": 0,
             "weekly_tokens": 0,
+            "monthly_tokens": 0,
         }
 
 def _probe_hardware(hardware_req: str) -> dict:
@@ -484,7 +509,8 @@ except Exception as _pte:
 def _load_keys():
     """Load keys from the manager .env (gitignored, never in repo)."""
     keys = {}
-    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env"]:
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env",
+               Path.home()/".hermes/bot/.env"]:
         if ep.exists():
             for line in ep.read_text(errors="ignore").splitlines():
                 line = line.strip()
@@ -515,11 +541,11 @@ LOCK_THRESHOLDS = {
 #   ollama_cloud  1.0   — flat-rate cloud ($100/mo, rate from real_price_tracker). Preferred
 #                         during z.ai peak hours (UTC 6-10) or when z.ai is dead.
 #   ppq           — pay-per-token; most expensive, last-resort failover only.
-_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0, "ollama_cloud_2": 1.0, "opencode_go": 1.0, "neuralwatt": 1.0}
+_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0, "ollama_cloud_2": 1.0, "ollama_cloud_3": 1.0, "opencode_go": 1.0, "neuralwatt": 1.0}
 UPSTREAM   = "https://api.z.ai/api/coding/paas/v4"
 QUOTA_URL  = "https://api.z.ai/api/monitor/usage/quota/limit"
 CACHE_TTL  = 300                                # 5 min
-PORT       = 9099
+PORT       = int(os.environ.get("PORT", "9099"))
 STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
 
 # ── external failover providers ─────────────────────────────────────────────
@@ -539,6 +565,8 @@ def _load_external_keys():
                     keys["ollama_cloud"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("OLLAMA_CLOUD_API_KEY_2=") and "ollama_cloud_2" not in keys:
                     keys["ollama_cloud_2"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499=") and "ollama_cloud_3" not in keys:
+                    keys["ollama_cloud_3"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("DEEPINFRA_API_KEY=") and "deepinfra" not in keys:
                     keys["deepinfra"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("DEEPINFRA_STARTING_BALANCE=") and "deepinfra_balance" not in keys:
@@ -559,69 +587,30 @@ def _load_external_keys():
                     keys["opencode_go"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("NEURALWATT_API_KEY=") and "neuralwatt" not in keys:
                     keys["neuralwatt"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
-                elif line.startswith("OPENROUTER_OXALPHA_KEY=") and "oxalpha" not in keys:
-                    keys["oxalpha"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
-
-# ── oxalpha promo tier (OX-2, 2026-08-22) ──────────────────────────────────
-# Import + construct the tier from repo src.oxalpha_tier (pure, contract-tested).
-# Fail-closed: any import/config error -> tier absent -> zero regression.
-# NOTE: Must be AFTER _EXTERNAL_KEYS = _load_external_keys() — the tier needs the key.
-_OXALPHA_TIER = None
-_oxalpha_key_alive = True  # validated at startup; False → poller/failover skip
-try:
-    from src.oxalpha_tier import OxalphaTier, load_tier_from_config
-    from src.promo_tier import PromoTierGuard
-    import yaml as _yaml_ox
-    _ox_cfg_path = os.path.expanduser("~/.hermes/bot/config/providers.yaml")
-    _ox_cfg = {}
-    if os.path.exists(_ox_cfg_path):
-        with open(_ox_cfg_path) as _f:
-            _ox_full = _yaml_ox.safe_load(_f) or {}
-        _ox_cfg = _ox_full.get("oxalpha") or {}
-        _ox_strategy = _ox_full.get("strategy") or {}
-    else:
-        _ox_strategy = {}
-    _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
-    _OXALPHA_TIER = load_tier_from_config(_ox_cfg, _ox_strategy, _ox_key)
-    # Validate the oxalpha key (OpenRouter /api/v1/key). A 401 means the
-    # promo key is dead/expired — disable the poller and failover attempts
-    # so we don't spam 401 every 5 min in the logs. One INFO at startup
-    # instead of an error loop.  Re-checking happens on process restart.
-    _oxalpha_key_alive = True
-    if _ox_key:
-        try:
-            _ox_probe = urllib.request.Request(
-                "https://openrouter.ai/api/v1/key",
-                headers={"Authorization": f"Bearer {_ox_key}", "User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(_ox_probe, timeout=10) as _r:
-                if _r.status != 200:
-                    raise OSError(f"HTTP {_r.status}")
-        except Exception as _ke:
-            _oxalpha_key_alive = False
-            print(f"[oxalpha] key DEAD ({_ke}) — poller + failover DISABLED "
-                  f"to avoid 401 spam every 5 min. Promo key suffix=...{_ox_key[-4:]}", flush=True)
-    print(f"[oxalpha] tier loaded — failover_enabled={_OXALPHA_TIER.failover_enabled} "
-          f"configured={_OXALPHA_TIER.configured} key={'present' if _ox_key else 'ABSENT'} "
-          f"alive={_oxalpha_key_alive}", flush=True)
-except Exception as _ox_e:
-    print(f"[oxalpha] tier DISABLED — {_ox_e}", flush=True)
-    _OXALPHA_TIER = None
 
 # Ollama Cloud — primary provider (same tier as z.ai, not just failover)
 OLLAMA_CLOUD_KEY = _EXTERNAL_KEYS.get("ollama_cloud", "")
 OLLAMA_CLOUD_BASE = "https://ollama.com/v1"
 # Ollama Cloud key #2 — second subscription account (market-routed, own Kalman)
 OLLAMA_CLOUD_KEY_2 = _EXTERNAL_KEYS.get("ollama_cloud_2", "")
+# Ollama Cloud key #3 (stoic_herschel_499) — $20/mo MONTHLY-budget credit-pool plan
+# (no 5h session windows; limits.monthly only). Market-routed as T4-included with a
+# monthly window + ~90% delist guard (dead-time penalty ~30 days). See plan
+# plans/ollama3-burn-reduction-2026-09-02.md Phases A/C.
+OLLAMA_CLOUD_KEY_3 = _EXTERNAL_KEYS.get("ollama_cloud_3", "")
 
 # All registered Ollama Cloud keys — the _try_ollama_cloud_any dispatcher
-# iterates this list. Key #1 first (backward compat), key #2 as failover.
+# iterates this list. Key #1 first (backward compat), key #2 as failover, key
+# #3 LAST as the monthly-budget relief valve (oc/oc2 drain 5h windows daily, so
+# they stay primary; oc3 absorbs overflow to protect its ~30-day pool from early
+# exhaustion). Empty keys are dropped below.
 _OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = [
     ("ollama_cloud", OLLAMA_CLOUD_KEY),
     ("ollama_cloud_2", OLLAMA_CLOUD_KEY_2),
+    ("ollama_cloud_3", OLLAMA_CLOUD_KEY_3),
 ]
 _OLLAMA_CLOUD_KEYS = [(n, k) for n, k in _OLLAMA_CLOUD_KEYS if k]  # drop empty
 
@@ -721,6 +710,10 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
     "ollama_cloud_2": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_3": {
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
@@ -903,10 +896,6 @@ _DEAD_KEY_BACKOFF_SECONDS = 3600
 # Medium flat backoff.
 _SERVER_ERROR_BACKOFF_SECONDS = 30
 
-# Legacy aliases — kept so any external script referencing them still resolves.
-_BACKOFF_BASE_SECONDS = 30
-_BACKOFF_CAP_SECONDS    = 3600
-
 # Log a KEY_DEAD anomaly after this many consecutive failures of any type —
 # surfaces persistently-failing keys (e.g. a cancelled subscription) to dashboards.
 _KEY_DEAD_THRESHOLD     = 7
@@ -933,6 +922,7 @@ _OLLAMA_PAYWALL_FLAG = Path.home() / ".hermes" / "bot" / ".ollama_exhausted_unti
 _OLLAMA_PAYWALL_FLAGS: dict[str, Path] = {
     "ollama_cloud": _OLLAMA_PAYWALL_FLAG,
     "ollama_cloud_2": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_2",
+    "ollama_cloud_3": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_3",
 }
 
 
@@ -971,15 +961,6 @@ def _ollama_paywall_active(key_name: str = "ollama_cloud") -> bool:
         return time.time() < float(flag.read_text().strip())
     except Exception:
         return False
-
-
-def _clear_ollama_paywall_flag(key_name: str = "ollama_cloud") -> None:
-    """Clear the per-key paywall flag (Monday reset confirmed by a probe)."""
-    try:
-        flag = _OLLAMA_PAYWALL_FLAGS.get(key_name, _OLLAMA_PAYWALL_FLAG)
-        flag.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 
 def _is_manually_disabled(name: str) -> bool:
@@ -1584,6 +1565,15 @@ def _neuralwatt_quota_snapshot() -> dict:
       * fresh row → forwards the collector's dict, but if the daily cap is
         exceeded we override used_pct=100 so routing drops neuralwatt today.
 
+    Credit-mode override (NW-API 2026-09-02, B1): the kWh subscription
+    allowance can be EXHAUSTED while a pay-as-you-go CREDIT balance remains
+    (user top-up). The kWh pool drives is_exhausted/used_pct, but with
+    credits > 0 NeuralWatt keeps serving on credit — ADR-004 "Phase B
+    overage" is real, it bills the credit balance. When that happens we
+    treat CREDITS as the binding budget (is_exhausted=False, regime
+    "credit", used_pct from the credit fraction) so the router keeps using
+    neuralwatt as a paid rung with scarcity pricing protecting the balance.
+
     Revert-safe: on any failure returns the cold-start fallback dict so
     routing never breaks. Never raises.
     """
@@ -1593,11 +1583,25 @@ def _neuralwatt_quota_snapshot() -> dict:
         entry = _neuralwatt_quota_entry_fn()
         if not isinstance(entry, dict):
             return {"used_pct": 0.0, "remaining": float("inf")}
+        entry = dict(entry)  # copy so we don't mutate the collector's dict
+        # Credit-mode override: kWh exhausted but credits remain → funded.
+        remaining_credits = float(entry.get("remaining_usd", 0.0) or 0.0)
+        total_credits = float(entry.get("total_credits_usd", 0.0) or 0.0)
+        if remaining_credits > 0.0 and entry.get("is_exhausted"):
+            used_frac = 0.0
+            if total_credits > 0.0:
+                used_frac = max(
+                    0.0, min(1.0, 1.0 - remaining_credits / total_credits)
+                )
+            entry["is_exhausted"] = False
+            entry["regime"] = "credit"
+            entry["used_pct"] = round(used_frac * 100.0, 2)
+            entry["remaining"] = remaining_credits
+            entry["total"] = total_credits
         # Daily-cap enforcement: when today's spend exceeds the cap, signal
         # exhaustion to the router by clamping used_pct to 100.0. This is the
         # primary runaway-burn guardrail (prevents another $258-in-one-day).
         if entry.get("is_daily_cap_exceeded"):
-            entry = dict(entry)  # copy so we don't mutate the collector's dict
             entry["used_pct"] = 100.0
             entry["regime"] = "daily-capped"
         return entry
@@ -1620,27 +1624,40 @@ def _snapshot_quota() -> dict:
                 }
         # Ollama Cloud — real quota from ollama_quota_tracker (EUv2-5)
         # Per-key since 2026-08-23: each subscription gets its own snapshot.
-        for _oc_key in ("ollama_cloud", "ollama_cloud_2"):
+        # oc/oc2 = session + weekly windows; oc3 (stoic_herschel_499) = MONTHLY
+        # budget pool only (no 5h sessions) — used_pct driven by the monthly
+        # usage fraction from /api/usage, with a ~90% scarcity guard.
+        for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
             oc_status = _get_ollama_quota_status(_oc_key)
-            oc_used_pct = max(oc_status["session_used_pct"], oc_status["weekly_used_pct"])
+            if _oc_key == "ollama_cloud_3":
+                oc_used_pct = float(oc_status.get("monthly_used_pct", 0.0))
+                # Monthly pools: no partial-window resets, so guard ~90% used so
+                # scarcity pricing kicks in before the ~30-day dead-time.
+                oc_total = oc_status.get("monthly_tokens", 0) or 0
+                oc_regime = oc_status.get("regime", "included")
+            else:
+                oc_used_pct = max(oc_status["session_used_pct"], oc_status["weekly_used_pct"])
+                oc_total = _OC_SESSION_LIMIT
+                oc_regime = oc_status["regime"]
             # G2: while the 403-paywall flag is fresh, force used_pct=100 so
             # quota_pressure sends the effective price to +inf (the paywall has
             # no extra-usage path) — the router avoids Ollama on PRICE, not just
             # health. Local token counting can't see the server-side window.
             if _ollama_paywall_active(_oc_key):
                 oc_used_pct = 100.0
-            # Use the session limit for remaining/total display
-            oc_total = _OC_SESSION_LIMIT
-            oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0))
+                oc_regime = "paywalled"
+            oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0)) if oc_total else float("inf")
             snap[_oc_key] = {
                 "used_pct": float(oc_used_pct),
                 "remaining": oc_remaining,
                 "total": oc_total,
-                "regime": "paywalled" if _ollama_paywall_active(_oc_key) else oc_status["regime"],
-                "session_used_pct": oc_status["session_used_pct"],
-                "weekly_used_pct": oc_status["weekly_used_pct"],
-                "session_tokens": oc_status["session_tokens"],
-                "weekly_tokens": oc_status["weekly_tokens"],
+                "regime": oc_regime,
+                "session_used_pct": oc_status.get("session_used_pct", 0.0),
+                "weekly_used_pct": oc_status.get("weekly_used_pct", 0.0),
+                "monthly_used_pct": oc_status.get("monthly_used_pct", 0.0),
+                "session_tokens": oc_status.get("session_tokens", 0),
+                "weekly_tokens": oc_status.get("weekly_tokens", 0),
+                "monthly_tokens": oc_status.get("monthly_tokens", 0),
             }
         # Per-token providers — effectively unlimited
         snap["opencode_go"] = {
@@ -1671,6 +1688,7 @@ def _snapshot_health() -> dict:
             h[name] = _is_key_healthy(name)
         h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
         h["ollama_cloud_2"] = _is_key_healthy("ollama_cloud_2")
+        h["ollama_cloud_3"] = _is_key_healthy("ollama_cloud_3")
         h["opencode_go"] = _is_key_healthy("opencode_go")
         # NW-API: daily-cap guardrail (real /v1/usage/summary).
         # When today's REAL spend from /v1/usage/summary exceeds
@@ -1820,6 +1838,12 @@ try:
     # ollama_cloud_2 — second T4 included subscription (2026-08-23)
     _shadow_optimizer.add_provider(
         "ollama_cloud_2", _shadow_pk(0.001), _ShadowConsumptionKalman(),
+        quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
+    )
+    # ollama_cloud_3 (stoic_herschel_499) — monthly-budget pool, T4-included.
+    # qu Total displayed as session-width for the legacy shadow path only.
+    _shadow_optimizer.add_provider(
+        "ollama_cloud_3", _shadow_pk(0.001), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
     # opencode_go — T3 flat-rate $10/mo subscription: marginal cost $0,
@@ -2682,6 +2706,14 @@ def _log_provider_telemetry(
 _SPEND_CAP_MANAGER = float(os.environ.get("SPEND_CAP_MANAGER", "inf"))
 _SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "inf"))
 
+# D6 (2026-09-02): metered-only cash breaker tiers. These are the providers
+# where a request spends NEW money (pay-per-token / credits). Subscription
+# lanes are deliberately absent — see _check_global_spend_cap docstring.
+_METERED_SPEND_TIERS = frozenset({
+    "neuralwatt", "routstr", "routstrd", "deepinfra",
+    "telnyx", "ppq", "openrouter",
+})
+
 # ── Cost per 1M tokens (RP-4: real_price_tracker is the source of truth) ──────
 # Hardcoded rate constants have been replaced by real_price_tracker.
 # get_rate_with_fallback() resolves: real data → Ollama API → LAST_RESORT_RATES.
@@ -2692,6 +2724,7 @@ _FALLBACK_OLLAMA_CLOUD_EXTRA = 0.15     # above-quota rate
 _FALLBACK_RATES: dict[str, float] = {
     "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
     "ollama_cloud_2": _FALLBACK_OLLAMA_CLOUD_BASE,
+    "ollama_cloud_3": _FALLBACK_OLLAMA_CLOUD_BASE,
     "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
     "neuralwatt":   2.21,     # glm-5.2 blended (primary model, conservative seed)
     "friend":       0.015,    # z.ai $300/yr amortized seed
@@ -3134,7 +3167,7 @@ def _spend_tier(key_name: str | None) -> str:
     telnyx/ppq/openrouter/routstr (paid external failover providers)."""
     if key_name in ("ours", "friend"):
         return key_name
-    elif key_name in ("ollama_cloud", "ollama_cloud_2"):
+    elif key_name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
         return key_name
     elif key_name == "deepinfra":
         return "deepinfra"
@@ -3808,12 +3841,33 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
 
 
 def _check_global_spend_cap() -> tuple[bool, float, float]:
-    """Check total daily spend across ALL tiers against the manager cap.
+    """Check today's METERED spend (real cash) against SPEND_CAP_METERED.
 
-    DEACTIVATED (2026-08-20): always allows. The merchant module markets
-    and wallet balance decide routing, not hard-coded caps.
+    Reactivated 2026-09-02 (D6, burn-reduction plan), scoped to METERED
+    providers only (neuralwatt, routstr, routstrd, deepinfra, telnyx, ppq,
+    openrouter) — the tiers where a request spends NEW money. Subscription
+    lanes (ours/friend/ollama_cloud*/opencode_go) are excluded: their
+    daily_spend rows are opportunity-cost accounting against already-paid
+    quotas, and blocking them would 503 sessions while real quota remains
+    (the failure mode that made the original 2026-08-20 hard caps harmful).
+
+    env SPEND_CAP_METERED (USD/day, default 25.0). The market-based pricing
+    (pressure FSM, depletion penalties, neuralwatt daily cap) remains the
+    primary mechanism — this is the last-resort cash circuit breaker.
     """
-    return (True, 0.0, float('inf'))
+    cap = float(os.environ.get("SPEND_CAP_METERED", "25.0"))
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rows = _usage_db().execute(
+            "SELECT tier, spend_usd FROM daily_spend WHERE date=?",
+            (today,)).fetchall()
+    except Exception:
+        return (True, 0.0, cap)
+    metered = 0.0
+    for tier, spend in rows or []:
+        if tier in _METERED_SPEND_TIERS and spend:
+            metered += float(spend)
+    return (metered < cap, round(metered, 4), cap)
 
 
 def _init_spend_table() -> None:
@@ -4066,7 +4120,7 @@ def _build_key_state_overview() -> str:
     # Key states
     health = _snapshot_health()
     quota = _snapshot_quota()
-    all_keys = ["ours", "friend", "ollama_cloud", "ollama_cloud_2", "opencode_go",
+    all_keys = ["ours", "friend", "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "opencode_go",
                 "neuralwatt", "deepinfra", "telnyx", "ppq", "openrouter",
                 "routstr", "routstrd"]
 
@@ -4106,11 +4160,12 @@ def _build_key_state_overview() -> str:
             allow = _opencode_go_allowance.get("remaining_usd")
             if allow is not None:
                 status += f" (allowance ${allow:.2f} remaining)"
-        elif name in ("ollama_cloud", "ollama_cloud_2"):
+        elif name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
             sess = qp.get("session_used_pct", 0) if isinstance(qp, dict) else 0
             wkly = qp.get("weekly_used_pct", 0) if isinstance(qp, dict) else 0
+            moly = qp.get("monthly_used_pct", 0) if isinstance(qp, dict) else 0
             if isinstance(sess, (int, float)):
-                status += f" (session {sess:.0f}%, weekly {wkly:.0f}%)"
+                status += f" (session {sess:.0f}%, weekly {wkly:.0f}%, monthly {moly:.0f}%)"
 
         lines.append(f"  {name:20s} {status}")
 
@@ -4251,15 +4306,6 @@ def _refresh_loop():
         # Check for keys that have been unavailable for ≥15 min
         _check_sustained_down()
         time.sleep(CACHE_TTL)
-
-
-def _weekly_pct(windows: list[dict]) -> int:
-    """Return the ``weekly`` window's used_pct, falling back to max_pct when no
-    weekly window is present (e.g. the friend key sometimes lacks one)."""
-    for w in windows:
-        if w.get("name") == "weekly":
-            return w.get("used_pct", 0)
-    return _max_pct(windows)
 
 
 def _best_unlocked():
@@ -5161,101 +5207,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _serve_via_oxalpha(self, body: bytes, response_buffer: bytearray, t0: float) -> bool:
-        """Attempt a single request to the oxalpha free promo tier.
-
-        Single attempt, 90s timeout, forced model=stealth/ox-alpha.
-        On ANY error (429/timeout/5xx/402) falls through to the paid chain.
-        Returns True on success (response already sent), False otherwise.
-        """
-        if not _OXALPHA_TIER or not _OXALPHA_TIER.failover_eligible():
-            return False
-        # Dead promo key (validated at startup) — skip, don't burn a
-        # 401 round-trip on every failover attempt.
-        if not _oxalpha_key_alive:
-            return False
-        _ox_key = _EXTERNAL_KEYS.get("oxalpha", "")
-        if not _ox_key:
-            return False
-        try:
-            body_json = json.loads(body) if body else {}
-        except Exception:
-            return False
-        req_body = _OXALPHA_TIER.build_request_body(body_json)
-        fwd = json.dumps(req_body).encode()
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        hdrs = {
-            "Authorization": f"Bearer {_ox_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://hermes.local",
-            "X-Title": "Hermes Agent (oxalpha promo)",
-            "User-Agent": "Mozilla/5.0",
-        }
-        print(f"[failover] trying oxalpha model=stealth/ox-alpha cost=$0.00/M (FREE promo)", flush=True)
-        try:
-            req = urllib.request.Request(url, data=fwd, method="POST", headers=hdrs)
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                self.send_response(resp.status)
-                for h, v in resp.headers.items():
-                    if h.lower() not in ("transfer-encoding", "connection"):
-                        self.send_header(h, v)
-                self.send_header("X-Failover-Provider", "oxalpha")
-                self.end_headers()
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    response_buffer.extend(chunk)
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                # Parse usage for spend tracking + cost guard
-                ext_usage = _parse_usage(bytes(response_buffer))
-                ext_tokens = int(ext_usage.get("total_tokens") or 0)
-                ext_cost_usd, ext_cost_source = _extract_cost("openrouter", bytes(response_buffer), ext_tokens)
-                # Observe cost — any cost > 0 kills the tier (no re-enable)
-                if ext_cost_usd is not None and ext_cost_usd > 0:
-                    _OXALPHA_TIER.observe_response_cost(ext_cost_usd)
-                    print(f"[oxalpha] SPEND DETECTED — cost=${ext_cost_usd:.6f} — tier KILLED", flush=True)
-                _OXALPHA_TIER.note_success()
-                _record_spend("oxalpha", "stealth/ox-alpha", ext_tokens, actual_cost=ext_cost_usd)
-                if _LIVE_ROUTER is not None:
-                    try:
-                        _LIVE_ROUTER.record_request(provider="oxalpha", tokens=ext_tokens)
-                    except Exception:
-                        pass
-                _log_api_call(
-                    key_name="oxalpha", key_suffix=_ox_key[-4:],
-                    model="stealth/ox-alpha",
-                    prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
-                    completion_tokens=int(ext_usage.get("completion_tokens") or 0),
-                    total_tokens=ext_tokens,
-                    tier="oxalpha", status_code=resp.status, error=None,
-                    duration_ms=int((time.time() - t0) * 1000),
-                    cost_usd=ext_cost_usd, cost_source=ext_cost_source,
-                    cache_hit=0,
-                    session_id=getattr(self, "_session_id", None),
-                    task_type=getattr(self, "_task_type", None),
-                )
-                _log_key_decision(chosen_key="oxalpha", reason="zai_exhausted_oxalpha_free_failover")
-                return True
-        except urllib.error.HTTPError as he:
-            if he.code == 429:
-                delay = _OXALPHA_TIER.note_429()
-                # Log ALL rate-limit headers for empirical discovery
-                rl_headers = {k: v for k, v in he.headers.items() if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"}
-                print(f"[failover] oxalpha returned 429 — backoff {delay}s — headers={rl_headers} — trying next", flush=True)
-            elif he.code == 402:
-                _OXALPHA_TIER.note_http_status(402)
-                print(f"[failover] oxalpha returned 402 — tier disabled for promo remainder — trying next", flush=True)
-            else:
-                _OXALPHA_TIER.note_failure()
-                print(f"[failover] oxalpha returned HTTP {he.code} — trying next", flush=True)
-            return False
-        except Exception as e:
-            _OXALPHA_TIER.note_failure()
-            print(f"[failover] oxalpha exception: {type(e).__name__}: {e} — trying next", flush=True)
-            return False
-
     def _try_external_single(self, provider_name: str, body: bytes,
                               model: str | None,
                               response_buffer: bytearray, t0: float) -> bool:
@@ -5380,16 +5331,6 @@ class Handler(BaseHTTPRequestHandler):
         Returns True on success (response already sent),
         False on failure (caller should send error response).
         """
-        # ── OX-2 EMERGENCY: oxalpha free-tier attempt BEFORE any paid provider ──
-        # Positioned after z.ai keys (the only way this function is reached)
-        # and before every paid candidate. Single attempt, 90s timeout.
-        # ANY error falls through to the paid chain — zero regression.
-        # Skipped entirely when the promo key was validated dead at startup.
-        if _OXALPHA_TIER is not None and _OXALPHA_TIER.failover_eligible() \
-                and _oxalpha_key_alive:
-            if self._serve_via_oxalpha(body, response_buffer, t0):
-                return True
-            # oxalpha failed — fall through to paid chain below
 
         # ── FIX: Silent model substitution bug (2026-08-25) ──────────────────
         # Previously, ANY non-glm-5.2/5.3 model was silently replaced with
@@ -5667,10 +5608,11 @@ class Handler(BaseHTTPRequestHandler):
         allowed, current_spend, cap = _check_global_spend_cap()
         if not allowed:
             err = json.dumps({
-                "error": f"daily spend cap exceeded (global)",
+                "error": f"daily METERED spend cap exceeded (neuralwatt/routstr/routstrd/deepinfra/telnyx/ppq/openrouter)",
                 "spend_usd": round(current_spend, 4),
                 "cap_usd": cap,
-                "reset_at": "midnight local"
+                "hint": "subscription lanes (ours/friend/ollama_cloud*) are NOT blocked — retry with a sub-served model or wait for the metered market pricing to recover",
+                "reset_at": "midnight UTC"
             }).encode()
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
@@ -5701,13 +5643,10 @@ class Handler(BaseHTTPRequestHandler):
         #   4. On failure: mark key failure, try next candidate
         #   5. If all candidates fail: send 503
         #
-        # Special cases handled before this point:
-        #   - Ollama-only models (kimi-k2.7-code, etc.) → routed to ollama above
-        #   - Telnyx-direct models (kimi-k3) → routed to telnyx above
-        #   - Non-z.ai models (deepseek/*, qwen, etc.) → routed to external above
-        # The flat router handles these naturally via PROVIDER_MODELS, but the
-        # early exits above are kept for backward compatibility (they skip the
-        # candidate evaluation overhead for these known-special cases).
+        # Special cases: ollama-only models, telnyx-direct models, and
+        # non-z.ai models are NOT special-cased above — the flat router
+        # handles them naturally via PROVIDER_MODELS. The old best_key()
+        # rollback path keeps its own special-case handling.
 
         _FLAT_ROUTER_DISABLE_FLAG = os.path.expanduser(
             "~/.hermes/bot/.disable_flat_router")
@@ -5949,7 +5888,7 @@ class Handler(BaseHTTPRequestHandler):
                         chosen_key=_pick,
                         reason=f"live_kalman_failover_{_pick}")
                     response_buffer = bytearray()
-                    if _pick in ("ollama_cloud", "ollama_cloud_2") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2):
+                    if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
                         if self._try_ollama_cloud_any(
                                 body, original_model, response_buffer, t0):
                             return
@@ -6066,7 +6005,7 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key=_pick,
                     reason=f"live_kalman_failover_{_pick}")
                 response_buffer = bytearray()
-                if _pick in ("ollama_cloud", "ollama_cloud_2") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2):
+                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
                     if self._try_ollama_cloud_any(body, original_model, response_buffer, t0):
                         return
                 elif _pick in EXTERNAL_PROVIDERS or _pick == "deepinfra":
@@ -6096,7 +6035,7 @@ class Handler(BaseHTTPRequestHandler):
         # fall through to the hardcoded failover chain below.
         if chosen not in KEYS:
             response_buffer = bytearray()
-            if chosen in ("ollama_cloud", "ollama_cloud_2") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2):
+            if chosen in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
                 if self._try_ollama_cloud_any(body, original_model, response_buffer, t0):
                     return
             elif chosen in EXTERNAL_PROVIDERS or chosen == "deepinfra":
@@ -6411,7 +6350,7 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key=_pick,
                     reason=f"live_kalman_failover_{_pick}")
                 response_buffer = bytearray()
-                if _pick in ("ollama_cloud", "ollama_cloud_2") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2):
+                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
                     if self._try_ollama_cloud_any(body, model, response_buffer, t0):
                         return
                 elif _pick in EXTERNAL_PROVIDERS:
@@ -6607,6 +6546,7 @@ class Handler(BaseHTTPRequestHandler):
             _sq = _snapshot_quota()
             data["ollama_cloud"] = _sq.get("ollama_cloud", {})
             data["ollama_cloud_2"] = _sq.get("ollama_cloud_2", {})
+            data["ollama_cloud_3"] = _sq.get("ollama_cloud_3", {})
             data["opencode_go"] = _sq.get("opencode_go", {})
             data["neuralwatt"] = _sq.get("neuralwatt", {})
             payload = json.dumps(data, indent=2).encode()
@@ -7111,50 +7051,6 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-# ── oxalpha 5-min usage-delta poller (OX-2 §4.3) ────────────────────────────
-# Polls /api/v1/key for cumulative usage. Kill on cumulative INCREASE.
-# First sample = baseline (never a kill). State in ~/.hermes/bot/.oxalpha_usage_state.json
-def _oxalpha_usage_poller():
-    import json as _json
-    _state_path = os.path.expanduser("~/.hermes/bot/.oxalpha_usage_state.json")
-    _key = _EXTERNAL_KEYS.get("oxalpha", "")
-    if not _key:
-        return
-    # Dead key (validated at startup, OpenRouter 401) — no point polling.
-    # Single startup log already emitted; skip the 5-min error loop.
-    if not _oxalpha_key_alive:
-        return
-    while True:
-        try:
-            if _OXALPHA_TIER is None or not _OXALPHA_TIER.configured:
-                time.sleep(300)
-                continue
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/key",
-                headers={"Authorization": f"Bearer {_key}", "User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = _json.loads(resp.read())
-            new_usage = float(data.get("usage", 0) or 0)
-            # Load previous state
-            prev = None
-            if os.path.exists(_state_path):
-                try:
-                    with open(_state_path) as f:
-                        prev = _json.loads(f.read()).get("cumulative_usage")
-                except Exception:
-                    prev = None
-            kill = _OXALPHA_TIER.decide_usage_kill(prev, new_usage)
-            if kill is not None:
-                print(f"[oxalpha] USAGE DELTA KILL — prev={prev} new={new_usage} delta={new_usage - (prev or 0):.6f}", flush=True)
-            # Save state
-            with open(_state_path, "w") as f:
-                _json.dump({"cumulative_usage": new_usage}, f)
-        except Exception as _e:
-            print(f"[oxalpha] usage poller error: {_e}", flush=True)
-        time.sleep(300)
-
-
 # ── Nostr kind-30315 Kalman pricing publisher ────────────────────────────────
 # Background thread that publishes the /kalman-pricing endpoint data as a
 # public kind-30315 replaceable Nostr event every 30 seconds.  This replaces
@@ -7366,11 +7262,6 @@ def _nostr_publish_kalman():
 if __name__ == "__main__":
     t = threading.Thread(target=_refresh_loop, daemon=True)
     t.start()
-    # OX-2: start oxalpha usage-delta poller
-    # (skipped when the key was validated dead at startup — see _oxalpha_key_alive)
-    if _OXALPHA_TIER is not None and _OXALPHA_TIER.configured and _oxalpha_key_alive:
-        _ox_poll = threading.Thread(target=_oxalpha_usage_poller, daemon=True)
-        _ox_poll.start()
     # Nostr kind-30315 Kalman pricing publisher
     _nostr_thread = threading.Thread(target=_nostr_publish_kalman, daemon=True)
     _nostr_thread.start()

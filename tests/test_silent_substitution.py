@@ -79,9 +79,8 @@ def test_failover_rejects_unknown_model():
     response_buffer = bytearray()
 
     # Call _try_external_failover with an unknown model
-    # Patch _OXALPHA_TIER to None so the oxalpha early-exit doesn't fire
-    with patch.object(zai_proxy, '_OXALPHA_TIER', None):
-        result = handler._try_external_failover(body, "nonexistent-model", response_buffer, 0.0)
+    # (oxalpha early-exit removed 2026-09-01 — no _OXALPHA_TIER patch needed)
+    result = handler._try_external_failover(body, "nonexistent-model", response_buffer, 0.0)
 
     # Should return False (not silently substitute and return True)
     assert result is False, (
@@ -116,8 +115,7 @@ def test_failover_passes_known_model():
     # We patch EXTERNAL_PROVIDERS to be empty so no candidates are found,
     # which returns False at the "no candidates" check — not the model rejection.
     with patch.object(zai_proxy, 'EXTERNAL_PROVIDERS', {}):
-        with patch.object(zai_proxy, '_OXALPHA_TIER', None):
-            result = handler._try_external_failover(body, "deepseek/deepseek-v4-flash", response_buffer, 0.0)
+        result = handler._try_external_failover(body, "deepseek/deepseek-v4-flash", response_buffer, 0.0)
 
     # Should return False because no providers are available, NOT because
     # the model was rejected as unknown

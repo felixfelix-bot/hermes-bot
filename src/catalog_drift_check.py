@@ -63,6 +63,14 @@ PROVIDERS: dict[str, dict] = {
         "catalog_complete": True,
         "type": "quota",
     },
+    # stoic_herschel_499 — $20/mo MONTHLY-budget plan (no 5h/weekly windows).
+    # Same ollama catalog as oc/oc2.
+    "ollama_cloud_3": {
+        "url": "https://ollama.com/v1/models",
+        "key_env": "OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499",
+        "catalog_complete": True,
+        "type": "quota",
+    },
     "neuralwatt": {
         "url": "https://api.neuralwatt.com/v1/models",
         "key_env": "NEURALWATT_API_KEY",

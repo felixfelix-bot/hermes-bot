@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""flat_router.py — Phase 1 flat router: select_provider() in SHADOW MODE.
+"""flat_router.py — flat router: select_provider() as the PRIMARY router.
 
 Implements the flat-hierarchy provider selection described in
 ~/.hermes/profiles/manager/state/flat-router-design.md (§2).
 
-This module runs ALONGSIDE the existing best_key() routing — it does NOT
-replace it. select_provider() is called in shadow mode to log what it
-WOULD have chosen, so operators can compare the two strategies.
+This module REPLACES the old best_key() routing as the primary path
+(Phase 3 full cutover, 2026-08-24). The old best_key() chain in
+production/zai_proxy.py is retained as the ROLLBACK path: touch
+~/.hermes/bot/.disable_flat_router to fall back to it.
 
 Key design principles:
   - All providers are equal (no z.ai preference).
@@ -17,7 +18,7 @@ Key design principles:
 
 Author: Hermes Agent (manager profile)
 Date: 2026-08-24
-Phase: 1 (shadow only — no routing change)
+Phase: 3 (primary router; best_key() retained as rollback only)
 """
 from __future__ import annotations
 
@@ -32,10 +33,23 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 # ── Path bootstrap ──────────────────────────────────────────────────────────
-_BOT = os.path.expanduser("~/.hermes/bot")
-_MRE = os.path.expanduser("~/merchant-routing-engine")
-for _p in [_BOT, _MRE, os.path.join(_MRE, "src")]:
-    if _p not in sys.path:
+# Repo copy: works in two layouts without editing.
+#   * repo checkout — this file at repo root, zai_proxy.py in production/,
+#     Kalman modules (price_kalman, consumption_kalman) in src/
+#   * deployed host — this file copied next to zai_proxy.py (e.g.
+#     ~/.hermes/bot/), Kalman modules from ~/merchant-routing-engine/src
+# Entries added later take import priority, so the repo layout wins when
+# running the in-repo test suite; deployed-host paths only fill gaps.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in [
+    os.path.expanduser("~/.hermes/bot"),                      # deployed host layout
+    os.path.expanduser("~/merchant-routing-engine"),          # (legacy fallback)
+    os.path.expanduser("~/merchant-routing-engine/src"),
+    _HERE,                                                    # repo root / host dir
+    os.path.join(_HERE, "src"),                               # repo src/ modules
+    os.path.join(_HERE, "production"),                        # repo production/zai_proxy.py
+]:
+    if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
 # ── Lazy imports from zai_proxy (avoid circular at module-load) ─────────────
@@ -157,6 +171,19 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "minimax-m3",
     },
+    # ollama_cloud_3 (stoic_herschel_499) — new $20/mo MONTHLY-budget credit-pool
+    # subscription (no 5h session windows; limits.monthly only). Same Ollama
+    # catalog as oc/oc2 (19 models verified 2026-09-02). Tier T4 "included" but
+    # with a MONTHLY window: delist guard ~90% monthly instead of the 60% weekly
+    # (exhaustion has ~30-day dead-time penalty). See plan Phase A/C.
+    "ollama_cloud_3": {
+        "glm-5.2", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code",
+        "gpt-oss:120b", "gpt-oss:20b", "gemma4:31b", "qwen3.5:397b",
+        "glm-5.1", "kimi-k2.6", "minimax-m2.7", "mistral-large-3:675b",
+        "nemotron-3-nano:30b", "nemotron-3-super", "nemotron-3-ultra",
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+        "minimax-m3",
+    },
     # OpenCode Go — flat-rate $10/mo, native glm-5.3, 29 models.
     # deepseek stays in SLASHED canonical form (FR-1 direction).
     "opencode_go": {
@@ -220,6 +247,7 @@ _SEED_RATES: dict[str, float] = {
     "friend":        0.082,   # 0.068 * 1.21
     "ollama_cloud":  0.40,
     "ollama_cloud_2": 0.40,
+    "ollama_cloud_3": 0.40,
     "opencode_go":   0.40,
     "neuralwatt":    2.21,
     "deepinfra":     1.30,
@@ -250,6 +278,7 @@ PROVIDER_TIER: dict[str, str] = {
     "opencode_go":    "flat",
     "ollama_cloud":   "included",
     "ollama_cloud_2": "included",
+    "ollama_cloud_3": "included",
     "deepinfra":      "per_token",
     "ppq":            "per_token",
     "telnyx":         "per_token",
@@ -355,7 +384,7 @@ _ZAI_KEYS = frozenset({"ours", "friend"})
 
 # Names that are flat-rate / included (no balance tracking)
 _FLAT_RATE_PROVIDERS = frozenset({
-    "ollama_cloud", "ollama_cloud_2", "opencode_go",
+    "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "opencode_go",
 })
 
 
@@ -804,7 +833,7 @@ def _make_dispatch_fn(name: str) -> Callable | None:
         return _dispatch_zai
 
     # ollama_cloud → _try_ollama_cloud_any
-    if name in ("ollama_cloud", "ollama_cloud_2"):
+    if name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
         def _dispatch_ollama(handler, body, model, buffer, t0):
             return handler._try_ollama_cloud_any(body, model, buffer, t0)
         return _dispatch_ollama

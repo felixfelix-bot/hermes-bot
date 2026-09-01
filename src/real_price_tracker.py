@@ -439,6 +439,38 @@ def _query_window(
     return (int(row[0] or 0), float(row[1] or 0.0), float(row[2] or 0.0))
 
 
+def _env_file_key(var_name: str) -> str:
+    """Read a key from ~/.hermes/profiles/manager/.env (prod key store).
+
+    The proxy loads API keys from the .env FILE into its own registry, not
+    into os.environ — so os.environ-only lookups silently miss them. This
+    mirrors catalog_drift_check._load_env_keys for the single-variable case.
+    Returns "" when absent. Cached at module level (keys rotate rarely).
+    """
+    cached = _ENV_FILE_CACHE.get(var_name)
+    if cached is not None:
+        return cached
+    value = ""
+    try:
+        from pathlib import Path
+
+        env_path = Path.home() / ".hermes" / "profiles" / "manager" / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(errors="ignore").splitlines():
+                stripped = line.strip()
+                if stripped.startswith(var_name + "="):
+                    value = stripped.split("=", 1)[1].split("#", 1)[0]
+                    value = value.strip().strip("'\"")
+                    break
+    except Exception:
+        value = ""
+    _ENV_FILE_CACHE[var_name] = value
+    return value
+
+
+_ENV_FILE_CACHE: dict[str, str] = {}
+
+
 def _ollama_api_rate(model: str | None, api_key: str | None = None) -> float | None:
     """Measured $/M from the Ollama billing API (``activity.cost`` / tokens).
 
@@ -682,12 +714,16 @@ def get_trailing_rate(
     window = _provider_window(provider)
     rate = get_real_rate(provider, model, window_hours=window, db_path=db, _now=now)
 
-    # ollama_cloud + ollama_cloud_2: real measurement may live in the billing
-    # API, not cost_usd. Both are flat subscriptions with ~$0 marginal per-call.
-    if rate is None and provider in ("ollama_cloud", "ollama_cloud_2"):
+    # ollama_cloud + ollama_cloud_2 + ollama_cloud_3: real measurement may
+    # live in the billing API, not cost_usd. All are flat subscriptions with
+    # ~$0 marginal per-call.
+    if rate is None and provider in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
         _api_key = None
         if provider == "ollama_cloud_2":
-            _api_key = os.environ.get("OLLAMA_CLOUD_API_KEY_2", "")
+            _api_key = os.environ.get("OLLAMA_CLOUD_API_KEY_2", "") or _env_file_key("OLLAMA_CLOUD_API_KEY_2")
+        elif provider == "ollama_cloud_3":
+            _api_key = (os.environ.get("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499", "")
+                        or _env_file_key("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499"))
         rate = _ollama_api_rate(model, api_key=_api_key)
 
     with _cache_lock:

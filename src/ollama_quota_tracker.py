@@ -29,10 +29,16 @@ except ImportError:  # pragma: no cover — yaml is a dev dep
 # ── Window durations in seconds ──────────────────────────────────────────────
 SESSION_WINDOW_S = 5 * 3600   # 5 hours
 WEEKLY_WINDOW_S = 7 * 86400   # 7 days
+MONTHLY_WINDOW_S = 30 * 86400  # 30 days (monthly-budget plans, e.g. ollama_cloud_3)
 
 # ── Default limits (from providers.yaml, used if config not readable) ────────
 DEFAULT_SESSION_LIMIT = 500_000_000      # 500M tokens / 5h
 DEFAULT_WEEKLY_LIMIT = 3_500_000_000     # 3.5B tokens / 7d
+# Monthly-budget plans (ollama_cloud_3): budget is server-side (limits.monthly.usage
+# fraction). This local budget is only a fallback ceiling when the server fraction
+# is unavailable; a large default starts at "included". Tune via providers.yaml
+# included_quota_tokens_monthly once the exact $20/mo allotment is known.
+DEFAULT_MONTHLY_LIMIT = 3_500_000_000
 
 # ── Config path ──────────────────────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(
@@ -44,18 +50,19 @@ _CONFIG_PATH = os.path.join(
 
 def _load_limits(
     config_path: Optional[str] = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Read included-quota limits from providers.yaml.
 
-    Returns (session_limit, weekly_limit). Falls back to defaults if
-    the config file is missing or the keys are absent.
+    Returns (session_limit, weekly_limit, monthly_limit). Falls back to
+    defaults if the config file is missing or the keys are absent.
     """
     path = config_path or _CONFIG_PATH
     session_limit = DEFAULT_SESSION_LIMIT
     weekly_limit = DEFAULT_WEEKLY_LIMIT
+    monthly_limit = DEFAULT_MONTHLY_LIMIT
 
     if yaml is None:
-        return session_limit, weekly_limit
+        return session_limit, weekly_limit, monthly_limit
 
     try:
         with open(path) as f:
@@ -67,10 +74,13 @@ def _load_limits(
         weekly_limit = int(
             oc.get("included_quota_tokens_weekly", weekly_limit)
         )
+        monthly_limit = int(
+            oc.get("included_quota_tokens_monthly", monthly_limit)
+        )
     except (FileNotFoundError, OSError, ValueError, TypeError):
         pass
 
-    return session_limit, weekly_limit
+    return session_limit, weekly_limit, monthly_limit
 
 
 def query_cumulative_tokens(
@@ -131,13 +141,20 @@ def get_quota_status(
     if now is None:
         now = time.time()
 
-    session_limit, weekly_limit = _load_limits(config_path)
+    session_limit, weekly_limit, monthly_limit = _load_limits(config_path)
 
     session_tokens = query_cumulative_tokens(
         db_path, key_name=key_name, window_s=SESSION_WINDOW_S, now=now
     )
     weekly_tokens = query_cumulative_tokens(
         db_path, key_name=key_name, window_s=WEEKLY_WINDOW_S, now=now
+    )
+    # Monthly-budget plans (ollama_cloud_3): local rolling-30d estimate. The
+    # authoritative monthly_used_pct is overridden by the server /api/usage
+    # fraction in the proxy (_get_ollama_quota_status) for oc3; this value is
+    # the deterministic fallback so routing never breaks if the fetch fails.
+    monthly_tokens = query_cumulative_tokens(
+        db_path, key_name=key_name, window_s=MONTHLY_WINDOW_S, now=now
     )
 
     session_used_pct = (
@@ -146,11 +163,15 @@ def get_quota_status(
     weekly_used_pct = (
         (weekly_tokens / weekly_limit * 100.0) if weekly_limit > 0 else 100.0
     )
+    monthly_used_pct = (
+        (monthly_tokens / monthly_limit * 100.0) if monthly_limit > 0 else 100.0
+    )
 
     session_exhausted = session_used_pct >= 100.0
     weekly_exhausted = weekly_used_pct >= 100.0
+    monthly_exhausted = monthly_used_pct >= 100.0
 
-    if session_exhausted and weekly_exhausted:
+    if (session_exhausted and weekly_exhausted) or monthly_exhausted:
         regime = "exhausted"
     elif session_exhausted or weekly_exhausted:
         regime = "extra"
@@ -161,6 +182,8 @@ def get_quota_status(
         "regime": regime,
         "session_used_pct": round(session_used_pct, 2),
         "weekly_used_pct": round(weekly_used_pct, 2),
+        "monthly_used_pct": round(monthly_used_pct, 2),
         "session_tokens": session_tokens,
         "weekly_tokens": weekly_tokens,
+        "monthly_tokens": monthly_tokens,
     }

@@ -186,26 +186,11 @@ class TestOllamaCloudUserAgent(unittest.TestCase):
         self.assertNotEqual(hdrs.get("User-Agent"), "Python-urllib/3.x")
 
 
-class TestOxalphaUserAgent(unittest.TestCase):
-    """oxalpha failover — openrouter.ai is Cloudflare-protected."""
-
-    def setUp(self):
-        # _serve_via_oxalpha needs both _OXALPHA_TIER and _EXTERNAL_KEYS
-        zai_proxy._OXALPHA_TIER = MagicMock()
-        zai_proxy._OXALPHA_TIER.configured = True
-        zai_proxy._OXALPHA_TIER.failover_eligible = Mock(return_value=True)
-        zai_proxy._OXALPHA_TIER.build_request_body = Mock(return_value={"model": "stealth/ox-alpha", "messages": []})
-        zai_proxy._EXTERNAL_KEYS["oxalpha"] = "test-ox-key"
-
-    def test_has_user_agent(self):
-        handler = _make_fake_handler()
-        body = json.dumps({"model": "stealth/ox-alpha", "messages": []}).encode()
-        hdrs = _capture_headers(
-            zai_proxy.Handler._serve_via_oxalpha,
-            handler, body, bytearray(), time.time()
-        )
-        self.assertIn("User-Agent", hdrs, "oxalpha/OpenRouter headers must include User-Agent")
-        self.assertNotEqual(hdrs.get("User-Agent"), "Python-urllib/3.x")
+# ═══════════════════════════════════════════════════════════════════════════
+# (TestOxalphaUserAgent removed 2026-09-01 — oxalpha routing/_serve_via_oxalpha
+#  deleted from zai_proxy.py per dead-code sweep; UA coverage for remaining
+#  paths lives in the ollama_cloud / quota / telnyx tests above.)
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -334,21 +319,14 @@ class TestSourceLevelUserAgent(unittest.TestCase):
         h = _extract_headers_near(_PROXY_SRC, r'api\.telnyx\.com/v2/balance')
         self._assert_ua_in_headers(h, "_get_telnyx_balance")
 
-    def test_oxalpha_source(self):
-        """oxalpha/OpenRouter headers must include User-Agent (source)."""
-        h = _extract_headers_near(_PROXY_SRC, r'_serve_via_oxalpha')
-        self._assert_ua_in_headers(h, "_serve_via_oxalpha")
-
     def test_generic_failover_source(self):
         """Generic failover headers must include User-Agent (source)."""
         # The generic failover is in _try_external_failover
         h = _extract_headers_near(_PROXY_SRC, r'prov\["base_url"\] \+ "/chat/completions"')
         self._assert_ua_in_headers(h, "generic failover")
 
-    def test_openrouter_key_check_source(self):
-        """OpenRouter key usage poller headers must include User-Agent."""
-        h = _extract_headers_near(_PROXY_SRC, r'openrouter\.ai/api/v1/key')
-        self._assert_ua_in_headers(h, "_oxalpha_usage_poller")
+    # test_openrouter_key_check_source removed 2026-09-01 — _oxalpha_usage_poller
+    # deleted from zai_proxy.py per dead-code sweep (promo key 401-dead upstream).
 
 
 # ═══════════════════════════════════════════════════════════════════════════

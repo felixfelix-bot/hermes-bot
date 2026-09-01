@@ -124,6 +124,7 @@ class ExtraUsageStatus:
     """Result of extra-usage detection."""
     session_usage: float       # 0-1 fraction from API
     weekly_usage: float        # 0-1 fraction from API
+    monthly_usage: float = field(default=0.0)   # 0-1 fraction from API (monthly-budget plans)
     session_tokens: int        # cumulative tokens in 5h window from api_calls
     weekly_tokens: int         # cumulative tokens in 7d window from api_calls
     extra_usage: bool          # True when either usage >= 1.0
@@ -133,6 +134,7 @@ class ExtraUsageStatus:
         return {
             "session_usage": round(self.session_usage, 4),
             "weekly_usage": round(self.weekly_usage, 4),
+            "monthly_usage": round(self.monthly_usage, 4),
             "session_tokens": self.session_tokens,
             "weekly_tokens": self.weekly_tokens,
             "extra_usage": self.extra_usage,
@@ -203,6 +205,10 @@ def get_extra_usage_status(
     limits = ollama_api_response.get("limits", {}) or {}
     session_usage = float(limits.get("session", {}).get("usage", 0) or 0)
     weekly_usage = float(limits.get("weekly", {}).get("usage", 0) or 0)
+    # Monthly-budget plans (e.g. ollama_cloud_3) report limits.monthly.usage —
+    # a 0-1 fraction with NO session/weekly windows. Parse it so the router can
+    # gate on the monthly pool + apply ~90% scarcity guard.
+    monthly_usage = float(limits.get("monthly", {}).get("usage", 0) or 0)
 
     session_tokens = 0
     weekly_tokens = 0
@@ -214,18 +220,21 @@ def get_extra_usage_status(
             db_path, window_s=WEEKLY_WINDOW_S, now=now
         )
 
-    extra = detect_extra_usage(session_usage, weekly_usage)
+    extra = detect_extra_usage(session_usage, weekly_usage) or monthly_usage >= 1.0
 
     reasons = []
     if session_usage >= 1.0:
         reasons.append(f"session limit exhausted ({session_usage:.1%})")
     if weekly_usage >= 1.0:
         reasons.append(f"weekly limit exhausted ({weekly_usage:.1%})")
+    if monthly_usage >= 1.0:
+        reasons.append(f"monthly budget exhausted ({monthly_usage:.1%})")
     reason = "; ".join(reasons) if reasons else "within included limits"
 
     return ExtraUsageStatus(
         session_usage=session_usage,
         weekly_usage=weekly_usage,
+        monthly_usage=monthly_usage,
         session_tokens=session_tokens,
         weekly_tokens=weekly_tokens,
         extra_usage=extra,

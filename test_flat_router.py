@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import json
+import io
 import sqlite3
 import tempfile
 import threading
@@ -800,13 +801,16 @@ class TestFR2CanonicalRegistry:
             assert "minimax-m3:cloud" not in PROVIDER_MODELS[prov], \
                 f"{prov} still lists phantom minimax-m3:cloud (404 on ollama)"
 
-    def test_ollama_phantom_glm53_removed(self):
-        """glm-5.3 is PHANTOM on ollama (FR-0: catalog has glm-5.1/5.2/5.3-flash).
-        It must be removed from ollama sets — the silent downgrade to glm-5.2
-        violates the never-substitute principle."""
+    def test_ollama_glm53_now_live(self):
+        """glm-5.3 / glm-5.3-flash are LIVE on ollama (2026-08-29 live
+        verification: both served 5-token completions HTTP 200, listed in
+        /v1/models). They must be present in ollama sets — the old silent
+        downgrade to glm-5.2 is gone (FR-A)."""
         for prov in ("ollama_cloud", "ollama_cloud_2"):
-            assert "glm-5.3" not in PROVIDER_MODELS[prov], \
-                f"{prov} still lists phantom glm-5.3 (silent downgrade to glm-5.2)"
+            assert "glm-5.3" in PROVIDER_MODELS[prov], \
+                f"{prov} missing live glm-5.3"
+            assert "glm-5.3-flash" in PROVIDER_MODELS[prov], \
+                f"{prov} missing live glm-5.3-flash"
 
     def test_ollama_phantom_glm45flash_removed(self):
         """glm-4.5-flash is PHANTOM on ollama (FR-0: absent from live catalog,
@@ -899,6 +903,78 @@ class TestFR2DispatchTranslation:
         import zai_proxy
         assert zai_proxy._is_known_external_model("deepseek-v4-flash") is True, \
             "short-form deepseek-v4-flash must be known to external failover"
+
+
+# ── FR-A tests (2026-08-29): glm-5.3 verbatim on Ollama Cloud ────────────────
+# Ollama Cloud NOW serves glm-5.3 (live-verified 2026-08-29). The proxy must
+# (a) include glm-5.3 in ollama candidate sets and (b) pass it through
+# verbatim (NO silent downgrade to glm-5.2). Heavy-tier requests were being
+# silently downgraded — a correctness bug.
+
+
+class _StubHandler:
+    """Minimal stand-in for Handler instance methods/attrs that do_GET touches."""
+
+    def __init__(self):
+        self.wfile = io.BytesIO()
+        self._sent_status = None
+        self._headers = {}
+        self.close_connection = False
+
+    def send_response(self, code):
+        self._sent_status = code
+
+    def send_header(self, k, v):
+        self._headers[k] = v
+
+    def end_headers(self):
+        pass
+
+
+class TestGlm53Verbatim:
+    """glm-5.3 must be a first-class ollama model, never downgraded to 5.2."""
+
+    def _healthy_all(self):
+        return patch("flat_router._is_provider_healthy", return_value=True)
+
+    def test_no_glm53_rewrite_in_ollama_provider_names(self):
+        """_PROVIDER_MODEL_NAMES for ollama_cloud / ollama_cloud_2 must NOT
+        map glm-5.3 to a different model (no silent downgrade)."""
+        import zai_proxy
+        for prov in ("ollama_cloud", "ollama_cloud_2"):
+            mapping = zai_proxy._PROVIDER_MODEL_NAMES[prov]
+            assert "glm-5.3" not in mapping, \
+                f"{prov} still rewrites glm-5.3 -> {mapping.get('glm-5.3')!r}"
+
+    def test_glm53_select_provider_includes_ollama(self):
+        """select_provider('glm-5.3') must include BOTH ollama_cloud and
+        ollama_cloud_2, with >=4 total candidates."""
+        with self._healthy_all():
+            candidates = select_provider(model="glm-5.3")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert "ollama_cloud" in names, \
+            f"ollama_cloud missing from glm-5.3 candidates: {names}"
+        assert "ollama_cloud_2" in names, \
+            f"ollama_cloud_2 missing from glm-5.3 candidates: {names}"
+        assert len(names) >= 4, \
+            f"glm-5.3 resolved to only {len(names)} candidates: {names}"
+
+    def test_v1_models_includes_glm53(self):
+        """The /v1/models stub response must include glm-5.3."""
+        import tempfile
+        from pathlib import Path
+        import zai_proxy
+        handler = _StubHandler()
+        handler.path = "/v1/models"
+        # Point Path.home() at an empty temp dir so kalman_pricing.json is
+        # absent -> _kp stays {} -> no pool is delisted -> glm-5.3 listed.
+        with patch.object(zai_proxy.Path, "home",
+                          return_value=Path(tempfile.mkdtemp())):
+            zai_proxy.Handler.do_GET(handler)
+        payload = json.loads(handler.wfile.getvalue())
+        ids = [m["id"] for m in payload["data"]]
+        assert "glm-5.3" in ids, \
+            f"glm-5.3 missing from /v1/models: {ids}"
 
 
 if __name__ == "__main__":

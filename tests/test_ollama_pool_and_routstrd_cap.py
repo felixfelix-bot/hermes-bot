@@ -25,7 +25,7 @@ import zai_proxy as z  # noqa: E402
 
 
 def _status(session_pct=0.0, weekly_pct=0.0, monthly_pct=0.0,
-            monthly_tokens=0, regime="included"):
+            monthly_tokens=0, monthly_limit=3_500_000_000, regime="included"):
     return {
         "regime": regime,
         "session_used_pct": session_pct,
@@ -34,6 +34,7 @@ def _status(session_pct=0.0, weekly_pct=0.0, monthly_pct=0.0,
         "session_tokens": 0,
         "weekly_tokens": 0,
         "monthly_tokens": monthly_tokens,
+        "monthly_limit": monthly_limit,
     }
 
 
@@ -51,7 +52,9 @@ class TestOllamaPoolOrder(unittest.TestCase):
             return [name for name, _key in z._ollama_cloud_key_order()]
 
     def test_most_remaining_first(self):
-        """oc2 with the most remaining must be tried before oc."""
+        """Fresh oc3 (5% of 3.5B monthly = 3.325B remaining) must be tried
+        before oc2 (10% of 500M weekly = 450M remaining) — B1's intent is to
+        promote unused monthly capacity, not sink oc3 last."""
         statuses = {
             "ollama_cloud":   _status(weekly_pct=90.0),
             "ollama_cloud_2": _status(weekly_pct=10.0),
@@ -59,7 +62,7 @@ class TestOllamaPoolOrder(unittest.TestCase):
         }
         self.assertEqual(
             self._order_names(statuses),
-            ["ollama_cloud_2", "ollama_cloud_3", "ollama_cloud"])
+            ["ollama_cloud_3", "ollama_cloud_2", "ollama_cloud"])
 
     def test_exhausted_key_sinks_last(self):
         statuses = {

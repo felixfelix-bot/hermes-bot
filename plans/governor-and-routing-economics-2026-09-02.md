@@ -80,9 +80,27 @@ to crontab/systemd greps:
 - [x] D5 Journal clean; commit + push dr main.
 
 ### User-side (not executable from here)
-- [ ] Buy +1 ollama Pro key ($20/mo, ~500M tokens/wk) — prep
-      `OLLAMA_CLOUD_API_KEY_4` naming so onboarding is instant. (RECOMMENDED)
+- [x] ~~Buy +1 ollama Pro key ($20/mo, ~500M tokens/wk)~~ CANCELLED by Felix
+      (2026-09-02): no 4th subscription. New-subscription candidates come from
+      the subscription/model discovery-research tooling BEFORE any buy — do not
+      re-propose manual key purchases without a research pass.
 - [ ] Optional: ~$15 NeuralWatt credit top-up (premium glm-5.3 lane float).
+
+### B1 fix follow-up (2026-09-02, landed same day)
+- [x] BUG A: oc3 remaining-quota uses monthly_limit (budget 3.5B), not
+      monthly_tokens (used count) — `zai_proxy._snapshot_quota` oc3 branch +
+      `_ollama_cloud_key_order` oc3 branch. monthly_limit surfaced in tracker
+      status dict (`src/ollama_quota_tracker.py`).
+- [x] BUG B-h: `_is_key_healthy` real 90% monthly delist gate for oc3
+      (fail-open; paywall/manual-disable semantics intact; no lock recursion —
+      quota status path confirmed lock-free first).
+- [x] BUG B-sc: flat_router scarcity uses monthly_used_pct for oc3 (was
+      max(session,weekly) = 0 for monthly-only key → zero price pressure).
+- [x] Tests: `tests/test_oc3_monthly_budget_fixes.py` (10 new, 3 classes;
+      5 bug-revealing tests confirmed RED before fix); pool test
+      `test_most_remaining_first` updated — fresh oc3 (3.325B) now correctly
+      outranks burned oc2 (450M); targeted suites 171 pass / 12 subtests;
+      tests/ 438 pass / 12 pre-existing fails (identical to baseline).
 
 ## Constraints honored
 - Bot-repo commits only; profile config edits live-only (documented here).

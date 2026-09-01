@@ -186,4 +186,5 @@ def get_quota_status(
         "session_tokens": session_tokens,
         "weekly_tokens": weekly_tokens,
         "monthly_tokens": monthly_tokens,
+        "monthly_limit": monthly_limit,
     }

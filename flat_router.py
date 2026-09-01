@@ -690,8 +690,14 @@ def compute_effective_price(
                     else:
                         # ollama_cloud: use session used_pct
                         _oc_status = _zp._get_ollama_quota_status(provider)
-                        scarcity = max(_oc_status.get("session_used_pct", 0),
-                                       _oc_status.get("weekly_used_pct", 0)) / 100.0
+                        if provider == "ollama_cloud_3":
+                            # BUG B-sc fix: oc3 is monthly-only (session/weekly
+                            # are always 0), so scarcity must use monthly_used_pct
+                            # or oc3 gets zero scarcity pricing until 100% used.
+                            scarcity = _oc_status.get("monthly_used_pct", 0) / 100.0
+                        else:
+                            scarcity = max(_oc_status.get("session_used_pct", 0),
+                                           _oc_status.get("weekly_used_pct", 0)) / 100.0
                     if scarcity > 0.01:
                         burn_share = _zp._compute_model_burn_share(provider, model)
                         # Burn premium: big burners on scarce providers pay more

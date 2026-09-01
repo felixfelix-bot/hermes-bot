@@ -81,10 +81,14 @@ _ollama_quota_status = None
 try:
     from src.ollama_quota_tracker import get_quota_status as _get_quota_status
     from src.ollama_quota_tracker import DEFAULT_SESSION_LIMIT as _OC_SESSION_LIMIT
+    from src.ollama_quota_tracker import DEFAULT_MONTHLY_LIMIT as _OC_MONTHLY_LIMIT
+    from src.ollama_quota_tracker import _load_limits as _oc_load_limits
 except Exception as _oqe:
     print(f"[ollama_quota] DISABLED — {_oqe}", flush=True)
     _get_quota_status = None
     _OC_SESSION_LIMIT = 500_000_000  # fallback default
+    _OC_MONTHLY_LIMIT = 3_500_000_000  # fallback default
+    _oc_load_limits = None
 
 # ── Cost extraction (RP-2) ───────────────────────────────────────────────────
 # Parses the real $ cost from each provider's API response body. Falls back to
@@ -165,6 +169,7 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
             "session_tokens": 0,
             "weekly_tokens": 0,
             "monthly_tokens": 0,
+            "monthly_limit": _OC_MONTHLY_LIMIT,
         }
     now = time.time()
     cached = _ollama_quota_cache.get(key_name)
@@ -190,6 +195,17 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
             status["monthly_used_pct"] = _moly
             status["regime"] = "exhausted" if _moly >= 100.0 else status.get("regime", "included")
             status["monthly_tokens"] = int(status.get("monthly_tokens", 0))
+            # Surface the monthly budget limit (BUG A fix): the tracker now
+            # returns it, but older cached/fallback dicts may lack it — resolve
+            # from the tracker's _load_limits (config override) or the default.
+            if not status.get("monthly_limit"):
+                try:
+                    if _oc_load_limits is not None:
+                        status["monthly_limit"] = _oc_load_limits()[2]
+                    else:
+                        status["monthly_limit"] = _OC_MONTHLY_LIMIT
+                except Exception:
+                    status["monthly_limit"] = _OC_MONTHLY_LIMIT
         _ollama_quota_cache[key_name] = status
         _ollama_quota_cache_ts[key_name] = now
         return status
@@ -204,6 +220,7 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
             "session_tokens": 0,
             "weekly_tokens": 0,
             "monthly_tokens": 0,
+            "monthly_limit": _OC_MONTHLY_LIMIT,
         }
 
 def _probe_hardware(hardware_req: str) -> dict:
@@ -1057,6 +1074,22 @@ def _is_key_healthy(name: str) -> bool:
     except Exception:
         pass
 
+    # BUG B-h fix: oc3 monthly-budget delist gate (~90% monthly usage). oc3 is
+    # a monthly-only key (no 5h session / weekly windows), so the existing
+    # session/weekly health logic never trips for it — it would burn straight
+    # to 100% with a ~30-day dead-time penalty. Delist at >= 90% monthly.
+    # _get_ollama_quota_status reads the tracker directly (no `lock`), so this
+    # cannot deadlock against _snapshot_quota's `lock`; fail-open on any error.
+    if name == "ollama_cloud_3":
+        try:
+            _oc3_status = _get_ollama_quota_status("ollama_cloud_3")
+            if float(_oc3_status.get("monthly_used_pct", 0.0)) >= 90.0:
+                _log_key_decision(chosen_key=None,
+                                  reason="oc3_monthly_delisted_90pct")
+                return False
+        except Exception:
+            pass  # fail-open — never break routing on a tracker hiccup
+
     h = _zai_key_health.get(name)
     if not h or h.get("healthy", True):
         return True
@@ -1633,7 +1666,10 @@ def _snapshot_quota() -> dict:
                 oc_used_pct = float(oc_status.get("monthly_used_pct", 0.0))
                 # Monthly pools: no partial-window resets, so guard ~90% used so
                 # scarcity pricing kicks in before the ~30-day dead-time.
-                oc_total = oc_status.get("monthly_tokens", 0) or 0
+                # BUG A fix: remaining is driven by the monthly BUDGET limit
+                # (not the used monthly_tokens count) so oc3's unused monthly
+                # capacity is correctly surfaced as large remaining.
+                oc_total = oc_status.get("monthly_limit", 0) or _OC_MONTHLY_LIMIT
                 oc_regime = oc_status.get("regime", "included")
             else:
                 oc_used_pct = max(oc_status["session_used_pct"], oc_status["weekly_used_pct"])
@@ -1709,7 +1745,10 @@ def _ollama_cloud_key_order() -> list[tuple[str, str]]:
             status = _get_ollama_quota_status(name)
             if name == "ollama_cloud_3":
                 used_pct = float(status.get("monthly_used_pct", 0.0))
-                total = status.get("monthly_tokens", 0) or 0
+                # BUG A fix: remaining = monthly BUDGET × (1 − pct), not the
+                # used monthly_tokens count (which made oc3 remaining ≈ 0 and
+                # sank it last, defeating B1's promote-unused-capacity intent).
+                total = status.get("monthly_limit", 0) or _OC_MONTHLY_LIMIT
             else:
                 used_pct = max(float(status.get("session_used_pct", 0.0)),
                                float(status.get("weekly_used_pct", 0.0)))

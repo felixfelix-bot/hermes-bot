@@ -76,13 +76,22 @@ lossy summary, eroding the manager's working memory.
 - [x] B4. Full suite: 460 passed, 12 failed — **identical to the documented
       pre-existing baseline** (telnyx ×4, pressure_wiring ×5,
       shadow_drop_ours ×1, cost_correction ×2). Zero new failures.
-- [ ] B5. Commit + push `dr` (bot repo) + commit hermes-agent files
-- [ ] B6. Verify on the governor's next cron tick — the cron runs the
-      working-tree script directly, so the new law is live on the next 15-min
-      tick; check `compression_growth_state.json` for `pressure_adj` /
-      `pressure_runs` and the DM's rising target.
-- [ ] B7. Gateway-restart window (graceful drain, after in-flight work):
-      activate B1, verify compression rows carry `session_id`
+- [x] B5. Committed + pushed: bot `150ce7d` (governor + tests + plan doc,
+      remote `dr` main); hermes-agent `d128a64d8` on `fix/cron-list-crash`
+      (local-commit convention of that checkout — joins the pending review
+      flow; session-search patch files deliberately NOT swept in).
+- [x] B6. Verified live: manual run measured **manager ratio 0.896**,
+      sustain-gated at runs=1; the 05:48 cron tick stepped
+      **adj 0 → 0.06 and applied threshold 0.5 → 0.5712** (trigger now
+      ~114K, walking toward the 150K cap at +0.06/15-min while the DM
+      sits pinned; decays automatically after the session reset).
+      State persistence verified (75 profiles tracked).
+- [x] B7. Gateway restarted 05:54:28 (graceful drain honored an in-flight
+      turn; systemd TimeoutStop 3m30s force-completed, PID 859788).
+      Attribution code live; the end-to-end DB proof (compression row
+      with non-NULL `session_id`) lands on the next live compaction —
+      traffic is quiet post-restart (DM idle since 04:52), path covered
+      by 10 unit tests + the running code.
 
 ## Deferred (documented, out of scope here)
 
@@ -103,4 +112,12 @@ lossy summary, eroding the manager's working memory.
   green (22 new). Full suite 460 pass / 12 baseline failures — identical set.
 - B1: auxiliary_client + context_compressor attribution landed; 10 tests
   green (`hermes -m pytest tests/agent/test_compression_session_attribution.py`).
+- 05:48 B6: new law live on cron tick — manager ratio 0.896 (sustained),
+  adj stepped 0 → 0.06, **threshold applied 0.5 → 0.5712** (trigger ~114K).
+  Integrator walks +0.06/tick toward the 0.75 cap while pressure sustains.
+- 05:54:28 B7: gateway restarted (graceful drain; PID 859788). Attribution
+  live; DB proof pending next live compaction (traffic quiet post-restart).
+- REMAINING USER ACTION (A3): send `/new` in the Signal DM to reset the
+  pinned session — the governor machinery handles the fresh bootstrap
+  (snapshot + notes) and the integrator will auto-decay afterward.
 

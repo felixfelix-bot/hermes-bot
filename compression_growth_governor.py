@@ -58,7 +58,11 @@ C0 = 17500                 # Manager fixed prefix (tokens)
 MINIMUM_CONTEXT_LENGTH = 64000  # Hard floor in context_compressor
 
 # Safety bounds (MIN_THRESHOLD is dynamic: MINIMUM_CONTEXT_LENGTH / context_length)
-MAX_THRESHOLD = 0.70
+# 2026-09-02 (plan B2): 0.70 → 0.75 — with the ctx ceiling at 200K for the
+# big profiles, authority to 0.75 lets the pressure-relief integrator push
+# triggers to ~150K, above the 139–142K operating point of the hot sessions
+# (2026-09-02 compaction crisis). Profiles without pressure stay well below.
+MAX_THRESHOLD = 0.75
 # Calibrated 2026-09-02 from 0.60 → 0.45: the 0.60 base was tuned for the
 # 200k-ctx profile ecosystem; at 1M-ctx manager sessions a 0.60-0.70 fill is
 # the degeneration-risk zone (zombie tool-loops ballooned sessions to 12M
@@ -82,6 +86,25 @@ PRICE_NUDGE_MAX = 0.10            # max threshold adjustment (positive = later c
 PRICE_REF_USD_PER_M = 0.02        # reference realized price ($/M)
 PRICE_SATURATION_RATIO = 8.0      # price/ref ratio where the nudge saturates
 PRICE_MIN_TOKENS = 1_000_000      # need ≥1M tokens in window for a measurement
+
+# ── Pressure-relief feedback (2026-09-02, compaction-crisis plan B2) ──────────
+# Compaction repeatedly failing to CLEAR (sessions pinned above the trigger,
+# every-turn compaction) is an error signal none of the terms above can see:
+# growth-rate says how fast context fills, price says what re-filling costs —
+# neither says the compaction loop has become lossy churn. This term measures
+# trigger pressure per profile (median prompt/(thr×ctx) over its live gateway
+# sessions, plus attributed compaction rate) and integrates the target
+# UPWARD, thermostat-style with slow decay, so each compaction actually
+# clears the deck instead of refiring next turn.
+PRESSURE_RATIO_HIGH = 0.85    # median prompt/(thr×ctx) ≥ this = pressured
+PRESSURE_CLEAR = 0.65        # median < this (and low k_comp) = pressure cleared
+PRESSURE_K_COMP_HR = 4.0     # attributed compactions/hour = pathological
+PRESSURE_STEP_UP = 0.06       # per sustained tick (15 min)
+PRESSURE_STEP_DOWN = 0.03    # decay per tick when clear (slower = hysteresis)
+PRESSURE_SUSTAIN_RUNS = 2     # consecutive pressured ticks before stepping
+PRESSURE_MAX_ADJ = 0.20      # bound on the pressure integral
+PRESSURE_MIN_CALLS = 5       # min mapped calls to trust the ratio
+PRESSURE_WINDOW_H = 2.0      # lookback for pressure measurement
 
 # Growth-rate bounds
 G_BASELINE = 1800          # Measured average (tokens/call)
@@ -287,32 +310,43 @@ def measure_growth_rate(db_path: Path = DB_PATH, hours: int = WINDOW_HOURS) -> f
 # ---------------------------------------------------------------------------
 
 def compute_threshold(growth_rate: float, context_length: int,
-                      current_threshold: float = None) -> float:
+                      current_threshold: float = None, *,
+                      price: float | None = None,
+                      pressure_adj: float = 0.0) -> float:
     """Compute optimal threshold from growth-rate estimate and context length.
 
     Control law (composes with cost governor)::
 
         threshold = FALLBACK + K × (G_BASELINE − g_estimate) − price_nudge
+                   + pressure_adj
 
     CONVERGENT (2026-09-02 fix): the target is computed from the BASE, NOT
     from the current threshold. The original ``base = current_threshold``
     made this an unbounded integrator (ratchet) — with a sparse-growth
     estimate every run added the same +delta, drifting all 75 profiles to
     MAX_THRESHOLD (0.7) within hours. The target now depends only on the
-    Kalman estimate (and the price nudge); ``current_threshold`` is retained
+    Kalman estimate (and the nudges); ``current_threshold`` is retained
     in the signature for compatibility but is ignored here — hysteresis in
     :func:`apply_threshold` guards write churn.
+
+    PRICE WIRING FIX (2026-09-02, plan B2): the measured realized $/M was
+    persisted to state but never passed here — ``_price_nudge()`` evaluated
+    with its default ``price=None`` returned a permanent 0.0, so the C1
+    nudge was inert in production (tests stubbed the function, masking it).
+    The measured price is now threaded through explicitly.
 
     Dense sessions (high *g*) → lower threshold → compact sooner.
     Sparse sessions (low *g*) → raise threshold → preserve context.
     Expensive lanes (high realized $/M) → compact sooner (price nudge).
+    Pinned sessions (pressure) → compact later (pressure-relief integral).
 
     Result is clamped to ``[MIN_THRESHOLD, MAX_THRESHOLD]`` where
     ``MIN_THRESHOLD = MINIMUM_CONTEXT_LENGTH / context_length``.
     """
     min_threshold = MINIMUM_CONTEXT_LENGTH / context_length
     delta = K_SENSITIVITY * (G_BASELINE - growth_rate)
-    new_threshold = FALLBACK_THRESHOLD + delta + _price_nudge()
+    new_threshold = (FALLBACK_THRESHOLD + delta
+                     + _price_nudge(price) + pressure_adj)
     return max(min_threshold, min(MAX_THRESHOLD, new_threshold))
 
 
@@ -363,6 +397,140 @@ def _price_nudge(price: float | None = None) -> float:
         return 0.0
     scaled = max(-1.0, min(1.0, scaled))
     return -PRICE_NUDGE_MAX * scaled
+
+
+# ---------------------------------------------------------------------------
+# Pressure-relief feedback (2026-09-02, compaction-crisis plan B2)
+# ---------------------------------------------------------------------------
+
+def _session_ids_for_profile(profile_name: str) -> list[str]:
+    """Return gateway-managed session_ids belonging to *profile_name*.
+
+    Reads the profile's ``sessions/sessions.json`` (the channel → session
+    map maintained by the hermes gateway). Worker/cron lanes that live
+    outside this map are intentionally invisible to the pressure signal —
+    the growth and price terms still govern them, and the incident
+    detector (planned) covers them once compression rows carry
+    ``session_id``.
+    """
+    path = PROFILES_DIR / profile_name / "sessions" / "sessions.json"
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    ids: list[str] = []
+    for entry in data.values():
+        if isinstance(entry, dict):
+            sid = entry.get("session_id")
+            if sid:
+                ids.append(str(sid))
+    return ids
+
+
+def _profile_pressure_signals(
+    db_path: Path,
+    session_ids: list[str],
+    threshold: float,
+    context_length: int,
+    hours: float = PRESSURE_WINDOW_H,
+) -> dict:
+    """Measure trigger pressure for one profile's live sessions.
+
+    Returns ``{"n_calls": int, "ratio": float | None, "k_comp": float}``:
+
+    - ``ratio`` — median recent ``prompt_tokens / trigger`` across the
+      profile's mapped sessions (trigger = max(threshold × ctx, floor)).
+      A healthy compaction cycle oscillates well below the trigger
+      (post-summary baseline ~0.3–0.5); a session pinned above the
+      trigger (2026-09-02 DM at 142K vs a 100K trigger) medians
+      ≥ PRESSURE_RATIO_HIGH.
+    - ``k_comp`` — attributed compactions/hour (``task_type =
+      'compression'`` rows on the profile's sessions). Reads 0.0 while
+      compression calls are unattributed (``session_id`` NULL) — the
+      interim signal is the ratio; attribution lands with the
+      trajectory-compressor session header (same plan, B1).
+    """
+    out: dict = {"n_calls": 0, "ratio": None, "k_comp": 0.0}
+    if not db_path.exists() or not session_ids:
+        return out
+    trigger = max(threshold * context_length, float(MINIMUM_CONTEXT_LENGTH))
+    if trigger <= 0:
+        return out
+    cutoff = time.time() - hours * 3600
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = conn.execute(
+                f"SELECT prompt_tokens FROM api_calls "
+                f"WHERE session_id IN ({placeholders}) AND ts >= ? "
+                f"AND status_code = 200 AND prompt_tokens IS NOT NULL "
+                f"AND prompt_tokens > 0 "
+                f"ORDER BY ts DESC LIMIT 25",
+                (*session_ids, cutoff),
+            ).fetchall()
+            comp_row = conn.execute(
+                f"SELECT COUNT(*) FROM api_calls "
+                f"WHERE session_id IN ({placeholders}) AND ts >= ? "
+                f"AND task_type = 'compression'",
+                (*session_ids, cutoff),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return out
+    tokens = sorted(int(r[0]) for r in rows if r[0])
+    out["n_calls"] = len(tokens)
+    if tokens:
+        out["ratio"] = tokens[len(tokens) // 2] / trigger
+    if comp_row and hours > 0:
+        out["k_comp"] = float(comp_row[0]) / hours
+    return out
+
+
+def _pressure_step(adj: float, runs: int, pressured: bool,
+                   cleared: bool) -> tuple[float, int]:
+    """Advance the pressure-relief integrator one governor tick.
+
+    Pressure must be SUSTAINED (PRESSURE_SUSTAIN_RUNS consecutive ticks)
+    before the target rises — a single busy dispatch burst must not move
+    the threshold. Decay only on a clearly-cleared reading; readings that
+    hover in between hold the current integral (hysteresis, like a
+    thermostat). ``adj`` is clamped to ``[0, PRESSURE_MAX_ADJ]``; the
+    combined target is clamped to MAX_THRESHOLD in :func:`compute_threshold`.
+    """
+    runs = runs + 1 if pressured else 0
+    if runs >= PRESSURE_SUSTAIN_RUNS:
+        adj = min(adj + PRESSURE_STEP_UP, PRESSURE_MAX_ADJ)
+    elif cleared and adj > 0.0:
+        adj = max(adj - PRESSURE_STEP_DOWN, 0.0)
+    return round(adj, 6), runs
+
+
+def _pressure_assessment(signals: dict) -> tuple[bool, bool]:
+    """Classify a profile's pressure signals as (pressured, cleared).
+
+    ``pressured`` — attributed compactions/hour pathological, OR enough
+    mapped calls with median ratio pinned ≥ PRESSURE_RATIO_HIGH.
+    ``cleared`` — low compaction rate AND (thin data or ratio clearly
+    below PRESSURE_CLEAR).
+    """
+    ratio = signals.get("ratio")
+    n_calls = signals.get("n_calls", 0)
+    k_comp = signals.get("k_comp", 0.0)
+    pressured = (
+        k_comp >= PRESSURE_K_COMP_HR
+        or (n_calls >= PRESSURE_MIN_CALLS
+            and ratio is not None and ratio >= PRESSURE_RATIO_HIGH)
+    )
+    cleared = (
+        k_comp < 1.0
+        and (n_calls < PRESSURE_MIN_CALLS
+             or (ratio is not None and ratio < PRESSURE_CLEAR))
+    )
+    return pressured, cleared
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +644,14 @@ def main(profiles: list[str] | None = None):
         kf.predict()
         g_estimate = kf.update(measured_g)
 
+    # Pressure-relief integrator state (2026-09-02, plan B2)
+    pressure_adj = {
+        str(p): float(v) for p, v in dict(state.get("pressure_adj", {})).items()
+    }
+    pressure_runs = {
+        str(p): int(v) for p, v in dict(state.get("pressure_runs", {})).items()
+    }
+
     # Iterate over all profiles
     profile_results: list[dict] = []
     for profile_name in profiles:
@@ -499,7 +675,23 @@ def main(profiles: list[str] | None = None):
                 "threshold": old_threshold,
             })
             continue
-        new_threshold = compute_threshold(g_estimate, context_length, old_threshold)
+
+        # Pressure signals for this profile's live gateway sessions
+        sig = _profile_pressure_signals(
+            DB_PATH, _session_ids_for_profile(profile_name),
+            old_threshold, context_length,
+        )
+        pressured, cleared = _pressure_assessment(sig)
+        adj = pressure_adj.get(profile_name, 0.0)
+        adj, runs = _pressure_step(
+            adj, pressure_runs.get(profile_name, 0), pressured, cleared)
+        pressure_adj[profile_name] = adj
+        pressure_runs[profile_name] = runs
+
+        new_threshold = compute_threshold(
+            g_estimate, context_length, old_threshold,
+            price=measured_price, pressure_adj=adj,
+        )
         applied = apply_threshold(
             new_threshold, config_path, profile_name,
             growth_rate=measured_g, kalman_estimate=g_estimate,
@@ -507,8 +699,8 @@ def main(profiles: list[str] | None = None):
 
         if applied:
             print(f"[growth-governor] updated {profile_name}: "
-                  f"threshold {old_threshold:.4f} → {new_threshold:.4f}",
-                  file=sys.stderr)
+                  f"threshold {old_threshold:.4f} → {new_threshold:.4f}"
+                  f" (pressure_adj={adj:.2f})", file=sys.stderr)
 
         profile_results.append({
             "profile": profile_name,
@@ -516,6 +708,13 @@ def main(profiles: list[str] | None = None):
             "new_threshold": round(new_threshold, 4),
             "context_length": context_length,
             "applied": applied,
+            "pressure": {
+                "ratio": round(sig["ratio"], 3) if sig["ratio"] is not None else None,
+                "k_comp": round(sig["k_comp"], 2),
+                "n_calls": sig["n_calls"],
+                "adj": round(adj, 3),
+                "runs": runs,
+            },
         })
 
     # Update persisted state
@@ -537,6 +736,15 @@ def main(profiles: list[str] | None = None):
     state["last_ts"] = time.time()
     state["profiles_processed"] = len(profile_results)
     state["threshold_history"] = history
+    # Pressure-relief integrator (prune entries for vanished profiles)
+    state["pressure_adj"] = {
+        p: round(v, 4) for p, v in pressure_adj.items()
+        if p in profiles
+    }
+    state["pressure_runs"] = {
+        p: v for p, v in pressure_runs.items()
+        if p in profiles
+    }
 
     try:
         save_state(state)

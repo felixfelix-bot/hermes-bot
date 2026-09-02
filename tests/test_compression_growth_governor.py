@@ -1072,3 +1072,203 @@ class TestExemptProfiles:
                      if r["profile"] == "kimi-consultant")
         assert entry.get("skipped") is True
         assert "old_config" not in entry
+
+
+# ---------------------------------------------------------------------------
+# 10. Pressure-relief control law (2026-09-02, compaction-crisis plan B2)
+# ---------------------------------------------------------------------------
+
+from compression_growth_governor import (  # noqa: E402
+    _session_ids_for_profile,
+    _profile_pressure_signals,
+    _pressure_step,
+    _pressure_assessment,
+    PRESSURE_RATIO_HIGH,
+    PRESSURE_CLEAR,
+    PRESSURE_K_COMP_HR,
+    PRESSURE_STEP_UP,
+    PRESSURE_STEP_DOWN,
+    PRESSURE_SUSTAIN_RUNS,
+    PRESSURE_MAX_ADJ,
+    PRESSURE_MIN_CALLS,
+    PRESSURE_WINDOW_H,
+)
+
+
+class TestPressureStep:
+    """The pressure-relief integrator advances one tick per run."""
+
+    def test_single_pressured_run_no_change(self):
+        # Sustain gate: one busy dispatch burst must not move the target.
+        adj, runs = _pressure_step(0.0, 0, pressured=True, cleared=False)
+        assert adj == 0.0
+        assert runs == 1
+
+    def test_sustained_pressure_steps_up(self):
+        adj, runs = _pressure_step(0.0, PRESSURE_SUSTAIN_RUNS - 1,
+                                    pressured=True, cleared=False)
+        assert adj == pytest.approx(PRESSURE_STEP_UP)
+        assert runs == PRESSURE_SUSTAIN_RUNS
+
+    def test_pressure_clamped_at_max(self):
+        adj, runs = _pressure_step(PRESSURE_MAX_ADJ, 5,
+                                    pressured=True, cleared=False)
+        assert adj == PRESSURE_MAX_ADJ
+
+    def test_decay_when_cleared(self):
+        adj, _runs = _pressure_step(PRESSURE_MAX_ADJ, 5,
+                                    pressured=False, cleared=True)
+        assert adj == pytest.approx(PRESSURE_MAX_ADJ - PRESSURE_STEP_DOWN)
+
+    def test_hold_when_hovering(self):
+        # Not pressured, not clearly cleared → hold the integral (hysteresis).
+        adj, _runs = _pressure_step(0.05, 0, pressured=False, cleared=False)
+        assert adj == 0.05
+
+    def test_runs_reset_when_not_pressured(self):
+        _adj, runs = _pressure_step(0.0, 2, pressured=False, cleared=True)
+        assert runs == 0
+
+
+class TestPressureAssessment:
+    """Classification of measured signals into (pressured, cleared)."""
+
+    def test_pinned_ratio_pressured(self):
+        # 2026-09-02 DM shape: 142K prompts vs a 100K trigger.
+        sig = {"n_calls": 10, "ratio": 1.42, "k_comp": 0.0}
+        pressured, cleared = _pressure_assessment(sig)
+        assert pressured is True
+        assert cleared is False
+
+    def test_thin_data_not_pressured(self):
+        sig = {"n_calls": 2, "ratio": 1.3, "k_comp": 0.0}
+        pressured, _cleared = _pressure_assessment(sig)
+        assert pressured is False
+
+    def test_k_comp_pathological_pressured(self):
+        # Attributed compaction rate alone is decisive, even with thin data.
+        sig = {"n_calls": 2, "ratio": None, "k_comp": PRESSURE_K_COMP_HR + 2}
+        pressured, _cleared = _pressure_assessment(sig)
+        assert pressured is True
+
+    def test_healthy_curve_cleared(self):
+        sig = {"n_calls": 10, "ratio": 0.40, "k_comp": 0.0}
+        pressured, cleared = _pressure_assessment(sig)
+        assert pressured is False
+        assert cleared is True
+
+    def test_hover_neither(self):
+        sig = {"n_calls": 10, "ratio": 0.75, "k_comp": 0.0}
+        pressured, cleared = _pressure_assessment(sig)
+        assert pressured is False
+        assert cleared is False
+
+    def test_high_ratio_but_recent_compressions_not_cleared(self):
+        # Compaction recently refiring → not "cleared" even at a mid ratio.
+        sig = {"n_calls": 10, "ratio": 0.50, "k_comp": 2.0}
+        _pressured, cleared = _pressure_assessment(sig)
+        assert cleared is False
+
+
+class TestProfilePressureSignals:
+    """SQL measurement against a temp api_calls DB."""
+
+    def _create_db(self, db_path, rows):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE api_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, prompt_tokens INTEGER, status_code INTEGER,
+                session_id TEXT, task_type TEXT
+            )
+        """)
+        now = time.time()
+        for pt, task_type in rows:
+            conn.execute(
+                "INSERT INTO api_calls (ts, prompt_tokens, status_code,"
+                " session_id, task_type) VALUES (?, ?, 200, ?, ?)",
+                (now - 60, pt, "sess-A", task_type))
+        conn.commit()
+        conn.close()
+
+    def test_pinned_session_high_ratio(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "z.db"
+            self._create_db(db, [(142_000, None)] * 10)
+            sig = _profile_pressure_signals(
+                db, ["sess-A"], threshold=0.5, context_length=200_000)
+            assert sig["n_calls"] == 10
+            assert sig["ratio"] is not None and sig["ratio"] >= PRESSURE_RATIO_HIGH
+
+    def test_healthy_oscillation_low_ratio(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "z.db"
+            self._create_db(db, [(50_000, None)] * 10)
+            sig = _profile_pressure_signals(
+                db, ["sess-A"], threshold=0.5, context_length=200_000)
+            assert sig["ratio"] is not None and sig["ratio"] < PRESSURE_CLEAR
+
+    def test_compaction_rate_attributed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "z.db"
+            self._create_db(db, [(50_000, None)] * 5 + [(120_000, "compression")] * 6)
+            sig = _profile_pressure_signals(
+                db, ["sess-A"], threshold=0.5, context_length=200_000,
+                hours=2.0)
+            assert sig["k_comp"] == pytest.approx(6.0 / 2.0)
+
+    def test_empty_session_list_returns_zeros(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "z.db"
+            self._create_db(db, [(50_000, None)])
+            sig = _profile_pressure_signals(
+                db, [], threshold=0.5, context_length=200_000)
+            assert sig == {"n_calls": 0, "ratio": None, "k_comp": 0.0}
+
+
+class TestSessionIdsForProfile:
+    def test_reads_sessions_json(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "profiles"
+            (root / "p1" / "sessions").mkdir(parents=True)
+            (root / "p1" / "sessions" / "sessions.json").write_text(json.dumps({
+                "agent:main:signal:dm:x": {"session_id": "s-1"},
+                "agent:main:signal:group:y": {"session_id": "s-2"},
+            }))
+            import compression_growth_governor as mod
+            monkeypatch.setattr(mod, "PROFILES_DIR", root)
+            assert sorted(_session_ids_for_profile("p1")) == ["s-1", "s-2"]
+
+    def test_missing_profile_returns_empty(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import compression_growth_governor as mod
+            monkeypatch.setattr(mod, "PROFILES_DIR", Path(tmpdir) / "nope")
+            assert _session_ids_for_profile("ghost") == []
+
+
+class TestComputeThresholdPriceAndPressure:
+    """C1 price wiring + pressure integral composition (2026-09-02 fix)."""
+
+    def test_expensive_price_lowers_threshold(self):
+        # Pins the wiring fix: the measured price must actually reach the
+        # control law (the old call passed no price → nudge was always 0).
+        base = compute_threshold(G_BASELINE, 200_000)
+        expensive = compute_threshold(G_BASELINE, 200_000, price=0.20)
+        assert expensive < base
+
+    def test_cheap_price_raises_threshold(self):
+        base = compute_threshold(G_BASELINE, 200_000)
+        cheap = compute_threshold(G_BASELINE, 200_000, price=0.005)
+        assert cheap > base
+
+    def test_pressure_adj_raises_target(self):
+        base = compute_threshold(G_BASELINE, 200_000)
+        lifted = compute_threshold(G_BASELINE, 200_000, pressure_adj=0.10)
+        assert lifted == pytest.approx(base + 0.10, abs=1e-9)
+
+    def test_pressure_bounded_by_extended_cap(self):
+        # MAX_THRESHOLD extended 0.70 → 0.75 so 200K-ctx profiles can
+        # reach ~150K triggers under sustained pressure.
+        target = compute_threshold(G_BASELINE, 200_000, pressure_adj=PRESSURE_MAX_ADJ)
+        assert target <= MAX_THRESHOLD
+        assert MAX_THRESHOLD == 0.75

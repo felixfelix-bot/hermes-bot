@@ -824,6 +824,28 @@ def _get_failure_count(name: str) -> int:
     return 0
 
 
+# ── Exhaust soft-preference (Felix: ALERTS-NOT-BLOCKS) ───────────────────────
+# Reads the latest kalman_samples row per key and inflates effective_cost for
+# lanes predicted to exhaust their quota soon. SOFT only — never removes a
+# lane, never touches the pressure FSM. See src/exhaust_weight.py for the
+# formula (ALPHA=0.5, HORIZON=6h) and graceful-degradation guarantees.
+
+def _apply_exhaust_weight(name: str, cost: float) -> float:
+    """Multiply a lane's effective cost by its exhaust soft-preference weight.
+
+    Returns ``cost`` unchanged (×1.0) when the lane is not predicted to exhaust,
+    the sample is stale, or the DB is unreadable. Never raises.
+    """
+    if not math.isfinite(cost):
+        return cost  # inf/NaN already sort to the end; don't touch them
+    try:
+        from exhaust_weight import exhaust_multiplier
+        mult = exhaust_multiplier(name)
+        return cost * mult
+    except Exception:
+        return cost  # never raise into routing
+
+
 # ── _dispatch_to_provider() — maps provider name to dispatch method ─────────
 
 def _make_dispatch_fn(name: str) -> Callable | None:
@@ -982,6 +1004,13 @@ def select_provider(
 
             # 3. Cost evaluation (via Kalman / shadow optimizer)
             cost = _get_effective_cost(name, model_id, difficulty)
+
+            # 3b. Exhaust soft-preference (Felix: ALERTS-NOT-BLOCKS) — lanes
+            # predicted to exhaust their quota within HORIZON hours get their
+            # effective cost inflated so they sort lower in the cheapest-first
+            # ordering. SOFT only: never removes a lane, never touches the
+            # pressure FSM. Degrades to ×1.0 (no effect) on any DB failure.
+            cost = _apply_exhaust_weight(name, cost)
 
             # 4. Build dispatch function
             dispatch_fn = _make_dispatch_fn(name)

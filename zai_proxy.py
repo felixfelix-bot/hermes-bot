@@ -2093,6 +2093,17 @@ _select_model_tier = None
 # call (X-Task-Type: compression or model == "__compress__" sentinel), this
 # hook selects the cheapest capable summarizer model based on cost, pressure,
 # benchmarks, and context constraints. See compression_model_router.py.
+#
+# GAP A (verified 2026-09-04): proxy-side compression selection is UNUSED by
+# live clients. Evidence from zai_usage.db: 301 requests carry
+# task_type='compression' (80 in the last 3 days), but ALL of them send a
+# CONCRETE model (glm-5.2 / glm-5.3 / deepseek/deepseek-v4-flash) — zero
+# requests ever used the "__compress__" sentinel, and model_decisions has zero
+# tier='compression' rows. Hermes profiles resolve compression.model in config
+# and pass a concrete model through, so the flat-router path (which never calls
+# _select_compression_model) is correct. This hook remains wired ONLY in the
+# legacy path (~6240) and is therefore dead-in-production; it is left in place
+# for Phase 1 removal. NO porting into the flat-router path is needed.
 _select_compression_model = None
 try:
     from compression_model_router import (
@@ -5817,6 +5828,33 @@ class Handler(BaseHTTPRequestHandler):
         _FLAT_ROUTER_DISABLE_FLAG = os.path.expanduser(
             "~/.hermes/bot/.disable_flat_router")
 
+        # ── EMERGENCY KILL-SWITCH (2026-09-04) ─────────────────────────────
+        # When ~/.hermes/bot/.emergency_ollama_only exists, dispatch EVERYTHING
+        # directly via the _try_ollama_cloud_any() chain (ollama_cloud →
+        # ollama_cloud_2 → ollama_cloud_3), bypassing select_provider entirely.
+        # This is the fast rollback once .disable_flat_router dies in Phase 1.
+        # On total ollama failure we return a clean 503 (never fall through to
+        # the legacy cascade). Startup log line is emitted in __main__.
+        _EMERGENCY_OLLAMA_FLAG = os.path.expanduser(
+            "~/.hermes/bot/.emergency_ollama_only")
+        if os.path.exists(_EMERGENCY_OLLAMA_FLAG):
+            _resp = bytearray()
+            if self._try_ollama_cloud_any(
+                    body, original_model, _resp, t0,
+                    reason="emergency_ollama_only"):
+                return
+            _err = json.dumps({
+                "error": "emergency ollama-only mode: all ollama keys failed",
+                "model": original_model,
+            }).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(_err)))
+            self.send_header("X-Provider", "none")
+            self.end_headers()
+            self.wfile.write(_err)
+            return
+
         if not os.path.exists(_FLAT_ROUTER_DISABLE_FLAG):
             # ── FLAT ROUTER PATH (Phase 3) ─────────────────────────────
             try:
@@ -5831,8 +5869,32 @@ class Handler(BaseHTTPRequestHandler):
                 _flat_select_provider = None
 
             if _flat_select_provider is not None:
-                # Get ordered candidate list from the flat router
-                _candidates = _flat_select_provider(model=original_model)
+                # Get ordered candidate list from the flat router.
+                # GAP D (2026-09-04): select_provider() is wrapped so a RUNTIME
+                # exception (corrupt quota cache, sqlite error, etc.) can never
+                # kill the request handler. On failure we log the traceback to
+                # the journal and return a clean 503 — we do NOT fall through to
+                # the legacy cascade (the flag check already passed, so the old
+                # path is not a valid fallback here).
+                try:
+                    _candidates = _flat_select_provider(model=original_model)
+                except Exception as _fr_err:
+                    import traceback as _tb
+                    print("[flat-router] select_provider raised "
+                          f"{type(_fr_err).__name__}: {_fr_err} — returning 503",
+                          flush=True)
+                    print(_tb.format_exc(), flush=True)
+                    _err = json.dumps({
+                        "error": "router selection failed",
+                        "detail": str(_fr_err),
+                    }).encode()
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(_err)))
+                    self.send_header("X-Provider", "none")
+                    self.end_headers()
+                    self.wfile.write(_err)
+                    return
 
                 # Shadow log: record what the flat router chose
                 try:
@@ -6791,7 +6853,25 @@ class Handler(BaseHTTPRequestHandler):
                 from urllib.parse import urlparse, parse_qs
                 qs = parse_qs(urlparse(self.path).query)
                 urgency = qs.get("urgency", ["standard"])[0]
-                chosen = best_key()
+                # GAP C (2026-09-04): re-point /tier off best_key() to the flat
+                # router's top candidate. select_provider() picks the cheapest
+                # healthy provider for the representative model (glm-5.2, the
+                # manager default); its top candidate becomes active_key. The
+                # response shape (active_key / quota_pct) is unchanged. best_key()
+                # remains as the fallback when the flat router is unavailable or
+                # raises (it is removed in Phase 1).
+                chosen = None
+                try:
+                    from flat_router import select_provider as _tier_sp
+                    _tier_cands = _tier_sp(model="glm-5.2")
+                    _tier_top = next(
+                        (c for c in _tier_cands if c.name != "fallback"), None)
+                    if _tier_top is not None:
+                        chosen = _tier_top.name
+                except Exception:
+                    chosen = None
+                if chosen is None:
+                    chosen = best_key()
                 if _select_model_tier is not None:
                     info = _select_model_tier(chosen, None, urgency)
                 else:
@@ -7437,6 +7517,10 @@ if __name__ == "__main__":
     _nostr_thread.start()
     time.sleep(3)  # let first quota fetch complete
     print(f"zai_proxy on :{PORT}  quotas={ {n: _max_pct(v[0]) for n, v in quota_cache.items()} }")
+    # Emergency kill-switch startup notice (2026-09-04)
+    if os.path.exists(os.path.expanduser("~/.hermes/bot/.emergency_ollama_only")):
+        print("[emergency] .emergency_ollama_only ACTIVE — all requests routed "
+              "directly to ollama_cloud chain, select_provider bypassed", flush=True)
     # Allow socket reuse to prevent "Address already in use" on restart
     from socketserver import TCPServer
     TCPServer.allow_reuse_address = True

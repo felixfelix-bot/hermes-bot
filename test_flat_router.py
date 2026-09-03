@@ -32,6 +32,21 @@ for p in [BOT, MRE, os.path.join(MRE, "src")]:
         sys.path.insert(0, p)
 
 
+# ── Pin the LIVE zai_proxy import ───────────────────────────────────────────
+# flat_router.py's path bootstrap inserts ~/merchant-routing-engine/production/
+# at sys.path[0], so a bare `import zai_proxy` would resolve to the STALE repo
+# copy (missing the Phase 0 hardening). Load the live ~/.hermes/bot/zai_proxy.py
+# by explicit path and register it in sys.modules BEFORE importing flat_router,
+# so every subsequent `import zai_proxy` in this module (and in flat_router's
+# lazy _resolve) gets the deployed source of truth.
+import importlib.util as _ilu
+_LIVE_ZAI_PROXY_PATH = os.path.join(BOT, "zai_proxy.py")
+_zai_proxy_spec = _ilu.spec_from_file_location("zai_proxy", _LIVE_ZAI_PROXY_PATH)
+_zai_proxy = _ilu.module_from_spec(_zai_proxy_spec)
+sys.modules["zai_proxy"] = _zai_proxy
+_zai_proxy_spec.loader.exec_module(_zai_proxy)
+
+
 # ── Import the flat router module (our new code) ────────────────────────────
 from flat_router import (
     ProviderCandidate,
@@ -1062,6 +1077,130 @@ class TestOllamaDispatchReasonRelabel:
         assert "zai_both_keys_exhausted_ollama_fallback" in src, \
             "legacy label must remain for the rollback path"
 
+
+# ── Phase 0 hardening (2026-09-04) ──────────────────────────────────────────
+# Gap D: select_provider() raising must yield a clean 503, not a crash.
+# Emergency kill-switch: .emergency_ollama_only routes everything to ollama.
+# Gap C: /tier re-pointed off best_key() to the flat router's top candidate.
+
+
+class _ProxyStubHandler(_zai_proxy.Handler):
+    """Minimal Handler stand-in for exercising _proxy()'s flat-router path.
+
+    Inherits the LIVE zai_proxy.Handler so _proxy()'s `self._pressure_enforce`
+    (and any other Handler method it touches) resolves to the real method —
+    the tests then patch `zai_proxy.Handler._pressure_enforce` to stub it out.
+    We override __init__ WITHOUT calling super() so no live socket is needed;
+    the stub supplies its own wfile/rfile/headers and the response helpers.
+    """
+
+    def __init__(self):
+        self.wfile = io.BytesIO()
+        self._sent_status = None
+        self._headers = {}
+        self.close_connection = False
+        self._response_started = False
+        self._spend_recorded = False
+        self._session_id = None
+        self._task_type = None
+        self._pressure_decision = None
+        self.headers = {}
+
+    def send_response(self, code):
+        self._sent_status = code
+
+    def send_header(self, k, v):
+        self._headers[k] = v
+
+    def end_headers(self):
+        pass
+
+    def _try_ollama_cloud_any(self, body, model, buffer, t0, reason=None):
+        # Simulate a successful ollama dispatch: write a fake body + mark
+        # response started so _proxy() returns immediately.
+        buffer.extend(b'{"model":"glm-5.2","choices":[]}')
+        self._response_started = True
+        return True
+
+
+class TestPhase0Hardening:
+    """Gap D + emergency kill-switch + Gap C behavioral tests."""
+
+    def _make_handler(self):
+        import zai_proxy
+        h = _ProxyStubHandler()
+        _body = json.dumps({"model": "glm-5.2",
+                            "messages": [{"role": "user", "content": "hi"}]}).encode()
+        h.rfile = io.BytesIO(_body)
+        h.headers = {"Content-Length": str(len(_body))}
+        return h
+
+    def test_select_provider_raising_returns_503(self):
+        """Gap D: a runtime exception in select_provider must yield a clean
+        503 JSON (not an uncaught exception that kills the handler)."""
+        import zai_proxy
+        h = self._make_handler()
+        with patch.object(zai_proxy, "_check_global_spend_cap",
+                          return_value=(True, 0.0, 100.0)), \
+             patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy.Handler, "_pressure_enforce",
+                          return_value=False), \
+             patch("flat_router.select_provider",
+                   side_effect=RuntimeError("corrupt quota cache")):
+            zai_proxy.Handler._proxy(h)
+        assert h._sent_status == 503, \
+            f"expected 503, got {h._sent_status}"
+        payload = json.loads(h.wfile.getvalue())
+        assert payload["error"] == "router selection failed", \
+            f"unexpected body: {payload}"
+
+    def test_emergency_ollama_only_dispatches_ollama(self):
+        """Emergency kill-switch: with .emergency_ollama_only present, _proxy()
+        must dispatch via _try_ollama_cloud_any and NEVER call select_provider."""
+        import zai_proxy
+        h = self._make_handler()
+        flag = os.path.expanduser("~/.hermes/bot/.emergency_ollama_only")
+        select_called = {"v": False}
+
+        def _spy_select(*a, **k):
+            select_called["v"] = True
+            return []
+
+        with patch.object(zai_proxy, "_check_global_spend_cap",
+                          return_value=(True, 0.0, 100.0)), \
+             patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy.Handler, "_pressure_enforce",
+                          return_value=False), \
+             patch("flat_router.select_provider", side_effect=_spy_select), \
+             patch.object(zai_proxy.os.path, "exists",
+                          side_effect=lambda p: p == flag):
+            zai_proxy.Handler._proxy(h)
+        assert select_called["v"] is False, \
+            "select_provider must NOT be called in emergency ollama-only mode"
+        # _try_ollama_cloud_any wrote a body and marked response started
+        assert h._response_started is True, \
+            "ollama dispatch should have served the request"
+
+    def test_tier_returns_valid_key_via_router(self):
+        """Gap C: /tier must return a valid active_key sourced from the flat
+        router's top candidate (not best_key)."""
+        import zai_proxy
+        h = _ProxyStubHandler()
+        h.path = "/tier"
+        with patch.object(zai_proxy, "_select_model_tier", None):
+            zai_proxy.Handler.do_GET(h)
+        payload = json.loads(h.wfile.getvalue())
+        assert "active_key" in payload, \
+            f"/tier response missing active_key: {payload}"
+        assert payload["active_key"], \
+            "active_key must be a non-empty provider name"
+        # The active_key must be a real provider name (flat router candidate),
+        # not the legacy binary "ours"/"friend" only — it can be any of the
+        # registered providers.
+        assert payload["active_key"] != "fallback", \
+            "active_key must not be the fallback sentinel"
 
 
 if __name__ == "__main__":

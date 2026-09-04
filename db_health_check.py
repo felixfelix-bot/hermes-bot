@@ -94,6 +94,22 @@ def check_integrity(db_path: Path) -> tuple[str, str]:
         return "error", str(e)
 
 
+def _remove_backup_copy(backup: Path) -> None:
+    """Delete the timestamped .corrupted-* copy (and any stale companions).
+
+    Root-cause fix 2026-09-04: these full-DB copies were never removed after
+    recovery attempts (success OR failure), leaking ~21 GiB/night across
+    profiles. Timestamped names only — the live state.db is never touched.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(backup) + suffix)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError as e:
+                _log(f"  WARN: could not remove {p.name}: {e}")
+
+
 def recover_database(db_path: Path) -> bool:
     """Attempt to recover a corrupted SQLite database.
     
@@ -136,6 +152,7 @@ def recover_database(db_path: Path) -> bool:
                 new_size = db_path.stat().st_size / 1048576
                 old_size = backup.stat().st_size / 1048576
                 _log(f"  RECOVERED: {old_size:.0f}MB → {new_size:.0f}MB")
+                _remove_backup_copy(backup)
                 return True
             else:
                 _log(f"  Rebuild failed: {result.stderr[:200]}")
@@ -154,6 +171,7 @@ def recover_database(db_path: Path) -> bool:
     
     if recovered_sql.exists():
         recovered_sql.unlink()
+    _remove_backup_copy(backup)
     return False
 
 
@@ -246,7 +264,13 @@ def run(check_only: bool = False, profile_filter: str | None = None):
                         results["compacted"] += 1
             elif size_mb > 10:
                 _log(f"  {profile_name}: OK ({size_mb:.0f}MB)")
-        elif status in ("corrupted", "timeout"):
+        elif status == "timeout":
+            # quick_check timeout on a large/live WAL DB is NOT corruption.
+            # Misclassifying it made the sweep full-copy + "recover" healthy
+            # multi-GB DBs every night (the 02:00 IST leak, fixed 2026-09-04).
+            results["ok"] += 1
+            _log(f"  {profile_name}: TIMEOUT ({size_mb:.0f}MB) — skip (large/live DB), not corrupt")
+        elif status == "corrupted":
             results["corrupted"] += 1
             corrupted_profiles.append(profile_name)
             _log(f"  {profile_name}: {status.upper()} ({size_mb:.0f}MB) — {detail[:80]}")

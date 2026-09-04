@@ -63,14 +63,16 @@ FAMILY_FALLBACKS: dict[str, int] = {
 # Safe fallback when config can't be read
 DEFAULT_CONTEXT_LENGTH = 200_000
 
-# Deliberate overrides: profiles the governor must NOT touch (hand-tuned
-# context_length for specific lanes). Mirrors compression_growth_governor's
-# EXEMPT_PROFILES. 2026-09-02: manager runs at a deliberate 200000 that the
-# global model-detection path kept stomping to 1M (cron/consultant calls
-# pollute the global latest-model signal). The value is informational only —
-# process_profile() skips these profiles entirely.
+# Deliberate overrides: profiles with an operator-pinned context_length.
+# 2026-09-05: manager pinned to 1_048_576 (GLM-5.3 full window, operator
+# directive "use the available context window better"). The pin is now
+# ACTIVE — process_profile() enforces this exact value and heals any drift
+# (dashboard model-switch pops, stale writes, manual edits) within one run.
+# History: 2026-09-02 pinned manager at 200_000 to stop detection flip-flop;
+# that was a symptom fix from before the real causes (tool-output pollution,
+# inflated preflight estimates) were repaired. Superseded.
 DELIBERATE_CONTEXT_LENGTHS: dict[str, int] = {
-    "manager": 200_000,
+    "manager": 1_048_576,
 }
 
 # session_id → profile mapping for per-profile model attribution.
@@ -378,6 +380,32 @@ def get_current_context_length(config_path: Path | None = None) -> int:
     return DEFAULT_CONTEXT_LENGTH
 
 
+def get_configured_model(config_path: Path | None = None) -> str | None:
+    """Read the profile's OWN configured model from config.yaml.
+
+    This is the ground truth for what the profile runs — unlike usage-DB
+    detection, it cannot be polluted by cron jobs, consultants, or other
+    profiles' traffic. Supports both the mapping form (``model: {default:
+            ...}``) and the legacy bare-string form (``model: glm-5.3``).
+    """
+    if config_path is None:
+        config_path = CONFIG_PATH
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(config_path.read_text())
+        model = (cfg or {}).get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        if isinstance(model, dict):
+            default = model.get("default")
+            if isinstance(default, str) and default.strip():
+                return default.strip()
+    except Exception:
+        pass
+    return None
+
+
 def set_context_length(new_value: int, profile_name: str = "manager") -> bool:
     """Set ``model.context_length`` via ``hermes config set``.
 
@@ -460,26 +488,44 @@ def process_profile(profile_name: str) -> dict:
     """
     config_path = profile_config_path(profile_name)
 
-    # 0. Exemption: profiles with a deliberate hand-tuned context_length
-    #    must never be touched (mirrors compression_growth_governor's
-    #    EXEMPT_PROFILES). Leave config untouched.
+    # 0. Pinned profiles: ENFORCE the operator-pinned context_length.
+    #    The pin is active — any drift (dashboard model-switch pop, stale
+    #    write, manual edit) is healed back to the pinned value here, within
+    #    one governor run. No detection, no registry, no 413 logic applies.
     if profile_name in DELIBERATE_CONTEXT_LENGTHS:
+        pinned = DELIBERATE_CONTEXT_LENGTHS[profile_name]
         current_ctx = get_current_context_length(config_path)
-        print(f"[ctx-governor] {profile_name}: exempt (deliberate context_length)")
+        healed = False
+        if current_ctx != pinned:
+            healed = set_context_length(pinned, profile_name)
+            action = "healed" if healed else "DRIFT-DETECTED-SET-FAILED"
+            print(
+                f"[ctx-governor] {profile_name}: pinned {pinned}, "
+                f"was {current_ctx} — {action}"
+            )
+        else:
+            print(f"[ctx-governor] {profile_name}: pinned {pinned}, ok")
         return {
             "profile": profile_name,
             "detected_model": None,
             "registry_ctx": None,
             "current_ctx": current_ctx,
-            "new_ctx": None,
-            "applied": False,
+            "new_ctx": pinned,
+            "applied": healed,
             "413_count": 0,
-            "reason": "exempt (deliberate context_length)",
+            "reason": (
+                "pinned-ok" if current_ctx == pinned
+                else ("pinned-healed" if healed else "pinned-heal-failed")
+            ),
         }
 
-    # 1. Detect active model — per-profile first (excludes cron sessions),
-    #    falling back to the global detect when no session rows match.
-    model = detect_active_model_for_profile(profile_name, db_path=DB_PATH)
+    # 1. Resolve model — the profile's OWN configured model first (ground
+    #    truth, immune to cron/consultant traffic pollution), then per-profile
+    #    usage attribution (excludes cron sessions), then global detect.
+    configured_model = get_configured_model(config_path)
+    model = configured_model
+    if model is None:
+        model = detect_active_model_for_profile(profile_name, db_path=DB_PATH)
     if model is None:
         model = detect_active_model(db_path=DB_PATH, allow_probe=False)
     current_ctx = get_current_context_length(config_path)

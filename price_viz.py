@@ -718,31 +718,36 @@ def render_headroom_weekly(outdir: Path) -> Path:
     fig, (ax_a, ax_b) = plt.subplots(nrows=2, figsize=(14, 9), sharex=True)
     x = range(n_hours)
 
-    # Panel A: token lanes stacked area
-    bottom = np.zeros(n_hours)
+    # Panel A: token lanes — each drawn individually on a LOG y-axis so the
+    # 14M z.ai lanes (ours/friend) stay visible next to the 3.5B ollama lanes.
+    # Stacking is impossible on a log axis (bottom=0 breaks log scale), so each
+    # lane is a separate headroom line, floor-clamped to stay visible.
+    token_floor_b = 0.001  # 0.001B floor so a 0-headroom lane doesn't vanish on log
+    panel_top_b = 5.0      # headroom top covering the 3.5B ollama lanes w/ margin
     colors = ["#1f77b4", "#2ca02c", "#90c3c4", "#ff7f0e", "#d62728", "#9467bd"]
     ci = 0
     for lane in token_lanes:
         vals = token_series.get(lane)
         if vals is None:
             continue
-        arr = np.array(vals)
-        color = colors[ci % len(colors)]
+        arr = np.array([v if v and v > 0 else token_floor_b for v in vals],
+                       dtype=float)
+        color = PROVIDER_COLORS.get(lane, colors[ci % len(colors)])
         ci += 1
-        ax_a.fill_between(x, bottom, bottom + arr, alpha=0.6, color=color, label=lane)
-        ax_a.plot(x, bottom + arr, color=color, linewidth=0.8)
-        bottom = bottom + arr
+        ax_a.plot(x, arr, color=color, linewidth=1.6, label=lane)
 
-    # Flat lanes: hatched band, never stacked
+    # Flat lanes: hatched band spanning the panel (regime="included"), never
+    # stacked into the token headroom lines.
     for lane in flat_lanes:
-        ax_a.axhspan(0, max(float(bottom.max()), 1e-9), color="gray",
+        ax_a.axhspan(token_floor_b, panel_top_b, color="gray",
                      alpha=0.15, hatch="//", label=f"{lane} (flat/included)")
 
-    ax_a.set_ylabel("Remaining Quota (B tokens)")
-    ax_a.set_title("Weekly Quota Headroom — Token Lanes (stacked)")
+    ax_a.set_yscale("log")
+    ax_a.set_ylabel("Weekly headroom (B tokens, log scale)")
+    ax_a.set_title("Weekly Quota Headroom — Token Lanes (log scale)")
     ax_a.legend(loc="upper right", fontsize=8)
     ax_a.grid(True, alpha=0.2)
-    ax_a.set_ylim(bottom=0)
+    ax_a.set_ylim(bottom=token_floor_b, top=panel_top_b)
 
     # Panel B: USD balance lanes (absolute, never stacked)
     for lane in usd_lanes:

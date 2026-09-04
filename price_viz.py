@@ -631,6 +631,18 @@ def _ffill_series(points, boundaries):
     return vals
 
 
+def _fmt_token_count(n: float) -> str:
+    """Human-readable token/call count (e.g. 12_399_810 -> "12.4M")."""
+    n = float(n or 0)
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}K"
+    return str(int(n))
+
+
 def render_headroom_weekly(outdir: Path) -> Path:
     """V8b: Dynamic 2-panel headroom over last 7 days.
 
@@ -711,6 +723,23 @@ def render_headroom_weekly(outdir: Path) -> Path:
                 if rem is not None:
                     points = [(now, rem)]
             usd_series[lane] = _ffill_series(points, hour_bins)
+
+    # ── Flat-lane usage (for NAMED bands) ──
+    # One query per flat lane over the window; used to label each band with its
+    # real token/call volume (e.g. "opencode_go — 12.4M tokens / 370 calls (7d)").
+    flat_usage: dict[str, tuple[int, int]] = {}
+    for lane in flat_lanes:
+        try:
+            rows = db.execute(
+                "SELECT ts, total_tokens FROM api_calls "
+                "WHERE key_name=? AND ts > ? ORDER BY ts",
+                (lane, now - window_s)
+            ).fetchall()
+        except Exception:
+            rows = []
+        tokens = int(sum(r["total_tokens"] or 0 for r in rows))
+        calls = len(rows)
+        flat_usage[lane] = (tokens, calls)
     db.close()
     burn_db.close()
 
@@ -736,11 +765,15 @@ def render_headroom_weekly(outdir: Path) -> Path:
         ci += 1
         ax_a.plot(x, arr, color=color, linewidth=1.6, label=lane)
 
-    # Flat lanes: hatched band spanning the panel (regime="included"), never
-    # stacked into the token headroom lines.
+    # Flat lanes: each drawn as its own NAMED band (per-lane color) with a live
+    # usage note (7d tokens / calls) so "included" lanes are individually
+    # identifiable instead of one anonymous gray band.
     for lane in flat_lanes:
-        ax_a.axhspan(token_floor_b, panel_top_b, color="gray",
-                     alpha=0.15, hatch="//", label=f"{lane} (flat/included)")
+        tokens, calls = flat_usage.get(lane, (0, 0))
+        color = PROVIDER_COLORS.get(lane, "#999999")
+        note = f"{lane} — {_fmt_token_count(tokens)} tokens / {calls} calls (7d)"
+        ax_a.axhspan(token_floor_b, panel_top_b, color=color,
+                     alpha=0.18, hatch="//", label=note)
 
     ax_a.set_yscale("log")
     ax_a.set_ylabel("Weekly headroom (B tokens, log scale)")

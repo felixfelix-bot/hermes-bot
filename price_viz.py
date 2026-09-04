@@ -586,6 +586,36 @@ def _rolling_window_sums(ts_arr, tok_arr, boundaries, window_s):
     return out
 
 
+def _parse_usd_remaining(limit_remaining, raw_json):
+    """Resolve a USD lane's remaining balance, reader-side.
+
+    The api_burn collector writes ``limit_remaining=0.0`` for neuralwatt on
+    every row (its kwh-included bucket is exhausted) while the real dollar
+    balance lives in ``raw_json.remaining_usd``. When the mirror column is 0
+    or None, fall back to parsing the raw_json payload (covers historical
+    rows too — we do NOT patch the collector).
+
+    Returns the best float balance, or None when nothing usable is present.
+    """
+    if limit_remaining is not None:
+        try:
+            rem = float(limit_remaining)
+        except (TypeError, ValueError):
+            rem = None
+        if rem is not None and rem > 0:
+            return rem
+    # limit_remaining is 0 / None / unparseable → try raw_json.remaining_usd
+    if raw_json:
+        try:
+            obj = json.loads(raw_json)
+            rem = obj.get("remaining_usd")
+            if rem is not None:
+                return float(rem)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _ffill_series(points, boundaries):
     """Forward-fill sparse (ts, value) points onto boundaries.
 
@@ -662,12 +692,19 @@ def render_headroom_weekly(outdir: Path) -> Path:
             usd_series[lane] = _ffill_series(points, hour_bins)
         else:
             rows = burn_db.execute(
-                "SELECT collected_at, limit_remaining FROM provider_balances "
+                "SELECT collected_at, limit_remaining, raw_json FROM provider_balances "
                 "WHERE provider=? AND collected_at > ? ORDER BY collected_at",
                 (lane, now - window_s - 3600)
             ).fetchall()
-            points = [(r["collected_at"], r["limit_remaining"])
-                      for r in rows if r["limit_remaining"] is not None]
+            points = []
+            for r in rows:
+                try:
+                    raw = r["raw_json"]
+                except (KeyError, IndexError):
+                    raw = None
+                rem = _parse_usd_remaining(r["limit_remaining"], raw)
+                if rem is not None:
+                    points.append((r["collected_at"], rem))
             if not points and payload and isinstance(payload.get(lane), dict):
                 # Fall back to a single live point from the /quota payload.
                 rem = payload[lane].get("remaining_usd")

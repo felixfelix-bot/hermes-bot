@@ -586,6 +586,36 @@ def _rolling_window_sums(ts_arr, tok_arr, boundaries, window_s):
     return out
 
 
+def _parse_usd_remaining(limit_remaining, raw_json):
+    """Resolve a USD lane's remaining balance, reader-side.
+
+    The api_burn collector writes ``limit_remaining=0.0`` for neuralwatt on
+    every row (its kwh-included bucket is exhausted) while the real dollar
+    balance lives in ``raw_json.remaining_usd``. When the mirror column is 0
+    or None, fall back to parsing the raw_json payload (covers historical
+    rows too — we do NOT patch the collector).
+
+    Returns the best float balance, or None when nothing usable is present.
+    """
+    if limit_remaining is not None:
+        try:
+            rem = float(limit_remaining)
+        except (TypeError, ValueError):
+            rem = None
+        if rem is not None and rem > 0:
+            return rem
+    # limit_remaining is 0 / None / unparseable → try raw_json.remaining_usd
+    if raw_json:
+        try:
+            obj = json.loads(raw_json)
+            rem = obj.get("remaining_usd")
+            if rem is not None:
+                return float(rem)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _ffill_series(points, boundaries):
     """Forward-fill sparse (ts, value) points onto boundaries.
 
@@ -599,6 +629,18 @@ def _ffill_series(points, boundaries):
             idx += 1
         vals.append(points[idx - 1][1] if idx > 0 else None)
     return vals
+
+
+def _fmt_token_count(n: float) -> str:
+    """Human-readable token/call count (e.g. 12_399_810 -> "12.4M")."""
+    n = float(n or 0)
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}K"
+    return str(int(n))
 
 
 def render_headroom_weekly(outdir: Path) -> Path:
@@ -662,18 +704,42 @@ def render_headroom_weekly(outdir: Path) -> Path:
             usd_series[lane] = _ffill_series(points, hour_bins)
         else:
             rows = burn_db.execute(
-                "SELECT collected_at, limit_remaining FROM provider_balances "
+                "SELECT collected_at, limit_remaining, raw_json FROM provider_balances "
                 "WHERE provider=? AND collected_at > ? ORDER BY collected_at",
                 (lane, now - window_s - 3600)
             ).fetchall()
-            points = [(r["collected_at"], r["limit_remaining"])
-                      for r in rows if r["limit_remaining"] is not None]
+            points = []
+            for r in rows:
+                try:
+                    raw = r["raw_json"]
+                except (KeyError, IndexError):
+                    raw = None
+                rem = _parse_usd_remaining(r["limit_remaining"], raw)
+                if rem is not None:
+                    points.append((r["collected_at"], rem))
             if not points and payload and isinstance(payload.get(lane), dict):
                 # Fall back to a single live point from the /quota payload.
                 rem = payload[lane].get("remaining_usd")
                 if rem is not None:
                     points = [(now, rem)]
             usd_series[lane] = _ffill_series(points, hour_bins)
+
+    # ── Flat-lane usage (for NAMED bands) ──
+    # One query per flat lane over the window; used to label each band with its
+    # real token/call volume (e.g. "opencode_go — 12.4M tokens / 370 calls (7d)").
+    flat_usage: dict[str, tuple[int, int]] = {}
+    for lane in flat_lanes:
+        try:
+            rows = db.execute(
+                "SELECT ts, total_tokens FROM api_calls "
+                "WHERE key_name=? AND ts > ? ORDER BY ts",
+                (lane, now - window_s)
+            ).fetchall()
+        except Exception:
+            rows = []
+        tokens = int(sum(r["total_tokens"] or 0 for r in rows))
+        calls = len(rows)
+        flat_usage[lane] = (tokens, calls)
     db.close()
     burn_db.close()
 
@@ -681,31 +747,40 @@ def render_headroom_weekly(outdir: Path) -> Path:
     fig, (ax_a, ax_b) = plt.subplots(nrows=2, figsize=(14, 9), sharex=True)
     x = range(n_hours)
 
-    # Panel A: token lanes stacked area
-    bottom = np.zeros(n_hours)
+    # Panel A: token lanes — each drawn individually on a LOG y-axis so the
+    # 14M z.ai lanes (ours/friend) stay visible next to the 3.5B ollama lanes.
+    # Stacking is impossible on a log axis (bottom=0 breaks log scale), so each
+    # lane is a separate headroom line, floor-clamped to stay visible.
+    token_floor_b = 0.001  # 0.001B floor so a 0-headroom lane doesn't vanish on log
+    panel_top_b = 5.0      # headroom top covering the 3.5B ollama lanes w/ margin
     colors = ["#1f77b4", "#2ca02c", "#90c3c4", "#ff7f0e", "#d62728", "#9467bd"]
     ci = 0
     for lane in token_lanes:
         vals = token_series.get(lane)
         if vals is None:
             continue
-        arr = np.array(vals)
-        color = colors[ci % len(colors)]
+        arr = np.array([v if v and v > 0 else token_floor_b for v in vals],
+                       dtype=float)
+        color = PROVIDER_COLORS.get(lane, colors[ci % len(colors)])
         ci += 1
-        ax_a.fill_between(x, bottom, bottom + arr, alpha=0.6, color=color, label=lane)
-        ax_a.plot(x, bottom + arr, color=color, linewidth=0.8)
-        bottom = bottom + arr
+        ax_a.plot(x, arr, color=color, linewidth=1.6, label=lane)
 
-    # Flat lanes: hatched band, never stacked
+    # Flat lanes: each drawn as its own NAMED band (per-lane color) with a live
+    # usage note (7d tokens / calls) so "included" lanes are individually
+    # identifiable instead of one anonymous gray band.
     for lane in flat_lanes:
-        ax_a.axhspan(0, max(float(bottom.max()), 1e-9), color="gray",
-                     alpha=0.15, hatch="//", label=f"{lane} (flat/included)")
+        tokens, calls = flat_usage.get(lane, (0, 0))
+        color = PROVIDER_COLORS.get(lane, "#999999")
+        note = f"{lane} — {_fmt_token_count(tokens)} tokens / {calls} calls (7d)"
+        ax_a.axhspan(token_floor_b, panel_top_b, color=color,
+                     alpha=0.18, hatch="//", label=note)
 
-    ax_a.set_ylabel("Remaining Quota (B tokens)")
-    ax_a.set_title("Weekly Quota Headroom — Token Lanes (stacked)")
+    ax_a.set_yscale("log")
+    ax_a.set_ylabel("Weekly headroom (B tokens, log scale)")
+    ax_a.set_title("Weekly Quota Headroom — Token Lanes (log scale)")
     ax_a.legend(loc="upper right", fontsize=8)
     ax_a.grid(True, alpha=0.2)
-    ax_a.set_ylim(bottom=0)
+    ax_a.set_ylim(bottom=token_floor_b, top=panel_top_b)
 
     # Panel B: USD balance lanes (absolute, never stacked)
     for lane in usd_lanes:

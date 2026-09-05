@@ -2905,9 +2905,10 @@ _MODEL_ID_TO_PROVIDER_ID: dict[str, dict[str, str]] = {
         "ppq": "z-ai/glm-5.2",
         "neuralwatt": "glm-5.2",
     },
-    "glm-5.3": {
-        "neuralwatt": "glm-5.3",
-    },
+    # glm-5.3 entry REMOVED (2026-09-05) — neuralwatt no longer routes glm-5.3
+    # (see flat_router PROVIDER_MODELS). This map (_MODEL_ID_TO_PROVIDER_ID) is
+    # cost-lookup only; the leftover "neuralwatt":"glm-5.3" identity entry is now
+    # dead and was a no-op (NEURALWATT_RATES has no glm-5.3 key).
     "kimi-k3": {
         "telnyx": "moonshotai/Kimi-K3",
         "openrouter": "moonshotai/kimi-k3",
@@ -4370,10 +4371,11 @@ def _check_sustained_down():
                 print(f"\n{'='*60}", flush=True)
                 print(alert_text, flush=True)
                 print(f"{'='*60}\n", flush=True)
-                # 3. Voice notification
+                # 3. Voice notification (natural Piper voice via say.sh;
+                #    espeak-ng fallback inside the wrapper guarantees audibility)
                 try:
                     import subprocess as _sp
-                    _sp.Popen(["espeak-ng",
+                    _sp.Popen(["/home/c03rad0r/.hermes/voices/say.sh",
                                f"Alert: key {name} has been unavailable for "
                                f"{down_duration/60:.0f} minutes"],
                               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)

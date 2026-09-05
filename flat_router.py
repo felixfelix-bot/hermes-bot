@@ -198,7 +198,10 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # kimi-k2.7-code: LIVE (2026-08-30) — $0.95/M in, $4.00/M out; cheaper
     # paid code rung than kimi-k3 ($3.00/$15.00).
     "neuralwatt": {
-        "glm-5.2", "glm-5.3", "kimi-k3", "kimi-k2.7-code",
+        # glm-5.3 REMOVED (2026-09-05) — NW glm-5.3 endpoint intermittently
+        # streams degenerate token-spam (77k+ completion tokens, HTTP 200).
+        # NW deepseek/glm-5.2/kimi lanes are coherent; only glm-5.3 collapses.
+        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "deepseek/gemma-4-31b",
     },

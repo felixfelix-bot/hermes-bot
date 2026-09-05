@@ -372,6 +372,19 @@ def _is_key_healthy(name: str) -> bool:
     return True
 
 
+def _is_pair_garbage_demoted(name: str, model: str) -> bool:
+    """Check if THIS (provider, model) pair is demoted by the garbage
+    circuit-breaker. Resolves from zai_proxy; fails OPEN (returns False, i.e.
+    NOT demoted) on any resolution error so routing is never blocked."""
+    fn = _resolve("_garbage_cb_pair_demoted")
+    if fn is not None:
+        try:
+            return bool(fn(name, model))
+        except Exception:
+            return False
+    return False
+
+
 def _is_provider_funded(name: str) -> bool:
     """Check if external provider has credits. Resolves from zai_proxy."""
     fn = _resolve("_is_provider_funded")
@@ -999,6 +1012,13 @@ def select_provider(
                 # Exact match only — model translation happens at dispatch time.
                 # (glm-5.3 is served verbatim on ollama since 2026-08-29; no
                 # downgrade-to-5.2 substitution exists anymore.)
+                continue
+
+            # 1a. Garbage circuit-breaker (per-(provider, model)): if THIS
+            # (provider, model) pair was demoted for degenerate oversized
+            # output (24h TTL), skip it from rotation while the provider stays
+            # eligible for OTHER models. Fails OPEN (never blocks routing).
+            if _is_pair_garbage_demoted(name, model_id):
                 continue
 
             # 1b. Phantom-catalog guard — if a fresh live-catalog snapshot for

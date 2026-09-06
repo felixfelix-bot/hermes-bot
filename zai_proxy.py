@@ -1505,6 +1505,13 @@ def _get_provider_cost(name: str, model_id: str) -> float:
             rates = NEURALWATT_RATES.get(provider_model) or NEURALWATT_RATES.get(model_id)
             if rates:
                 return _blended_rate(rates["input"], rates["output"])
+        elif name == "deepseek":
+            rates = DEEPSEEK_RATES.get(provider_model) or DEEPSEEK_RATES.get(model_id)
+            if rates:
+                # DeepSeek has cache_hit pricing — blend with a 60:40 cache-hit ratio
+                # (conservative; PAE-6/7 warm-context will push toward 94%).
+                blended_input = 0.6 * rates.get("cache_hit", rates["input"]) + 0.4 * rates["input"]
+                return _blended_rate(blended_input, rates["output"])
     # 1b. Routstr/routstrd: check MEASURED rates first (ground truth via
     # wallet balance deltas and published sats_pricing, stored in
     # measured_rates table by routstr_probe.py daily at 03:00).
@@ -1909,6 +1916,7 @@ def _snapshot_health() -> dict:
         h["openrouter"] = True
         h["telnyx"] = _is_key_healthy("telnyx")
         h["routstr"] = _is_key_healthy("routstr")
+        h["deepseek"] = _is_key_healthy("deepseek")
         # DAILY SUB-CAP for routstrd (2026-09-02, plan B3): routstrd is the
         # cheapest METERED provider ($0.53/M measured), so during ollama
         # burst-flaps it became the default overflow catch-basin — $47.67 of
@@ -4097,7 +4105,43 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                 + completion_toks * out_r
             ) / 1_000_000
             return (raw_cost, "rate_derived_chutes")
-        # 4c. Catch-all fallback — for ANY provider without a specific branch
+        # 4c. DeepSeek — per-token, no in-body cost. Derive from DEEPSEEK_RATES
+        # × actual token breakdown. Cache-hit pricing makes our warm-context
+        # workload very cheap — account for prompt_tokens_details.cached_tokens
+        # just like the telnyx branch does.
+        if provider == "deepseek":
+            usage = _parse_usage(bytes(response_buffer))
+            prompt_toks = int(usage.get("prompt_tokens") or 0)
+            completion_toks = int(usage.get("completion_tokens") or 0)
+            cached_toks = 0
+            _ptd = usage.get("prompt_tokens_details") or {}
+            if isinstance(_ptd, dict):
+                cached_toks = int(_ptd.get("cached_tokens") or 0)
+            uncached_toks = max(prompt_toks - cached_toks, 0)
+            model_name = None
+            try:
+                _obj = json.loads(bytes(response_buffer))
+                if isinstance(_obj, dict):
+                    model_name = _obj.get("model")
+            except Exception:
+                pass
+            rates = DEEPSEEK_RATES.get(model_name or "")
+            if rates:
+                in_r = rates.get("input", 0.22)
+                cache_r = rates.get("cache_hit", 0.007)
+                out_r = rates.get("output", 0.66)
+                raw_cost = (
+                    uncached_toks * in_r
+                    + cached_toks * cache_r
+                    + completion_toks * out_r
+                ) / 1_000_000
+                return (raw_cost, "cached_rate_derived" if cached_toks > 0 else "rate_derived")
+            # fallback to blended rate (same as generic catch-all below)
+            rate = _rpt_rate("deepseek")
+            if rate is not None and rate > 0 and rate != float("inf"):
+                return ((total_tokens / 1_000_000) * rate, "rate_derived")
+            return (None, None)
+        # 4d. Catch-all fallback — for ANY provider without a specific branch
         # above (e.g. routstr, routstrd, deepinfra, ppq, openrouter,
         # ollama_cloud_2, and any future provider), derive cost from the
         # Kalman-measured $/M rate × total_tokens. These providers don't

@@ -221,26 +221,66 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
         return cached
     try:
         status = _get_quota_status(str(USAGE_DB), key_name=key_name)
-        # Monthly-budget key (ollama_cloud_3): override monthly_used_pct with the
-        # authoritative server fraction (limits.monthly.usage); fall back to the
-        # local rolling estimate if the server fetch is unavailable.
+        # Server-truth override (t_30dde4c7): the LOCAL token counter (sum of
+        # api_calls.total_tokens in session/weekly/monthly windows) is blind to
+        # server-side exhaustion — an exhausted key stops being dispatched, so
+        # its local counts freeze near 0 and /quota reports "included/0%" while
+        # the subscription actually serves 100% of its pool. The authoritative
+        # source is ollama.com/api/usage (limits.*.usage fractions). Override
+        # the local window fractions with the server fractions for EVERY key,
+        # not just ollama_cloud_3. Falls back to the local rolling estimates if
+        # the server fetch is unavailable so routing never breaks.
+        #
+        # Probe markers exposed to /quota:
+        #   probe_exhausted  True if the server used_pct >= 100 (pool fully
+        #                    consumed) — so operators can trust the view.
+        #   server_used_pct  Server-derived used_pct (0-100), if fetched.
+        #   probe_ts         Wall-clock of the last successful server fetch.
+        _probe_exhausted = False
+        _srv_pct = None
+        try:
+            from src.ollama_extra_usage import fetch_ollama_usage
+            _key_var = {
+                "ollama_cloud": OLLAMA_CLOUD_KEY,
+                "ollama_cloud_2": OLLAMA_CLOUD_KEY_2,
+                "ollama_cloud_3": OLLAMA_CLOUD_KEY_3,
+                "ollama_cloud_4": OLLAMA_CLOUD_KEY_4,
+            }.get(key_name)
+            if _key_var:
+                _usage = fetch_ollama_usage(api_key=_key_var, now=now)
+                _lim = (_usage or {}).get("limits", {}) or {}
+                _srv_fracs = {}
+                for _win in ("session", "weekly", "monthly"):
+                    _w = _lim.get(_win)
+                    if isinstance(_w, dict) and _w.get("usage") is not None:
+                        _srv_fracs[_win] = float(_w.get("usage") or 0)
+                if _srv_fracs:
+                    # Override local window fractions with server truth.
+                    if "session" in _srv_fracs:
+                        status["session_used_pct"] = _srv_fracs["session"] * 100.0
+                    if "weekly" in _srv_fracs:
+                        status["weekly_used_pct"] = _srv_fracs["weekly"] * 100.0
+                    if "monthly" in _srv_fracs:
+                        status["monthly_used_pct"] = _srv_fracs["monthly"] * 100.0
+                    _srv_pct = max(_srv_fracs.values()) * 100.0
+                    _probe_exhausted = bool(_srv_pct >= 100.0)
+                    # regime from server truth: 100% → exhausted, >=90% → extra
+                    # (scarcity ramp), else included. Preserves the oc3 monthly
+                    # delist intent and generalises to oc/oc2/oc4 weekly pools.
+                    if _srv_pct >= 100.0:
+                        status["regime"] = "exhausted"
+                    elif _srv_pct >= 90.0:
+                        status["regime"] = "extra"
+                    else:
+                        status["regime"] = "included"
+        except Exception:
+            pass  # server fetch unavailable → keep local estimates
+        status["probe_exhausted"] = _probe_exhausted
+        status["server_used_pct"] = _srv_pct
+        status["probe_ts"] = now if _srv_pct is not None else None
         if key_name == "ollama_cloud_3":
-            _moly = status.get("monthly_used_pct", 0.0)
-            try:
-                from src.ollama_extra_usage import fetch_ollama_usage
-                if OLLAMA_CLOUD_KEY_3:
-                    _usage = fetch_ollama_usage(api_key=OLLAMA_CLOUD_KEY_3, now=now)
-                    if _usage and _usage.get("limits", {}).get("monthly", {}):
-                        _frac = float(_usage["limits"]["monthly"].get("usage", 0) or 0)
-                        _moly = _frac * 100.0
-            except Exception:
-                pass
-            status["monthly_used_pct"] = _moly
-            status["regime"] = "exhausted" if _moly >= 100.0 else status.get("regime", "included")
-            status["monthly_tokens"] = int(status.get("monthly_tokens", 0))
-            # Surface the monthly budget limit (BUG A fix): the tracker now
-            # returns it, but older cached/fallback dicts may lack it — resolve
-            # from the tracker's _load_limits (config override) or the default.
+            # oc3 is monthly-only: surface the budget limit (BUG A fix). The
+            # tracker returns it, but older cached/fallback dicts may lack it.
             if not status.get("monthly_limit"):
                 try:
                     if _oc_load_limits is not None:
@@ -249,6 +289,7 @@ def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
                         status["monthly_limit"] = _OC_MONTHLY_LIMIT
                 except Exception:
                     status["monthly_limit"] = _OC_MONTHLY_LIMIT
+            status["monthly_tokens"] = int(status.get("monthly_tokens", 0))
         _ollama_quota_cache[key_name] = status
         _ollama_quota_cache_ts[key_name] = now
         return status
@@ -649,6 +690,8 @@ def _load_external_keys():
                     keys["opencode_go"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("NEURALWATT_API_KEY=") and "neuralwatt" not in keys:
                     keys["neuralwatt"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("CHUTES_API_KEY=") and "chutes" not in keys:
+                    keys["chutes"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
     return keys
 
 _EXTERNAL_KEYS = _load_external_keys()
@@ -755,6 +798,16 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek/deepseek-v4-pro",
     },
+    # Chutes — transient lane (ADR-014, onboarded 2026-09-06). Verified live
+    # slugs from llm.chutes.ai/v1. NOTE: Chutes serves reasoning models whose
+    # completion_tokens include hidden CoT — GLM-5.2 needs max_tokens >= 2048
+    # on dispatch or responses come back empty. The proxy forwards the
+    # client's max_tokens verbatim (no special handling, by design): clients
+    # requesting glm-5.2 via chutes must send max_tokens >= 2048 themselves.
+    "chutes": {
+        "deepseek/deepseek-v4-flash":  "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
+        "glm-5.2":                     "zai-org/GLM-5.2-TEE",
+    },
     "ppq": {
         "glm-5.2":                    "z-ai/glm-5.2",
         "kimi-k3":                    "moonshotai/kimi-k3",
@@ -820,6 +873,13 @@ EXTERNAL_PROVIDERS = {
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "key": _EXTERNAL_KEYS.get("openrouter", ""),
+    },
+    # Chutes — transient inference lane (ADR-014, onboarded 2026-09-06).
+    # Plus plan: 2000 req/day + $50/mo + $4.17/4h-burst caps. $0.096/M eff
+    # seed on DS-V4-Flash; Kalman refines from real cost data.
+    "chutes": {
+        "base_url": "https://llm.chutes.ai/v1",
+        "key": _EXTERNAL_KEYS.get("chutes", ""),
     },
     "routstr": {
         # Our own VPS2 routstr node — z.ai-backed upstream, Cashu-metered.
@@ -1900,6 +1960,12 @@ def _snapshot_quota() -> dict:
                 "remaining": oc_remaining,
                 "total": oc_total,
                 "regime": oc_regime,
+                # t_30dde4c7: probe-truth markers so operators see the
+                # server-derived used_pct and exhaustion explicitly instead of
+                # a frozen local-token "included/0%" view.
+                "probe_exhausted": bool(oc_status.get("probe_exhausted", False)),
+                "server_used_pct": oc_status.get("server_used_pct"),
+                "probe_ts": oc_status.get("probe_ts"),
                 "session_used_pct": oc_status.get("session_used_pct", 0.0),
                 "weekly_used_pct": oc_status.get("weekly_used_pct", 0.0),
                 "monthly_used_pct": oc_status.get("monthly_used_pct", 0.0),
@@ -4166,6 +4232,39 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
             nw_correction = 0.2762
             raw_cost = raw_cost * nw_correction
             return (raw_cost, "rate_derived")
+        # 4b2. Chutes — transient lane (ADR-014). No in-body cost field, so
+        # derive from per-model rates × actual token breakdown. Reasoning
+        # models: completion_tokens include hidden CoT (billed as output).
+        # Prices $/M: DS-V4-Flash in 0.44 / out 1.32 / cached 0.044;
+        # GLM-5.2 in 0.275 / out 1.10 (blended seed fine — Kalman refines).
+        if provider == "chutes":
+            usage = _parse_usage(bytes(response_buffer))
+            prompt_toks = int(usage.get("prompt_tokens") or 0)
+            completion_toks = int(usage.get("completion_tokens") or 0)
+            cached_toks = 0
+            _ptd = usage.get("prompt_tokens_details") or {}
+            if isinstance(_ptd, dict):
+                cached_toks = int(_ptd.get("cached_tokens") or 0)
+            uncached_toks = max(prompt_toks - cached_toks, 0)
+            model_name = None
+            try:
+                _obj = json.loads(bytes(response_buffer))
+                if isinstance(_obj, dict):
+                    model_name = _obj.get("model")
+            except Exception:
+                pass
+            _m = model_name or ""
+            if "GLM-5.2" in _m:
+                in_r, cache_r, out_r = 0.275, 0.0275, 1.10
+            else:
+                # DS-V4-Flash (default: any unrecognised slug → DS rates)
+                in_r, cache_r, out_r = 0.44, 0.044, 1.32
+            raw_cost = (
+                uncached_toks * in_r
+                + cached_toks * cache_r
+                + completion_toks * out_r
+            ) / 1_000_000
+            return (raw_cost, "rate_derived_chutes")
         # 4c. Catch-all fallback — for ANY provider without a specific branch
         # above (e.g. routstr, routstrd, deepinfra, ppq, openrouter,
         # ollama_cloud_2, and any future provider), derive cost from the
@@ -4561,6 +4660,47 @@ def _build_key_state_overview() -> str:
     return "\n".join(lines)
 
 
+def _recover_ollama_stale_backoffs():
+    """Structural backoff-decay for ollama pools (t_30dde4c7).
+
+    Exhausted ollama keys only re-entered rotation when their in-memory
+    failure backoff expired AND a request happened to retry — a stale-health
+    livelock. Weekly/monthly pool resets are invisible to both the frozen
+    local token counter AND the backoff. Each refresh cycle, check the
+    server-derived usage (fetch_ollama_usage → probe-truth override in
+    _get_ollama_quota_status) for keys that are currently benched by an
+    *exhaustion* failure: if the server pool is no longer at 100% (reset),
+    clear the backoff so the key re-enters rotation immediately.
+
+    Safe by design (mirrors the key-health-stale-backoff structural fix):
+    - Only CONSIDER keys whose health flag says exhausted/unhealthy.
+    - Only heal when a FRESH server probe actually returned (probe_ts set) —
+      a failed fetch will NOT heal, preventing a retry storm vs a genuinely
+      exhausted key.
+    - A genuinely-still-exhausted key simply re-429s on next dispatch and
+      re-arms its backoff — self-healing either way (worst case 1 wasted try).
+    Never raises.
+    """
+    for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
+        try:
+            h = _zai_key_health.get(_oc_key, {})
+            if h.get("healthy", True):
+                continue  # not benched — nothing to recover
+            if h.get("last_error_type") not in ("exhausted",):
+                continue  # only decay exhaustion backoffs, never dead/server
+            st = _get_ollama_quota_status(_oc_key)  # server-truth (30s cache)
+            if st.get("probe_ts") is None:
+                continue  # server fetch unavailable — do NOT risk a retry storm
+            if st.get("probe_exhausted", False):
+                continue  # server still says 100% — pool not reset yet
+            _mark_key_healthy(_oc_key)
+            print(f"[ollama] {_oc_key} server pool no longer exhausted "
+                  f"(server_used_pct={st.get('server_used_pct')}) → "
+                  f"cleared stale exhaustion backoff", flush=True)
+        except Exception:
+            pass
+
+
 def _check_sustained_down():
     """Check for keys that have been unavailable for ≥15 min and fire alerts.
 
@@ -4657,6 +4797,11 @@ def _refresh_loop():
         # calibration factor that corrects for prompt-caching discounts.
         if _refresh_iteration % 2 == 0:
             _calibrate_telnyx_rates()
+        # t_30dde4c7: forced re-probe of benched ollama pools — so weekly/
+        # monthly resets recover WITHOUT a proxy restart. _recover_* calls
+        # _get_ollama_quota_status which does its own server-truth fetch
+        # (30s TTL cache); it heals only when a fresh probe confirms reset.
+        _recover_ollama_stale_backoffs()
         # Check for keys that have been unavailable for ≥15 min
         _check_sustained_down()
         time.sleep(CACHE_TTL)

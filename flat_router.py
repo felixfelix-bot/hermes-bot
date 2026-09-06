@@ -222,6 +222,14 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     },
+    # Chutes — transient lane (ADR-014, onboarded 2026-09-06). Plus plan:
+    # 2000 req/day + $50/mo + $4.17/4h-burst caps. Canonical forms only;
+    # dispatch translates via _PROVIDER_MODEL_NAMES['chutes'] to the
+    # -TEE slugs. Reasoning models: clients must send max_tokens >= 2048
+    # for glm-5.2 (hidden CoT in completion_tokens) — see zai_proxy comment.
+    "chutes": {
+        "deepseek/deepseek-v4-flash", "glm-5.2",
+    },
     # Telnyx — Kimi-focused by operator decision.
     # kimi-k3:cloud deduped under canonical kimi-k3 (2026-08-27, FR-2):
     # the :cloud form silently downgraded to Kimi-K2.5 — a silent
@@ -259,6 +267,9 @@ _SEED_RATES: dict[str, float] = {
     "telnyx":        5.40,
     "routstr":       1.00,    # estimated from routstr_probe
     "routstrd":      1.00,    # estimated
+    # Chutes — transient lane (ADR-014): $0.096/M eff on DS-V4-Flash
+    # (in 0.44 / out 1.32 / cached 0.044 $/M); Kalman refines from live data.
+    "chutes":        0.096,
 }
 
 # Map proxy provider names to shadow optimizer names
@@ -288,6 +299,7 @@ PROVIDER_TIER: dict[str, str] = {
     "openrouter":     "per_token",
     "routstr":        "per_token",
     "routstrd":       "per_token",
+    "chutes":         "per_token",
 }
 
 # ── Tier-specific constants ──────────────────────────────────────────────────

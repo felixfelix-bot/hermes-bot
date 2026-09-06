@@ -202,8 +202,12 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     "neuralwatt": {
         # glm-5.3 REMOVED (2026-09-05) — NW glm-5.3 endpoint intermittently
         # streams degenerate token-spam (77k+ completion tokens, HTTP 200).
-        # NW deepseek/glm-5.2/kimi lanes are coherent; only glm-5.3 collapses.
-        "glm-5.2", "kimi-k3", "kimi-k2.7-code",
+        # glm-5.2 REMOVED (2026-09-06 incident) — same class: NW glm-5.2
+        # produced degenerate/repetition output + unbounded CoT loops
+        # (2.3k-token completions off 40-58k prompts, 23:36-23:38 evidence,
+        # state-db-corruption evening). Reversible registry change —
+        # re-add after quality re-verification via canary.
+        "kimi-k3", "kimi-k2.7-code",
         "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
         "deepseek/gemma-4-31b",
     },
@@ -221,7 +225,10 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     },
     # OpenRouter — per-token, rates vary by model
     "openrouter": {
-        "glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash",
+        # glm-5.2 REMOVED (2026-09-06 incident) — openrouter z-ai/glm-5.2
+        # served degenerate repetition output (2.2k-token junk completion,
+        # 23:38 evidence, state-db-corruption evening). Reversible.
+        "kimi-k3", "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     },
     # Chutes — transient lane (ADR-014, onboarded 2026-09-06). Plus plan:

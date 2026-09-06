@@ -1203,5 +1203,115 @@ class TestPhase0Hardening:
             "active_key must not be the fallback sentinel"
 
 
+# ── Chutes transient lane (ADR-014, onboarded 2026-09-06) ───────────────────
+# Fast-path onboarding: PROVIDER_MODELS + _SEED_RATES + _extract_cost branch.
+# These tests pin the lane into the candidate set for both of its models and
+# verify the rate-derived cost extraction returns a non-NULL cost.
+
+
+class TestChutesTransientLane:
+    """ADR-014: chutes must be a routing citizen for both of its models."""
+
+    def _healthy_all(self):
+        """Patch context where every provider passes the health gate."""
+        return patch("flat_router._is_provider_healthy", return_value=True)
+
+    def test_chutes_in_candidates_for_deepseek_flash(self):
+        """'chutes' should be a candidate for deepseek/deepseek-v4-flash."""
+        with self._healthy_all():
+            candidates = select_provider(model="deepseek/deepseek-v4-flash")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert "chutes" in names, \
+            f"chutes missing from deepseek/deepseek-v4-flash candidates: {names}"
+
+    def test_chutes_in_candidates_for_glm52(self):
+        """'chutes' should be a candidate for glm-5.2."""
+        with self._healthy_all():
+            candidates = select_provider(model="glm-5.2")
+        names = [c.name for c in candidates if c.name != "fallback"]
+        assert "chutes" in names, \
+            f"chutes missing from glm-5.2 candidates: {names}"
+
+    def test_chutes_excluded_when_unhealthy(self):
+        """An unhealthy chutes must not appear in candidates."""
+        with patch("flat_router._is_provider_healthy",
+                   side_effect=lambda n: n != "chutes"):
+            for model in ("deepseek/deepseek-v4-flash", "glm-5.2"):
+                candidates = select_provider(model=model)
+                names = [c.name for c in candidates if c.name != "fallback"]
+                assert "chutes" not in names, \
+                    f"unhealthy chutes leaked into {model} candidates: {names}"
+
+    def test_chutes_model_translation_to_tee_slugs(self):
+        """Dispatch-time translation must resolve to the verified -TEE slugs."""
+        import zai_proxy
+        tr = zai_proxy._PROVIDER_MODEL_NAMES.get("chutes", {})
+        assert tr.get("deepseek/deepseek-v4-flash") == \
+            "deepseek-ai/DeepSeek-V4-Flash-0731-TEE"
+        assert tr.get("glm-5.2") == "zai-org/GLM-5.2-TEE"
+
+    def test_chutes_seed_rate_registered(self):
+        """_SEED_RATES must carry the chutes catalog seed (Kalman refines)."""
+        from flat_router import _SEED_RATES
+        assert _SEED_RATES.get("chutes") == 0.096, \
+            f"chutes seed rate missing/wrong: {_SEED_RATES.get('chutes')}"
+
+
+class TestChutesExtractCost:
+    """_extract_cost('chutes', ...) must yield a non-NULL rate-derived cost."""
+
+    def _ds_payload(self) -> bytes:
+        # Chutes response shape: no cost field, standard usage tokens.
+        return json.dumps({
+            "model": "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
+            "choices": [{"message": {"content": "hello"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 400},
+            },
+        }).encode()
+
+    def test_chutes_cost_non_null_with_usage_tokens(self):
+        """Chutes payload with usage tokens → non-NULL cost, chutes source."""
+        import zai_proxy
+        cost, source = zai_proxy._extract_cost("chutes", self._ds_payload(),
+                                               total_tokens=1500)
+        assert cost is not None, \
+            "chutes cost must not be NULL (rate branch missing → invisible burn)"
+        assert cost > 0, f"chutes cost should be positive, got {cost}"
+        assert source == "rate_derived_chutes", \
+            f"expected cost_source='rate_derived_chutes', got {source!r}"
+        # Expected per-M: (1000-400)*0.44 + 400*0.044 + 500*1.32 = 941.6
+        # → cost = 941.6 / 1_000_000 = 0.0009416
+        assert abs(cost - 0.0009416) < 1e-9, f"unexpected chutes cost: {cost}"
+
+    def test_chutes_glm52_rates(self):
+        """GLM-5.2 slug must use the GLM rate table (0.275/1.10 per-M)."""
+        import zai_proxy
+        payload = json.dumps({
+            "model": "zai-org/GLM-5.2-TEE",
+            "choices": [],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 1000,
+                      "total_tokens": 2000},
+        }).encode()
+        cost, source = zai_proxy._extract_cost("chutes", payload,
+                                               total_tokens=2000)
+        # 1000*0.275 + 1000*1.10 (per-M) = 0.001375
+        assert cost is not None and abs(cost - 0.001375) < 1e-9, \
+            f"unexpected GLM-5.2 chutes cost: {cost}"
+        assert source == "rate_derived_chutes"
+
+    def test_chutes_empty_usage_no_crash(self):
+        """A payload with no usage block must not crash (None, None) allowed."""
+        import zai_proxy
+        payload = json.dumps({"model": "x", "choices": []}).encode()
+        cost, source = zai_proxy._extract_cost("chutes", payload, 0)
+        # Zero-token call → cost 0.0 is fine; must never raise.
+        assert cost is None or cost >= 0
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

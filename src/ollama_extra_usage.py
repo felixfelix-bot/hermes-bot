@@ -124,10 +124,10 @@ class ExtraUsageStatus:
     """Result of extra-usage detection."""
     session_usage: float       # 0-1 fraction from API
     weekly_usage: float        # 0-1 fraction from API
-    monthly_usage: float = field(default=0.0)   # 0-1 fraction from API (monthly-budget plans)
     session_tokens: int        # cumulative tokens in 5h window from api_calls
     weekly_tokens: int         # cumulative tokens in 7d window from api_calls
     extra_usage: bool          # True when either usage >= 1.0
+    monthly_usage: float = field(default=0.0)   # 0-1 fraction from API (monthly-budget plans)
     reason: str = field(default="")
 
     def to_dict(self) -> dict:

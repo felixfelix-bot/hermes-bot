@@ -38,6 +38,46 @@ sys.modules["zai_proxy_wt"] = _zp_mod
 _spec.loader.exec_module(_zp_mod)
 
 
+class ExtraUsageModuleImportTest(unittest.TestCase):
+    """Regression for t_30dde4c7 production breakage.
+
+    _get_ollama_quota_status and _recover_ollama_stale_backoffs both do
+    `from src.ollama_extra_usage import fetch_ollama_usage` inside a
+    try/except that SWALLOWS import errors. If that module cannot be imported
+    (dataclass field-order bug → TypeError), the server-truth override and
+    pool-reset recovery silently become dead code and /quota falls back to the
+    frozen local-token "included/0%" view — exactly the stale-health livelock
+    this task exists to remove.
+
+    This test asserts the module imports cleanly so a future field-ordering
+    regression fails loudly instead of silently degrading to the fallback.
+    """
+    def test_ollama_extra_usage_imports_cleanly(self):
+        import importlib
+        try:
+            m = importlib.import_module("src.ollama_extra_usage")
+        except Exception as e:  # pragma: no cover — surfaces the real traceback
+            self.fail(f"src.ollama_extra_usage failed to import: "
+                      f"{type(e).__name__}: {e}")
+        self.assertTrue(hasattr(m, "fetch_ollama_usage"))
+        self.assertTrue(hasattr(m, "ExtraUsageStatus"))
+
+    def test_extra_usage_status_constructs_ok(self):
+        import importlib
+        m = importlib.import_module("src.ollama_extra_usage")
+        # All construction sites in the module pass keyword args, so the field
+        # ORDER must keep non-default fields before defaulted ones. Exercise a
+        # full construction to prove no TypeError on instantiation.
+        s = m.ExtraUsageStatus(
+            session_usage=0.5, weekly_usage=1.0,
+            session_tokens=10, weekly_tokens=20,
+            extra_usage=True, reason="test")
+        d = s.to_dict()
+        self.assertEqual(d["session_usage"], 0.5)
+        self.assertEqual(d["weekly_usage"], 1.0)
+        self.assertTrue(d["extra_usage"])
+
+
 class OllamaProbeSyncFixture(unittest.TestCase):
     def setUp(self):
         import importlib

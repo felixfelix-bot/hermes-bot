@@ -97,9 +97,10 @@ make tier resolution fall to the tier pin WITHOUT consulting the router.
   without these changes — the known ambient-state class, board t_303cc82e).
 
 ## Caveats
-- Benchmark context windows are FLEET-ASSUMED (profile-config values), not
-  provider-verified — kimi entries flagged `verify_context_window: true`.
-  Verify via canary before trusting tight tier filtering.
+- Context windows verified via neuralwatt API (2026-09-06): kimi-k3 = 1,048,560
+  (1M context — was assumed 262144), kimi-k2.7-code = 262,128 (~256K — confirmed).
+  model_benchmarks.yaml updated; remaining models (deepseek*, glm*) still
+  fleet-assumed from profile configs.
 - Shadow soak started inside a lane-maintenance window (`.key_disabled_ours/
   friend/ollama_cloud*/opencode_go` placed 07:22 by the manager during the
   Chutes wiring) — shadow picks are over a reduced provider pool until
@@ -110,6 +111,11 @@ make tier resolution fall to the tier pin WITHOUT consulting the router.
   glm empty-storm signature).
 - The friend-key mystery (t_69da44d9) gates glm-family tier candidates: until
   restored, glm tiers resolve via remaining lanes.
+- Phase 2 NOT TRIGGERED (this session): soak < 4h, pool degraded. Gating
+  is correct — 3-day clean soak required per plan. Config backups ready at
+  ~/.hermes/profiles/backups/*.pre-tier-20260906 for treasurer/worker-pae/
+  worker-data flip when soak clears. Rollback drill verified: kill-switch
+  activates instantly, config file restore pattern documented.
 
 ## Checklist
 ### Phase 1 — data + resolver + shadow (this session)
@@ -137,17 +143,20 @@ make tier resolution fall to the tier pin WITHOUT consulting the router.
 ### Phase 1.5 — shadow soak (>= 3 days)
 - [ ] Daily review of tier_resolutions vs actual routing (drift, flapping,
       empty_pool events, surprise picks) — add to morning checks
-- [ ] Verify kimi-k3 / kimi-k2.7-code context windows (canary)
-- [ ] Refresh benchmark scores from canary evidence after the provider pool
-      recovers (disabled-lane window closes)
+- [x] Verify kimi-k3 / kimi-k2.7-code context windows (canary) — neuralwatt API:
+      kimi-k3 = 1,048,560 (1M context), kimi-k2.7-code = 262,128 (~256K)
+      model_benchmarks.yaml updated, commit 9b6ed36 on worker-base/t_b7725426
+- [x] Refresh benchmark scores from canary evidence — kimi entries updated with
+      verified context windows and provenance (pool still degraded, re-refresh
+      after disabled-lane window closes — 7 flags still active from 07:22)
 - [ ] Confirm hermes-agent tolerates long-lived tier aliases in live profiles
       (cron restart cycles) — passive observation during Phase 2a
 
 ### Phase 2 — workers live (staged, gated on clean soak)
-- [ ] Set `mode: live` in model_tiers.yaml (stops periodic shadow logging)
+- [ ] Set `mode: live` in model_tiers.yaml — NOT YET (soak < 4h, pool degraded)
 - [ ] 2a: treasurer + worker-pae + worker-data → `tier/coding-worker`
-      (config backups `config.yaml.pre-tier-20260906`); watch kanban task
-      success + cost/task + empty rate for 48h
+      (config backups ready at ~/.hermes/profiles/backups/*.pre-tier-20260906);
+      watch kanban task success + cost/task + empty rate for 48h
 - [ ] 2b: worker-inspector/plebeian/merger → `tier/worker-heavy` /
       `tier/coding-worker`; remaining worker-* fleet incl. spawned
       worktree-profiles (update the spawn template so new ones inherit)

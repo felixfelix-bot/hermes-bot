@@ -63,24 +63,22 @@ models:
     measured: 2026-09-06
 
   kimi-k3:
-    context_window: 262144        # assumed (kimi-consultant profile config)
+    context_window: 1048576       # verified: neuralwatt /v1/models max_model_len=1,048,560 (claimed 1M context)
     coding_class: pro
     tool_use: strong
     reported_as:
       - kimi-k3
-    evidence: "138 neuralwatt calls + kimi-consultant reasoning duty; strong agentic reputation on fleet tasks"
+    evidence: "138 neuralwatt calls + kimi-consultant reasoning duty; strong agentic reputation on fleet tasks. Context verified via neuralwatt /v1/models (max_model_len=1048560)."
     measured: 2026-09-06
-    verify_context_window: true
 
   kimi-k2.7-code:
-    context_window: 262144        # assumed — UNVERIFIED, verify via canary
+    context_window: 262144        # verified: neuralwatt /v1/models max_model_len=262128 (256K standard)
     coding_class: solid
     tool_use: good
     reported_as:
       - kimi-k2.7-code
-    evidence: "207 neuralwatt calls in 2-day window (code tasks)"
+    evidence: "207 neuralwatt calls in 2-day window (code tasks). Context verified via neuralwatt /v1/models (max_model_len=262128)."
     measured: 2026-09-06
-    verify_context_window: true
 
   glm-5.3-flash:
     context_window: 1048576        # assumed

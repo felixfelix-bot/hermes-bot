@@ -164,3 +164,55 @@ Remaining open items: P4b (NW top-up watch), P4c (key rotations —
 OR/Chutes/ollama#4 live in transcripts), T2b Baidu canary re-run,
 T2c Chutes TEE diagnosis, T3 demand-side QS tasks (D4 cache-hit
 accounting first).
+
+## Round 2 — "hermes unresponsive" postmortem (2026-09-06 ~11:00)
+
+User-visible: manager DM deaf again since ~07:26 (Felix's paste = the
+manager's own Chutes-lane session, timestamps in his local TZ).
+
+Causal chain (all IST):
+- 07:05-07:26 z.ai empty-stream disease hit glm-5.3 too (24/25 empties
+  at 07:06; glm-5.2 had it at 06:05). Transient — both planes healthy
+  by 10:44 (probes clean).
+- ours tripped its WEEKLY PACING LOCK (74% vs 60% thr) — correct
+  governor behavior, but it left glm with zero zai keys.
+- friend lane = KEYLESS (ZAI_API_KEY absent from manager/.env — open
+  question in t_69da44d9; GLM_API_KEY/GLM_BASE_URL in .env may be it).
+- routstr-forward-tunnel held by a stale Sep-03 ssh (PID 3018) → unit
+  crash-looped on bind → routstr/routstrd broken-pipe spin. FIXED:
+  killed stale ssh, fresh unit line up, node answers (11:06).
+- ppq/deepinfra chronically dispatch-failing (independent outage).
+- Result: glm-5.3 walk = [routstr,routstrd,deepinfra] all dead → 503
+  ×54, gateway retry-death ×37, DM silent. Chutes (wired by the
+  manager at 07:17) kept serving buyer traffic cleanly throughout.
+
+Recovery executed:
+- Root config + manager + treasurer default model → deepseek/deepseek-v4-flash
+  (profile configs override the root config — only root flip was NOT
+  enough before the 11:00 restart; worker-reviewer-glm/kimi-consultant
+  stay model-specific by design, paused until zai recovers).
+- Stuck 146-msg DM conversation (20260906_050400_7c3f4068, ~126K ctx,
+  dropped tool args) exported + deleted: backups/session-exports/
+  20260906_105800_7c3f4068-pre-reset.jsonl. Fresh sessions = deepseek.
+- Gateway restarted twice (config reload). Manager one-shot verified
+  clean ("unblocked-ok" via chutes). First traffic: chutes/DS 200s.
+- Manager's uncommitted Chutes work reviewed + tested + committed:
+  3c08486 (chutes lane + t_30dde4c7 server-truth quotas + stale-backoff
+  recovery + recovery tests). glm-5.2 then pulled OFF chutes (ce47af0):
+  mid-stream failure with no failover — client hangs (t_bc670026).
+- Marks cleared (ours/friend/routstr/routstrd/deepinfra/ppq), ollama
+  key #4 + chutes remain healthy carriers for deepseek.
+- Board: t_bc670026 (streaming failover hole), t_69da44d9 (zai-tier
+  false-negative + friend key mystery), t_303cc82e (test isolation).
+
+Suite: 15 failed vs 12 baseline — delta = ambient-state test flakiness
+(ours' live lock leaks into tests via zai_proxy_state.json; verified by
+stashed-HEAD runs). NOT regressions. Hermetic fix = t_303cc82e.
+
+Still degraded (by design, with owners):
+- glm-5.2/glm-5.3 via proxy until ours' weekly window recovers OR the
+  friend key is restored (t_69da44d9). root-config escape hatch
+  (direct z.ai fallback) unaffected.
+- friends/public resale chain regression (glm not resolving on public
+  after the manager's 03:4x-era DB surgery) — manager's own task,
+  picked up post-recovery via its plan.

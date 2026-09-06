@@ -1226,13 +1226,16 @@ class TestChutesTransientLane:
         assert "chutes" in names, \
             f"chutes missing from deepseek/deepseek-v4-flash candidates: {names}"
 
-    def test_chutes_in_candidates_for_glm52(self):
-        """'chutes' should be a candidate for glm-5.2."""
+    def test_chutes_excluded_from_glm52(self):
+        """glm-5.2 must NOT ride chutes: GLM-5.2-TEE fails mid-stream
+        (repetition blowups / hang) and the streaming relay cannot fail
+        over once the response has started — infra evidence 2026-09-06
+        11:06 (client 60s hang, no fallback). DeepSeek-only lane."""
         with self._healthy_all():
             candidates = select_provider(model="glm-5.2")
         names = [c.name for c in candidates if c.name != "fallback"]
-        assert "chutes" in names, \
-            f"chutes missing from glm-5.2 candidates: {names}"
+        assert "chutes" not in names, \
+            f"chutes must not serve glm-5.2: {names}"
 
     def test_chutes_excluded_when_unhealthy(self):
         """An unhealthy chutes must not appear in candidates."""
@@ -1250,7 +1253,8 @@ class TestChutesTransientLane:
         tr = zai_proxy._PROVIDER_MODEL_NAMES.get("chutes", {})
         assert tr.get("deepseek/deepseek-v4-flash") == \
             "deepseek-ai/DeepSeek-V4-Flash-0731-TEE"
-        assert tr.get("glm-5.2") == "zai-org/GLM-5.2-TEE"
+        assert "glm-5.2" not in tr, \
+            "glm-5.2 must stay off chutes (mid-stream failure, no fallback)"
 
     def test_chutes_seed_rate_registered(self):
         """_SEED_RATES must carry the chutes catalog seed (Kalman refines)."""

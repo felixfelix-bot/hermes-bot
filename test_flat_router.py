@@ -678,18 +678,34 @@ class TestDoubleResponseGuard:
     """Response-started guard: once bytes hit the client, iteration must stop."""
 
     def test_response_started_flag_set_in_handlers(self):
-        """Dispatch handlers must mark _response_started right after
-        send_response()."""
+        """The streaming dispatch layer must mark _response_started when it
+        COMMITS response bytes to the client.
+
+        Since t_bc670026 the four live-streaming handlers (_try_ollama_cloud,
+        _try_opencode_go, _try_telnyx, _try_external_single) route their
+        streaming through _stream_upstream_with_failover_window, which is the
+        single place that flips _response_started = True at the commit point
+        (after a healthy first chunk). _try_zai_key still sets it directly.
+        The invariant that matters: the flag exists, is set at commit, and the
+        flat-router loop aborts when it is already True."""
         import zai_proxy
         source = open(zai_proxy.__file__).read()
-        assert "_response_started" in source, \
-            "Handlers must set self._response_started after send_response()"
-        # All five dispatch handlers that stream must set the flag
-        for marker in ("X-Provider", ):
-            assert marker in source
-        n_set = source.count("self._response_started = True")
-        assert n_set >= 5, \
-            f"Expected ≥5 _response_started sets (one per streaming handler), got {n_set}"
+        assert "self._response_started = True" in source, \
+            "Response commitment must set self._response_started"
+        # The shared failover-window streamer exists and is the commit point.
+        assert "_stream_upstream_with_failover_window" in source, \
+            "Shared failover-window streamer must exist"
+        assert "handler._response_started = True" in source, \
+            "Failover-window streamer must set _response_started at commit"
+        # Every live-streaming dispatch handler must route through it.
+        # (Each handler is a distinct method in zai_proxy.py; the streamer
+        # symbol is module-level, so check it appears in the same file as the
+        # handler definitions and that each handler references the streamer.)
+        for handler in ("_try_ollama_cloud", "_try_opencode_go",
+                        "_try_telnyx", "_try_external_single"):
+            assert f"def {handler}(" in source, f"{handler} must exist"
+        assert source.count("_stream_upstream_with_failover_window(") >= 4, \
+            "≥4 handlers must call the failover-window streamer"
 
     def test_response_started_aborts_iteration(self):
         """The flat-router candidate loop must abort (not try the next
@@ -1585,6 +1601,385 @@ class TestTierResolution:
         with self._env(cfg=cfg) as log:
             flat_router.shadow_tier_evaluate("glm-5.3", "sess-1")
             assert log.call_count == 0
+
+
+# ── Streaming failover window (t_bc670026, 2026-09-06) ─────────────────────
+# Streaming-relay failover hole: dispatch methods that stream used to commit
+# status + headers + every 4096-byte chunk to the client immediately, then
+# flip _response_started. A candidate that died mid-stream (empty body, 5xx,
+# connection drop) before producing a useful first chunk could neither fail
+# over to the next candidate nor return a 503 — the client hung 60s+.
+#
+# The failover window fixes this: NO client bytes (status/headers/body) are
+# committed until a healthy FIRST chunk is confirmed. A candidate that dies
+# before its first complete chunk commits ZERO client bytes, so the flat router
+# still fails over cleanly. These are the regression tests for the three
+# incident classes: mid-stream 5xx, mid-stream empty stream, and the
+# hang-the-client path.
+
+
+class _FakeResp:
+    """Minimal urllib response stand-in: fake .status/.headers/.read()."""
+    def __init__(self, chunks, status=200, headers=None, raise_on_read=None):
+        self._chunks = list(chunks)
+        self.status = status
+        self.headers = headers if headers is not None else {
+            "content-type": "text/event-stream",
+            "transfer-encoding": "chunked",
+        }
+        self._raise = raise_on_read
+        self.reads = 0
+
+    def read(self, n=-1):
+        self.reads += 1
+        if self._raise is not None:
+            r = self._raise
+            self._raise = None
+            raise r
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FailoverWindowHandler:
+    """Handler stand-in that exposes the minimal surface the failover-window
+    streamer touches (send_response/send_header/end_headers/wfile/_response_started)."""
+    def __init__(self):
+        self.wfile = io.BytesIO()
+        self._sent_status = None
+        self._headers = {}
+        self._response_started = False
+
+    def send_response(self, code):
+        self._sent_status = code
+
+    def send_header(self, k, v):
+        self._headers[k] = v
+
+    def end_headers(self):
+        pass
+
+
+class TestFailoverWindowHelper:
+    """Unit tests of _stream_upstream_with_failover_window + _sse_first_frame_complete."""
+
+    def _call(self, resp, is_stream=True, seed_body=None,
+              exclude_headers=frozenset({"transfer-encoding", "connection"}),
+              extra_headers=None):
+        import zai_proxy
+        h = _FailoverWindowHandler()
+        buf = bytearray()
+        ok = zai_proxy._stream_upstream_with_failover_window(
+            h, resp, buf, 200,
+            provider_header=("X-Provider", "test"),
+            exclude_headers=exclude_headers,
+            is_stream=is_stream, seed_body=seed_body,
+            extra_headers=extra_headers)
+        return ok, h, buf
+
+    def test_empty_stream_returns_false_client_untouched(self):
+        """Mid-stream EMPTY stream: must return False having committed ZERO
+        client bytes (no status, no _response_started), so the caller fails
+        over instead of hanging the client."""
+        ok, h, buf = self._call(_FakeResp(chunks=[]), is_stream=True)
+        assert ok is False, "empty stream must fail over"
+        assert h._response_started is False, \
+            "empty stream must NOT flip _response_started (client untouched)"
+        assert h._sent_status is None, "no status line may be sent"
+        assert h.wfile.getvalue() == b"", "no client bytes may be written"
+        assert buf == bytearray(), "no head committed to response_buffer"
+
+    def test_read_error_before_first_chunk_returns_false(self):
+        """A connection drop (read exception) before any chunk must fail over
+        with the client untouched — the hang-the-client path."""
+        ok, h, buf = self._call(
+            _FakeResp(chunks=[], raise_on_read=ConnectionResetError("drop")),
+            is_stream=True)
+        assert ok is False
+        assert h._response_started is False
+        assert h.wfile.getvalue() == b""
+        assert h._sent_status is None
+
+    def test_healthy_sse_stream_commits_and_streams(self):
+        """Happy path: a healthy SSE stream commits status+headers+first frame
+        and streams the rest live."""
+        chunks = [b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+                  b"data: [DONE]\n\n"]
+        ok, h, buf = self._call(_FakeResp(chunks=chunks), is_stream=True)
+        assert ok is True
+        assert h._response_started is True, "healthy stream must commit"
+        assert h._sent_status == 200
+        assert h._headers.get("X-Provider") == "test"
+        # transfer-encoding excluded from client copy by default
+        assert "transfer-encoding" not in h._headers
+        client = h.wfile.getvalue()
+        assert b'data: {"choices"' in client, "first frame bytes must reach client"
+        assert b"data: [DONE]" in client, "tail bytes must reach client live"
+        assert bytes(buf) == b"".join(chunks), \
+            "response_buffer must hold the complete response for cost extraction"
+
+    def test_split_first_frame_held_until_complete(self):
+        """A first SSE frame split across reads must be buffered until the full
+        frame (blank-line terminator) is present before any bytes go out — the
+        order must be preserved."""
+        chunks = [b'data: {"choices":[{"delta":{"co',
+                  b'ntent":"Hi"}}]}\n\n',
+                  b"data: [DONE]\n\n"]
+        ok, h, buf = self._call(_FakeResp(chunks=chunks), is_stream=True)
+        assert ok is True
+        assert h._response_started is True
+        client = h.wfile.getvalue()
+        assert b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n' in client, \
+            "split first frame must be delivered intact (both reads joined)"
+
+    def test_non_stream_seed_empty_fails_over(self):
+        """Non-stream with an empty body (seed empty) must fail over cleanly."""
+        ok, h, buf = self._call(_FakeResp(chunks=[]), is_stream=False,
+                                seed_body=b"")
+        assert ok is False
+        assert h._response_started is False
+
+    def test_non_stream_seed_nonempty_commits(self):
+        """Non-stream with a buffered full body (seed) commits immediately,
+        including extra_headers (e.g. recalculated Content-Length)."""
+        body = b'{"choices":[{"message":{"content":"ok"}}]}'
+        ok, h, buf = self._call(_FakeResp(chunks=[]), is_stream=False,
+                                seed_body=body,
+                                extra_headers=[("Content-Length", str(len(body)))])
+        assert ok is True
+        assert h._response_started is True
+        assert h._headers.get("Content-Length") == str(len(body))
+        assert h.wfile.getvalue() == body
+
+    def test_sse_first_frame_complete_detector(self):
+        import zai_proxy
+        assert zai_proxy._sse_first_frame_complete(
+            b'data: {"choices":[]}\n\n') is True
+        assert zai_proxy._sse_first_frame_complete(b"data: [DONE]\n\n") is True
+        assert zai_proxy._sse_first_frame_complete(
+            b'data: {"choices":[{"delta":{"content":"a"}}}\n') is True
+        assert zai_proxy._sse_first_frame_complete(
+            b'data: {"choices":[{"delta":{"co') is False, \
+            "partial frame must NOT be considered complete"
+        assert zai_proxy._sse_first_frame_complete(b"") is False
+
+    def test_responsive_stall_times_out_and_fails_over(self):
+        """A RESPONSIVE-but-never-completing stream (partial frame that never
+        reaches a blank-line terminator) must be bounded by head_timeout and
+        fail over with the client untouched — a stall-after-partial-frame
+        candidate can no longer monopolize the whole request."""
+        import zai_proxy
+        # Each read returns a partial SSE line that never gets a blank line,
+        # so the frame never completes. With head_timeout=0 the deadline fires
+        # immediately (between reads) -> fail over.
+        resp = _FakeResp(chunks=[b'data: {"choices":[{"delta":{"co',
+                                  b'ntent":"more',
+                                  b":and-more"])
+        h = _FailoverWindowHandler()
+        buf = bytearray()
+        ok = zai_proxy._stream_upstream_with_failover_window(
+            h, resp, buf, 200, is_stream=True, head_timeout=0.0)
+        assert ok is False, "responsive stall must fail over"
+        assert h._response_started is False, \
+            "stalled candidate must not commit any client bytes"
+        assert h.wfile.getvalue() == b""
+
+
+class TestExternalSingleFailover:
+    """_try_external_single must honor the failover window: a candidate that
+    dies before its first chunk returns False with the client untouched."""
+
+    def _make(self, provider="neuralwatt", key="test-key-abc"):
+        h = _ProxyStubHandler()
+        h.path = "/v1/chat/completions"
+        h._response_started = False
+        return h
+
+    def _call(self, resp, provider="neuralwatt"):
+        import zai_proxy
+        h = self._make(provider=provider)
+        body = json.dumps({"model": "glm-5.2", "stream": True,
+                           "messages": [{"role": "user",
+                                         "content": "hi"}]}).encode()
+        with patch.dict(zai_proxy.EXTERNAL_PROVIDERS[provider],
+                        {"key": "test-key"}), \
+             patch("urllib.request.urlopen", return_value=resp), \
+             patch.object(zai_proxy, "_mark_funded"), \
+             patch.object(zai_proxy, "_mark_key_healthy"), \
+             patch.object(zai_proxy, "_record_spend"), \
+             patch.object(zai_proxy, "_log_api_call"), \
+             patch.object(zai_proxy, "_check_garbage_cb"):
+            ok = h._try_external_single(provider, body, "glm-5.2",
+                                        bytearray(), time.time())
+        return ok, h
+
+    def test_empty_stream_fails_over(self):
+        """Mid-stream EMPTY stream: external single returns False, client
+        untouched — the flat loop can still try the next candidate."""
+        ok, h = self._call(_FakeResp(chunks=[]))
+        assert ok is False
+        assert h._response_started is False
+        assert h.wfile.getvalue() == b""
+
+    def test_read_error_fails_over(self):
+        """A dropped connection before the first chunk must return False with
+        the client untouched (the hang-the-client path)."""
+        ok, h = self._call(
+            _FakeResp(chunks=[], raise_on_read=ConnectionResetError("drop")))
+        assert ok is False
+        assert h._response_started is False
+        assert h.wfile.getvalue() == b""
+
+    def test_healthy_stream_succeeds(self):
+        """Healthy SSE stream still succeeds and _response_started commits."""
+        ok, h = self._call(_FakeResp(
+            chunks=[b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+                    b"data: [DONE]\n\n"]))
+        assert ok is True
+        assert h._response_started is True
+        assert h.wfile.getvalue().startswith(b"data: {")
+
+
+class TestFlatLoopFailoverNoHang:
+    """End-to-end regression for the hang-the-client path: a first candidate
+    that dies before its first chunk must NOT abort the flat-router loop (the
+    old '_response_started already True → abort' path); the loop must fail over
+    to a healthy second candidate and serve the client."""
+
+    def test_dead_first_candidate_fails_over_to_healthy_second(self):
+        """Simulate the chutes GLM-5.2-TEE incident: candidate #1 (external)
+        dies before producing a first chunk; candidate #2 (opencode_go) serves.
+        Because the failover window commits zero client bytes for candidate #1,
+        the loop continues instead of aborting — the client gets served."""
+        import zai_proxy
+        from flat_router import ProviderCandidate
+
+        h = _ProxyStubHandler()
+        _body = json.dumps({"model": "glm-5.2", "stream": True,
+                            "messages": [{"role": "user",
+                                          "content": "hi"}]}).encode()
+        h.rfile = io.BytesIO(_body)
+        h.headers = {"Content-Length": str(len(_body))}
+
+        # Candidate 1: dies before first chunk (empty stream -> False, no commit)
+        def _dead_dispatch(handler, name, body, model, buf, t0):
+            handler._response_started = False
+            return False
+
+        # Candidate 2: healthy opencode_go stream
+        def _ok_dispatch(handler, name, body, model, buf, t0):
+            buf.extend(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+            buf.extend(b"data: [DONE]\n\n")
+            handler.send_response(200)
+            handler._response_started = True
+            handler.wfile.write(bytes(buf))
+            handler.wfile.flush()
+            return True
+
+        call_log = []
+
+        def _fake_dispatch(handler, name, body, model, buf, t0):
+            call_log.append(name)
+            if name == "chutes":
+                return _dead_dispatch(handler, name, body, model, buf, t0)
+            if name == "opencode_go":
+                return _ok_dispatch(handler, name, body, model, buf, t0)
+            return False
+
+        _cands = [
+            ProviderCandidate(name="chutes", model="glm-5.2",
+                              effective_cost=1.0,
+                              dispatch_fn=lambda *a: None),
+            ProviderCandidate(name="opencode_go", model="glm-5.2",
+                              effective_cost=2.0,
+                              dispatch_fn=lambda *a: None),
+        ]
+
+        with patch.object(zai_proxy, "_check_global_spend_cap",
+                          return_value=(True, 0.0, 100.0)), \
+             patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy, "_tier_resolution_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy.Handler, "_pressure_enforce",
+                          return_value=False), \
+             patch("flat_router.select_provider", return_value=_cands), \
+             patch("flat_router._dispatch_to_provider",
+                   side_effect=_fake_dispatch), \
+             patch.object(zai_proxy, "_is_key_healthy", return_value=True), \
+             patch.object(zai_proxy, "_mark_key_failure"), \
+             patch.object(zai_proxy, "_log_key_decision"), \
+             patch.object(zai_proxy, "_parse_usage",
+                          return_value={"total_tokens": 5,
+                                        "prompt_tokens": 2,
+                                        "completion_tokens": 3}), \
+             patch.object(zai_proxy, "_extract_cost",
+                          return_value=(0.001, "test")), \
+             patch.object(zai_proxy, "_record_spend"):
+            zai_proxy.Handler._proxy(h)
+
+        # The loop MUST have tried the second candidate (did not abort after #1).
+        assert call_log == ["chutes", "opencode_go"], \
+            f"flat loop must fail over from dead candidate, got {call_log}"
+        # The client got served (response started = committed by candidate #2).
+        assert h._response_started is True, \
+            "a healthy later candidate must have served the client"
+        assert b"data: [DONE]" in h.wfile.getvalue(), \
+            "client must receive real completion bytes (not hang)"
+
+    def test_all_candidates_dead_returns_503(self):
+        """If every candidate dies before its first chunk, the loop must return
+        a clean 503 (not hang with a half-committed response)."""
+        import zai_proxy
+        from flat_router import ProviderCandidate
+
+        h = _ProxyStubHandler()
+        _body = json.dumps({"model": "glm-5.2", "stream": True,
+                            "messages": [{"role": "user",
+                                          "content": "hi"}]}).encode()
+        h.rfile = io.BytesIO(_body)
+        h.headers = {"Content-Length": str(len(_body))}
+
+        def _dead_dispatch(handler, name, body, model, buf, t0):
+            handler._response_started = False
+            return False
+
+        _cands = [
+            ProviderCandidate(name="chutes", model="glm-5.2",
+                              effective_cost=1.0,
+                              dispatch_fn=lambda *a: None),
+            ProviderCandidate(name="neuralwatt", model="glm-5.2",
+                              effective_cost=2.0,
+                              dispatch_fn=lambda *a: None),
+        ]
+
+        with patch.object(zai_proxy, "_check_global_spend_cap",
+                          return_value=(True, 0.0, 100.0)), \
+             patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy, "_tier_resolution_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy.Handler, "_pressure_enforce",
+                          return_value=False), \
+             patch("flat_router.select_provider", return_value=_cands), \
+             patch("flat_router._dispatch_to_provider",
+                   side_effect=_dead_dispatch), \
+             patch.object(zai_proxy, "_is_key_healthy", return_value=True), \
+             patch.object(zai_proxy, "_mark_key_failure"), \
+             patch.object(zai_proxy, "_log_key_decision"):
+            zai_proxy.Handler._proxy(h)
+
+        assert h._response_started is False, \
+            "no candidate committed — response must not be started"
+        payload = json.loads(h.wfile.getvalue())
+        assert payload.get("error") == "all providers exhausted (flat router)", \
+            f"expected clean 503, got {payload}"
 
 
 if __name__ == "__main__":

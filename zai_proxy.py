@@ -5096,6 +5096,151 @@ def _attempt_retry(e, attempt, name, t0, key_order):
         time.sleep(1 + random.random())  # 1-2s jitter
         return True
 
+# ── streaming failover window (t_bc670026, 2026-09-06) ─────────────────────
+# Streaming-relay failover hole: the flat-router dispatch methods that stream
+# to the client used to call send_response() + set _response_started and write
+# every 4096-byte chunk to self.wfile IMMEDIATELY. If the upstream died
+# mid-stream (empty stream, HTTPError after a 200 head already committed,
+# connection drop / broken pipe, a relay that returns 200 then an SSE error),
+# the flat router could neither try the next candidate nor return a 503 —
+# 'response already started — aborting candidate iteration' left the client
+# hanging with zero useful bytes for 60s+ (chutes GLM-5.2-TEE, 2026-09-06).
+#
+# Fix: NO status line / headers / body bytes are committed to the client until
+# a healthy FIRST chunk is confirmed (the first complete SSE data: frame, or
+# EOF with a non-empty body for non-streams). Only then do we commit and switch
+# to live streaming. A candidate that dies before producing its first complete
+# chunk commits ZERO client bytes, so the flat-router loop still fails over to
+# the next candidate (and can emit a 503) instead of hanging the client.
+
+
+def _sse_first_frame_complete(buf: bytes) -> bool:
+    """True once `buf` holds at least one COMPLETE SSE frame — the "healthy
+    first chunk" signal required before committing any client bytes.
+
+    An OpenAI-compatible SSE frame is a `data: {...}` (or `data: [DONE]`) line
+    terminated by a blank line, i.e. `\n\n` (or `\r\n\r\n`). Some providers
+    emit bare newline-terminated `data:` frames without the trailing blank
+    line, so a leading `data:` line that already carries a newline is also
+    accepted. Never raises."""
+    if not buf:
+        return False
+    if buf.strip() == b"data: [DONE]":
+        return True
+    if b"\n\n" in buf or b"\r\n\r\n" in buf:
+        return True
+    dec = buf.decode("utf-8", "ignore").lstrip("\r\n")
+    if dec.startswith("data:") and "\n" in dec:
+        return True
+    return False
+
+
+def _stream_upstream_with_failover_window(
+        handler, resp, response_buffer, status,
+        provider_header=None,
+        exclude_headers=frozenset({"transfer-encoding", "connection"}),
+        is_stream=True,
+        seed_body: bytes | None = None,
+        extra_headers: list | None = None,
+        head_timeout: float = 30.0) -> bool:
+    """Live-stream an upstream response `resp` to the client behind a FAILOVER
+    WINDOW.
+
+    No status line / headers / body bytes are committed to the client until a
+    healthy FIRST chunk is confirmed:
+      * stream:  the first complete SSE frame (_sse_first_frame_complete)
+      * non-stream: EOF with a non-empty body (the whole JSON object)
+    Only then do we commit status + headers + the buffered complete head and
+    switch to streaming the remainder live to the client.
+
+    `seed_body` is used by non-stream callers that have ALREADY read the full
+    body (e.g. Ollama's reasoning-content injection): pass it so `resp` may be
+    consumed (at EOF) without losing the already-buffered body. A non-empty
+    seed commits immediately; an empty seed fails over.
+
+    `head_timeout` bounds how long we wait for the first complete chunk from a
+    RESPONSIVE upstream (checked between reads) before giving up and failing
+    over — a slowly-trickling or stall-after-partial-frame candidate can no
+    longer monopolize the whole request. This is best-effort: a read that
+    blocks on a dead transport is still bounded by the underlying `urlopen`
+    socket timeout, only the current read blocks.
+
+    Returns True when a full response was streamed; False when the upstream
+    died before producing its first complete chunk — in which case the client
+    has been left fully untouched (no status / headers / bytes written,
+    `_response_started` still False), so the caller may fail over to the next
+    candidate cleanly.
+
+    `provider_header` is an optional (name, value) pair added at commit, e.g.
+    ("X-Provider", "opencode_go") or ("X-Failover-Provider", "neuralwatt").
+    `extra_headers` is an optional list of (name, value) pairs also added at
+    commit (e.g. a recalculated Content-Length for a buffered non-stream body).
+    `exclude_headers` is a set of lowercase upstream header names to skip when
+    copying headers (default drops transfer-encoding/connection so the proxy
+    re-frames the response on this socket).
+    """
+    committed = False
+    head = bytearray()
+    deadline = time.monotonic() + max(0.0, head_timeout)
+    # Seed the head for non-stream callers that pre-read the full body.
+    if seed_body:
+        head.extend(seed_body)
+        committed = True
+    # ── HEAD: read until we hold a healthy complete first chunk (or EOF) ──
+    while not committed:
+        if time.monotonic() > deadline:
+            # responsive-stall bounded: give up and let the caller fail over
+            return False
+        try:
+            chunk = resp.read(4096)
+        except Exception:
+            # upstream died before the first complete chunk -> nothing committed
+            return False
+        if not chunk:
+            # EOF
+            if not head:
+                return False            # empty stream -> caller fails over
+            committed = True            # non-empty body ended with EOF -> healthy
+            break
+        head.extend(chunk)
+        if (not is_stream) or _sse_first_frame_complete(bytes(head)):
+            committed = True
+            break
+    if not head:
+        # defensively: nothing to commit even after a "healthy" decision
+        return False
+
+    # ── COMMIT: status + headers + buffered complete first chunk ──────────
+    response_buffer.extend(head)
+    handler.send_response(status)
+    handler._response_started = True    # bytes now committed — no further retry
+    for h, v in resp.headers.items():
+        if h.lower() not in exclude_headers:
+            handler.send_header(h, v)
+    if provider_header:
+        handler.send_header(*provider_header)
+    for _eh_name, _eh_val in (extra_headers or []):
+        handler.send_header(_eh_name, _eh_val)
+    handler.end_headers()
+    handler.wfile.write(bytes(head))
+    handler.wfile.flush()
+
+    # ── STREAM: remainder live ─────────────────────────────────────────────
+    while True:
+        try:
+            chunk = resp.read(4096)
+        except Exception:
+            # past the failover window a mid-stream failure is terminal —
+            # the client already has committed bytes; stop reading cleanly.
+            break
+        if not chunk:
+            break
+        response_buffer.extend(chunk)
+        handler.wfile.write(chunk)
+        handler.wfile.flush()
+    return True
+
+
 # ── proxy handler ───────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -5191,12 +5336,6 @@ class Handler(BaseHTTPRequestHandler):
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
-                self.send_response(resp.status)
-                self._response_started = True  # response bytes committed — no retry
-                for h, v in resp.headers.items():
-                    if h.lower() not in ("transfer-encoding", "connection", "content-length"):
-                        self.send_header(h, v)
-                self.send_header("X-Provider", key_name)
                 # FIX-1b (2026-09-02): ollama reasoning models (glm-5.3,
                 # qwen3.5:397b, ...) can spend the entire completion budget
                 # in the separate "reasoning" field and return content="" —
@@ -5206,6 +5345,10 @@ class Handler(BaseHTTPRequestHandler):
                 # the body and inject reasoning into content before
                 # forwarding (same treatment _try_zai_key gives
                 # "reasoning_content"). Streaming requests forward unchanged.
+                # Both branches go through the FAILOVER WINDOW (t_bc670026):
+                # no client bytes are committed until a healthy first chunk
+                # is confirmed, so a dead/empty/error stream fails over to the
+                # next flat-router candidate instead of hanging the client.
                 if not body_json.get("stream"):
                     full_body = resp.read()
                     try:
@@ -5220,20 +5363,23 @@ class Handler(BaseHTTPRequestHandler):
                                 full_body = json.dumps(resp_json).encode()
                     except Exception:
                         pass
-                    response_buffer.extend(full_body)
-                    self.send_header("Content-Length", str(len(full_body)))
-                    self.end_headers()
-                    self.wfile.write(full_body)
-                    self.wfile.flush()
+                    if not _stream_upstream_with_failover_window(
+                            self, resp, response_buffer, resp.status,
+                            provider_header=("X-Provider", key_name),
+                            exclude_headers=frozenset(
+                                {"transfer-encoding", "connection", "content-length"}),
+                            is_stream=False, seed_body=full_body,
+                            extra_headers=[("Content-Length",
+                                            str(len(full_body)))]):
+                        return False
                 else:
-                    self.end_headers()
-                    while True:
-                        chunk = resp.read(4096)
-                        if not chunk:
-                            break
-                        response_buffer.extend(chunk)
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    if not _stream_upstream_with_failover_window(
+                            self, resp, response_buffer, resp.status,
+                            provider_header=("X-Provider", key_name),
+                            exclude_headers=frozenset(
+                                {"transfer-encoding", "connection", "content-length"}),
+                            is_stream=True):
+                        return False
 
                 # Parse usage for spend tracking
                 ollama_usage = _parse_usage(bytes(response_buffer))
@@ -5502,20 +5648,14 @@ class Handler(BaseHTTPRequestHandler):
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
-                self.send_response(resp.status)
-                self._response_started = True  # response bytes committed — no retry
-                for h, v in resp.headers.items():
-                    if h.lower() not in ("transfer-encoding", "connection"):
-                        self.send_header(h, v)
-                self.send_header("X-Provider", "opencode_go")
-                self.end_headers()
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    response_buffer.extend(chunk)
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                # FAILOVER WINDOW (t_bc670026): no client bytes until the first
+                # complete chunk is confirmed — dead-before-first-chunk fails
+                # over cleanly instead of hanging the client.
+                if not _stream_upstream_with_failover_window(
+                        self, resp, response_buffer, resp.status,
+                        provider_header=("X-Provider", "opencode_go"),
+                        is_stream=bool(body_json.get("stream"))):
+                    return False
 
                 og_usage = _parse_usage(bytes(response_buffer))
                 og_tokens = int(og_usage.get("total_tokens") or 0)
@@ -5714,20 +5854,14 @@ class Handler(BaseHTTPRequestHandler):
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             with urllib.request.urlopen(req, timeout=180) as resp:
-                self.send_response(resp.status)
-                self._response_started = True  # response bytes committed — no retry
-                for h, v in resp.headers.items():
-                    if h.lower() not in ("transfer-encoding", "connection"):
-                        self.send_header(h, v)
-                self.send_header("X-Provider", "telnyx")
-                self.end_headers()
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    response_buffer.extend(chunk)
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                # FAILOVER WINDOW (t_bc670026): no client bytes until the first
+                # complete chunk is confirmed — dead-before-first-chunk fails
+                # over cleanly instead of hanging the client.
+                if not _stream_upstream_with_failover_window(
+                        self, resp, response_buffer, resp.status,
+                        provider_header=("X-Provider", "telnyx"),
+                        is_stream=bool(body_json.get("stream"))):
+                    return False
 
                 # Parse usage for spend tracking
                 telnyx_usage = _parse_usage(bytes(response_buffer))
@@ -5822,20 +5956,16 @@ class Handler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
             try:
                 with urllib.request.urlopen(req, timeout=180) as resp:
-                    self.send_response(resp.status)
-                    self._response_started = True  # response bytes committed — no retry
-                    for h, v in resp.headers.items():
-                        if h.lower() not in ("transfer-encoding", "connection"):
-                            self.send_header(h, v)
-                    self.send_header("X-Failover-Provider", provider_name)
-                    self.end_headers()
-                    while True:
-                        chunk = resp.read(4096)
-                        if not chunk:
-                            break
-                        response_buffer.extend(chunk)
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    # FAILOVER WINDOW (t_bc670026): commit NO client bytes until
+                    # the first complete chunk is confirmed. A candidate that
+                    # dies before its first chunk leaves the client untouched,
+                    # so the flat router can still fail over to the next one.
+                    if not _stream_upstream_with_failover_window(
+                            self, resp, response_buffer, resp.status,
+                            provider_header=("X-Failover-Provider", provider_name),
+                            is_stream=bool(body_json.get("stream"))):
+                        # died before first complete chunk — client untouched
+                        return False
                     _mark_funded(provider_name)
                     _mark_key_healthy(provider_name)
                     ext_usage = _parse_usage(bytes(response_buffer))

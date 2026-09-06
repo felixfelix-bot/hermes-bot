@@ -1,0 +1,101 @@
+# ── model_benchmarks.yaml — per-model capability snapshot ──────────────────
+#	Input to tier resolution (ADR: benchmark-tier model resolution).
+#	Filter:  model must satisfy tier minima (context, coding_class,
+#	         tool_use) to enter the tier candidate pool.
+#	Provenance: EVERY entry carries an `evidence:` line. Scores without
+#	provenance are forbidden — stale or unsourced floors are how bad
+#	models sneak into routing.
+#	Coding classes (ordered): economy < solid < pro
+#	tool_use (ordered):        ok < good < strong
+#	Context windows marked "assumed" come from fleet profile configs
+#	(hermes-side operating assumption), NOT provider-verified — verify
+#	via canary before relying on them for tight-tier filtering.
+#	stale_after_days: if the best candidate in a resolving pool is older
+#	than this, log reason=stale_benchmarks (warn, never block).
+
+version: 1
+stale_after_days: 14
+
+models:
+  deepseek/deepseek-v4-pro:
+    context_window: 1048576        # assumed (fleet config)
+    coding_class: pro
+    tool_use: strong
+    reported_as:
+      - deepseek/deepseek-v4-pro
+      - deepseek-v4-pro
+    evidence: "4210 clean neuralwatt calls in 2-day fleet window (2026-09-06); inspector/plebeian standard"
+    measured: 2026-09-06
+
+  deepseek/deepseek-v4-flash:
+    context_window: 1048576        # assumed (fleet config)
+    coding_class: solid
+    tool_use: strong
+    reported_as:
+      - deepseek/deepseek-v4-flash
+      - deepseek-v4-flash
+      - deepseek-ai/DeepSeek-V4-Flash-0731-TEE   # chutes slug
+      - deepseek-v4-flash:0731                    # ollama slug
+    evidence: "~3300 clean calls across neuralwatt/chutes/ollama_cloud_4 in 2-day window; canary 6/6 (2026-09-06 manager re-test)"
+    measured: 2026-09-06
+
+  glm-5.3:
+    context_window: 1048576        # assumed (fleet config)
+    coding_class: pro
+    tool_use: strong
+    reported_as:
+      - glm-5.3
+    evidence: "2288 ours calls + manager DM orchestrator for weeks; transient empty-storm 2026-09-06 07:05-07:26 (recovered, was a provider-side incident not a capability gap)"
+    measured: 2026-09-06
+
+  glm-5.2:
+    context_window: 1048576        # assumed (fleet config)
+    coding_class: solid
+    tool_use: good
+    caveats:
+      - "reasoning-variant trap: small max_tokens budgets yield empty+finish=length (needs >=2048 or thinking off) — canary 2026-09-06"
+      - "repetition blowups on chutes GLM-5.2-TEE (canary FAIL) — model is OFF the chutes lane, see bot commit ce47af0"
+    reported_as:
+      - glm-5.2
+      - zai-org/GLM-5.2-TEE
+      - z-ai/glm-5.2                           # openrouter slug
+    evidence: "341+ calls across routstrd/openrouter/neuralwatt in 2-day window; solid class with documented failure modes above"
+    measured: 2026-09-06
+
+  kimi-k3:
+    context_window: 262144        # assumed (kimi-consultant profile config)
+    coding_class: pro
+    tool_use: strong
+    reported_as:
+      - kimi-k3
+    evidence: "138 neuralwatt calls + kimi-consultant reasoning duty; strong agentic reputation on fleet tasks"
+    measured: 2026-09-06
+    verify_context_window: true
+
+  kimi-k2.7-code:
+    context_window: 262144        # assumed — UNVERIFIED, verify via canary
+    coding_class: solid
+    tool_use: good
+    reported_as:
+      - kimi-k2.7-code
+    evidence: "207 neuralwatt calls in 2-day window (code tasks)"
+    measured: 2026-09-06
+    verify_context_window: true
+
+  glm-5.3-flash:
+    context_window: 1048576        # assumed
+    coding_class: economy
+    tool_use: good
+    reported_as:
+      - glm-5.3-flash
+    evidence: "listed in ours PROVIDER_MODELS rungs; no recent fleet traffic — capability floor only, not a tier candidate today"
+    measured: 2026-08-30
+
+  glm-4.5-flash:
+    context_window: 1048576        # assumed
+    coding_class: economy
+    tool_use: ok
+    reported_as:
+      - glm-4.5-flash
+    evidence: "routstr legacy rung; economy class filler"
+    measured: 2026-08-30

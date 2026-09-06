@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import yaml
+
 # ── Path bootstrap ──────────────────────────────────────────────────────────
 # Repo copy: works in two layouts without editing.
 #   * repo checkout — this file at repo root, zai_proxy.py in production/,
@@ -1075,6 +1077,323 @@ def select_provider(
             dispatch_fn=None,
             reason="select_provider error",
         )]
+
+
+# ── resolve_tier() — benchmark-tier model resolution ───────────────────────
+# Design: plans/benchmark-tier-model-resolution-2026-09-06.md
+# Profiles pin "tier/<name>" instead of a concrete model. The proxy resolves
+# the alias to the CHEAPEST healthy model meeting the tier's minimum
+# benchmarks (model_benchmarks.yaml) plus live fleet gates (provider
+# health, garbage demotion, trailing empty-rate). Reuses select_provider()
+# per candidate model so resolution logic can NEVER drift from the actual
+# walk: whatever the router would do, the resolver sees.
+#
+# Contract:
+#   - concrete model strings are NEVER alias-resolved (escape hatch).
+#   - stickiness: one resolution per session (24h TTL) — conversations
+#     never switch models mid-flight.
+#   - hysteresis: an incumbent is kept unless it fails a gate or a
+#     challenger costs < hysteresis_switch_cost_ratio of it.
+#   - fallback: empty pool -> tier fallback_model. Never 503, never raise.
+#   - kill-switch: <bot dir>/.disable_tier_resolution pins every tier to
+#     its fallback_model instantly (30s cache, no restart).
+
+_TIER_PREFIX = "tier/"
+_BOT_DIR = os.path.expanduser("~/.hermes/bot")
+_TIER_CFG_CACHE: dict[str, Any] = {"mtime": 0, "bench_mtime": 0}
+_TIER_STICKINESS: dict[str, tuple[str, float, float]] = {}  # session -> (model, cost, expires)
+_TIER_SHADOW_TS: dict[str, float] = {}                       # tier -> last shadow eval
+_TIER_KILLSWITCH_TS: dict[str, float] = {"checked": 0.0, "present": False}
+
+_CODING_CLASS_ORDER = {"economy": 0, "solid": 1, "pro": 2}
+_TOOL_USE_ORDER = {"ok": 0, "good": 1, "strong": 2}
+
+
+def _load_yaml_cached(path: str, mtime_key: str) -> Any:
+    """Load a YAML file with mtime caching; None if missing/broken."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if _TIER_CFG_CACHE.get(mtime_key) == mtime:
+        return _TIER_CFG_CACHE.get("cfg_" + mtime_key)
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+    _TIER_CFG_CACHE[mtime_key] = mtime
+    _TIER_CFG_CACHE["cfg_" + mtime_key] = data
+    return data
+
+
+def _tier_killswitch_active() -> bool:
+    """True if the kill-switch file exists (30s cache, fail-closed to the
+    LAST known state on errors — operator intent is sticky)."""
+    now = time.time()
+    if now - _TIER_KILLSWITCH_TS["checked"] < 30:
+        return _TIER_KILLSWITCH_TS["present"]
+    present = False
+    try:
+        present = os.path.exists(os.path.join(
+            _BOT_DIR, ".disable_tier_resolution"))
+    except Exception:
+        present = _TIER_KILLSWITCH_TS["present"]
+    _TIER_KILLSWITCH_TS["checked"] = now
+    _TIER_KILLSWITCH_TS["present"] = present
+    return present
+
+
+def _tier_registry() -> tuple[dict | None, dict | None]:
+    """(tiers config, benchmarks) from the YAML files; (None, None) if the
+    tier system is unconfigured — resolver inert, concrete passthrough."""
+    cfg = _load_yaml_cached(os.path.join(_BOT_DIR, "model_tiers.yaml"), "mtime")
+    bench = _load_yaml_cached(os.path.join(_BOT_DIR, "model_benchmarks.yaml"), "bench_mtime")
+    if not isinstance(cfg, dict) or not isinstance(bench, dict):
+        return None, None
+    return cfg, bench
+
+
+def _model_passes_benchmarks(model: str, tier: dict, bench: dict) -> str | None:
+    """Return None if model qualifies, else the failing reason. Filters on
+    the explicit tier candidate allowlist FIRST (belt-and-suspenders), then
+    the benchmark minima."""
+    allowed = tier.get("candidates") or []
+    if allowed and model not in allowed:
+        return "not_in_tier_allowlist"
+    m = (bench.get("models") or {}).get(model)
+    if not isinstance(m, dict):
+        return "no_benchmark_entry"
+    if int(m.get("context_window") or 0) < int(tier.get("min_context") or 0):
+        return "context_below_min"
+    if _CODING_CLASS_ORDER.get(m.get("coding_class"), -1) < \
+            _CODING_CLASS_ORDER.get(tier.get("min_coding_class"), 0):
+        return "coding_class_below_min"
+    if _TOOL_USE_ORDER.get(m.get("tool_use"), -1) < \
+            _TOOL_USE_ORDER.get(tier.get("min_tool_use"), 0):
+        return "tool_use_below_min"
+    return None
+
+
+def _model_empty_rate(model: str, reported_as: list, window_hours: float,
+                      min_samples: int) -> tuple[float, int]:
+    """Trailing empty-completion rate for a model across its logged names.
+    Fail-open: <min_samples -> rate 0 so the gate passes on thin data
+    (canaries pre-qualify NEW cheap models; this gate catches SICK ones)."""
+    db_path = os.path.join(_BOT_DIR, "zai_usage.db")
+    names = [model] + [n for n in (reported_as or []) if n]
+    if not names:
+        return 0.0, 0
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            q = conn.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN completion_tokens IS NULL "
+                "OR completion_tokens = 0 THEN 1 ELSE 0 END) "
+                "FROM api_calls WHERE ts > ? AND status_code = 200 "
+                "AND model IN (%s)" % ",".join("?" * len(names)),
+                (time.time() - window_hours * 3600, *names))
+            row = q.fetchone()
+            total = int(row[0] or 0)
+            empties = int(row[1] or 0)
+        finally:
+            conn.close()
+    except Exception:
+        return 0.0, 0
+    return (empties / total if total else 0.0), total
+
+
+def _tier_log_resolution(mode: str, tier_name: str, resolved: str,
+                         reason: str, session_id: str | None,
+                         incumbent: str | None, switched: bool,
+                         would_cost: float | None, actual_model: str | None,
+                         considered: list) -> None:
+    """Insert into tier_resolutions (best-effort; never raises)."""
+    try:
+        db_path = os.path.join(_BOT_DIR, "zai_usage.db")
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS tier_resolutions ("
+                "ts REAL NOT NULL, mode TEXT, tier TEXT, resolved_model TEXT,"
+                " reason TEXT, session_id TEXT, incumbent TEXT,"
+                " switched INTEGER, would_cost REAL, actual_model TEXT,"
+                " candidates TEXT)")
+            conn.execute(
+                "INSERT INTO tier_resolutions (ts, mode, tier, resolved_model,"
+                " reason, session_id, incumbent, switched, would_cost,"
+                " actual_model, candidates) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), mode, tier_name, resolved, reason, session_id,
+                 incumbent, int(switched), would_cost, actual_model,
+                 json.dumps(considered)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _tier_resolve_uncached(tier_name: str) -> tuple[str, str, float, list]:
+    """Pure resolution: cheapest qualifying model for a tier (no
+    stickiness/hysteresis). Returns (model, reason, best_cost, considered)."""
+    cfg, bench = _tier_registry()
+    if cfg is None:
+        return "", "tier_system_unconfigured", float("inf"), []
+    tier = (cfg.get("tiers") or {}).get(tier_name)
+    if not isinstance(tier, dict):
+        return "", "unknown_tier", float("inf"), []
+    if _tier_killswitch_active():
+        return (tier.get("fallback_model") or "", "killswitch_active",
+                float("inf"), [])
+    # Runtime kill-switches: when the flat router is hard-disabled
+    # (.disable_flat_router) or emergency ollama-only is active, NEVER
+    # consult select_provider — resolve straight to the configured pin so
+    # tier machinery cannot violate the emergency dispatch contract.
+    try:
+        if os.path.exists(os.path.join(_BOT_DIR, ".emergency_ollama_only")) \
+                or os.path.exists(os.path.join(_BOT_DIR, ".disable_flat_router")):
+            return (tier.get("fallback_model") or "",
+                    "flat_router_disabled", float("inf"), [])
+    except Exception:
+        pass
+    window_h = float(cfg.get("empty_rate_window_hours") or 6)
+    min_s = int(cfg.get("empty_rate_min_samples") or 50)
+    max_rate = float(tier.get("max_empty_rate") or 0.01)
+
+    best_model, best_cost, considered = "", float("inf"), []
+    for model in tier.get("candidates") or []:
+        fail = _model_passes_benchmarks(model, tier, bench)
+        if fail:
+            considered.append({"model": model, "rejected": fail})
+            continue
+        rate, n = _model_empty_rate(
+            model, ((bench.get("models") or {}).get(model) or {})
+            .get("reported_as"), window_h, min_s)
+        if n >= min_s and rate > max_rate:
+            considered.append({"model": model, "rejected": "empty_rate",
+                               "empty_rate": round(rate, 4), "n": n})
+            continue
+        # Reuse the router itself: cheapest-first candidates for THIS model.
+        cands = select_provider(model, task_type="coding")
+        if not cands or cands[0].name == "fallback" or \
+                cands[0].effective_cost == float("inf"):
+            considered.append({"model": model, "rejected": "no_healthy_provider"})
+            continue
+        cost = cands[0].effective_cost
+        considered.append({"model": model, "cost": round(cost, 6),
+                            "via": cands[0].name})
+        if cost < best_cost:
+            best_model, best_cost = model, cost
+
+    if not best_model:
+        return (tier.get("fallback_model") or "", "empty_pool_fallback",
+                float("inf"), considered)
+    return best_model, "cheapest_qualified", best_cost, considered
+
+
+def resolve_tier(model: str, session_id: str | None = None) -> tuple[str, str]:
+    """Resolve a model string. tier/* aliases resolve per the contract
+    (stickiness + hysteresis + fallback); concrete strings pass through
+    untouched. Returns (resolved_model, reason). Never raises."""
+    try:
+        if not isinstance(model, str) or not model.startswith(_TIER_PREFIX):
+            return model, "concrete_passthrough"
+        cfg, _bench = _tier_registry()
+        if cfg is None:
+            return model, "tier_system_unconfigured"
+        ttl_s = float(cfg.get("stickiness_ttl_hours") or 24) * 3600
+        ratio = float(cfg.get("hysteresis_switch_cost_ratio") or 0.75)
+        max_sessions = int(cfg.get("stickiness_max_sessions") or 10000)
+
+        key = session_id or "__sessionless__"
+        now = time.time()
+        tier = (cfg.get("tiers") or {}).get(model)
+        # Kill-switch takes precedence over stickiness: operator intent is
+        # "pin to fallback_model NOW" — including in-flight sticky sessions.
+        if _tier_killswitch_active():
+            fallback = (tier or {}).get("fallback_model") or ""
+            _tier_log_resolution("live", model, fallback,
+                                 "killswitch_active", key, None, False,
+                                 None, None, [])
+            _TIER_STICKINESS.pop(key, None)
+            return fallback or model, "killswitch_active"
+        incumbent = _TIER_STICKINESS.get(key)
+        if incumbent:
+            in_model, in_cost, expires = incumbent
+            if now < expires:
+                # Re-validate: is the incumbent still healthy & cheap enough?
+                cands = select_provider(in_model, task_type="coding")
+                still_ok = bool(cands) and cands[0].name != "fallback" and \
+                    cands[0].effective_cost != float("inf")
+                best_model, reason, best_cost, considered = \
+                    _tier_resolve_uncached(model)
+                if still_ok and (not best_model or
+                                 best_cost >= ratio * in_cost):
+                    _tier_log_resolution(
+                        "live", model, in_model, "sticky_kept", key,
+                        in_model, False, in_cost, None, considered)
+                    return in_model, "sticky"
+                if not best_model:
+                    # No challenger at all AND incumbent unhealthy? Fall back
+                    # to the configured pin (last known good) rather than
+                    # caching a dead model.
+                    _tier_log_resolution(
+                        "live", model, tier.get("fallback_model") or "",
+                        "empty_pool_fallback", key, in_model, True,
+                        None, None, considered)
+                    return (tier.get("fallback_model") or model,
+                            "empty_pool_fallback")
+                _tier_log_resolution(
+                    "live", model, best_model, reason, key, in_model, True,
+                    best_cost, None, considered)
+                _TIER_STICKINESS[key] = (best_model, best_cost, now + ttl_s)
+                return best_model, "re_resolved_switched"
+
+        best_model, reason, best_cost, considered = _tier_resolve_uncached(model)
+        if not best_model:
+            # Nothing resolved (unknown tier / unconfigured / empty
+            # fallback): pass the alias through, never cache it.
+            return model, reason
+        # Evict oldest stickiness entries when over cap (cheap FIFO —
+        # sessions are transient; correctness only needs liveness).
+        if len(_TIER_STICKINESS) >= max_sessions:
+            for k in list(_TIER_STICKINESS)[:max(1, max_sessions // 10)]:
+                _TIER_STICKINESS.pop(k, None)
+        _TIER_STICKINESS[key] = (best_model, best_cost, now + ttl_s)
+        _tier_log_resolution("live", model, best_model, reason, key,
+                             incumbent[0] if incumbent else None,
+                             bool(incumbent), best_cost, None, considered)
+        return best_model, reason
+    except Exception:
+        # Never break a request on resolver failure: pass the alias through
+        # untouched (fails exactly like an unknown concrete model would).
+        return model, "resolver_error"
+
+
+def shadow_tier_evaluate(actual_model: str | None,
+                         session_id: str | None = None) -> None:
+    """SHADOW mode: for each tier, log what WOULD have been resolved, at a
+    per-tier rate limit — zero effect on routing. Precedent: the pressure
+    FSM shadow hook (S2b, t_4dfaf0d5). Never raises."""
+    try:
+        cfg, _bench = _tier_registry()
+        if cfg is None:
+            return
+        if str(cfg.get("mode") or "shadow") != "shadow":
+            return  # live mode: real resolutions are logged by resolve_tier
+        min_interval = float(cfg.get("shadow_min_interval_seconds") or 300)
+        now = time.time()
+        for tier_name in (cfg.get("tiers") or {}):
+            if now - _TIER_SHADOW_TS.get(tier_name, 0.0) < min_interval:
+                continue
+            _TIER_SHADOW_TS[tier_name] = now
+            best_model, reason, best_cost, considered = \
+                _tier_resolve_uncached(tier_name)
+            _tier_log_resolution(
+                "shadow", tier_name, best_model, reason, session_id,
+                None, False, best_cost, actual_model, considered)
+    except Exception:
+        pass
 
 
 def _resolve_model_for_provider(name: str, model: str) -> str:

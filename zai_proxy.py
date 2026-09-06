@@ -549,6 +549,35 @@ def _pressure_shadow(model: str | None, session_id: str | None,
     except Exception:
         return None  # shadow hooks must never break request handling
 
+
+# ── Benchmark-tier resolution hooks (plans/benchmark-tier-…-2026-09-06) ─────
+# Thin module-level wrappers so (a) the request handler stays linear and
+# (b) tests can patch these exactly like _pressure_shadow (see
+# TestPhase0Hardening) instead of flat_router internals.
+def _tier_alias_resolve(model: str, session_id: str | None) -> tuple[str, str]:
+    """Resolve a tier/* alias to a concrete model (flat_router contract:
+    stickiness/hysteresis/kill-switch/fallback). NEVER raises; on any
+    failure the alias is returned unchanged (fails exactly like an
+    unknown concrete model would downstream)."""
+    try:
+        from flat_router import resolve_tier
+        return resolve_tier(model, session_id) or (model, "no_result")
+    except Exception:
+        return model, "resolver_error"
+
+
+def _tier_resolution_shadow(model: str | None,
+                            session_id: str | None) -> None:
+    """Shadow-evaluate every tier (rate-limited) and log the would-be
+    resolution. Read-only with respect to routing. NEVER raises."""
+    if not model:
+        return
+    try:
+        from flat_router import shadow_tier_evaluate
+        shadow_tier_evaluate(model, session_id)
+    except Exception:
+        pass  # shadow hooks must never break request handling
+
 # ── ProfitTracker (consumer-mode savings ledger, MRE Phase 2.3) ─────────────
 # Records every external-failover routing decision + savings vs the next-best
 # alternative into the routing_profit table. Fire-and-forget daemon writer;
@@ -5940,6 +5969,27 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":"invalid request body"}')
             return
+
+        # ── Benchmark-tier resolution (plans/ …-model-resolution-2026-09-06) ─
+        # tier/* aliases resolve to the cheapest healthy model meeting the
+        # tier's minimum benchmarks (model_benchmarks.yaml + model_tiers.yaml;
+        # stickiness/hysteresis/kill-switch per the resolver contract).
+        # Concrete model strings are NEVER alias-resolved. The resolver never
+        # raises; on internal error the alias passes through unchanged.
+        # Shadow evaluation (mode: shadow in model_tiers.yaml) logs what
+        # each tier WOULD resolve to at a per-tier rate limit — read-only.
+        if isinstance(original_model, str) and original_model.startswith("tier/"):
+            _resolved, _tier_reason = _tier_alias_resolve(
+                original_model, self._session_id)
+            if _resolved and _resolved != original_model:
+                try:
+                    _body_json = json.loads(body)
+                    _body_json["model"] = _resolved
+                    body = json.dumps(_body_json).encode()
+                    original_model = _resolved
+                except Exception:
+                    pass
+        _tier_resolution_shadow(original_model, self._session_id)
 
         # ── Pressure FSM shadow hook (S2b, t_4dfaf0d5) ────────────────────
         # Compute + log the pressure decision this request WOULD get.

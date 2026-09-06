@@ -763,7 +763,6 @@ _PROVIDER_MODEL_NAMES = {
     # requesting glm-5.2 via chutes must send max_tokens >= 2048 themselves.
     "chutes": {
         "deepseek/deepseek-v4-flash":  "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
-        "glm-5.2":                     "zai-org/GLM-5.2-TEE",
     },
     "ppq": {
         "glm-5.2":                    "z-ai/glm-5.2",

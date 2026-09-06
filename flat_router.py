@@ -228,7 +228,7 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # -TEE slugs. Reasoning models: clients must send max_tokens >= 2048
     # for glm-5.2 (hidden CoT in completion_tokens) — see zai_proxy comment.
     "chutes": {
-        "deepseek/deepseek-v4-flash", "glm-5.2",
+        "deepseek/deepseek-v4-flash",
     },
     # Telnyx — Kimi-focused by operator decision.
     # kimi-k3:cloud deduped under canonical kimi-k3 (2026-08-27, FR-2):

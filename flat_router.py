@@ -257,6 +257,13 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         "glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro", "glm-5.3", "glm-4.5-flash",
     },
+    # DeepSeek Direct — per-token, operator-pasted key 2026-09-06.
+    # Serves only DeepSeek models (canonical short IDs on the direct API).
+    # Note: NOT vision-exp (experimental, not in PROVIDER_MODELS deliberately
+    # until we have a use case; can be added when needed).
+    "deepseek": {
+        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+    },
 }
 
 
@@ -279,6 +286,11 @@ _SEED_RATES: dict[str, float] = {
     # Chutes — transient lane (ADR-014): $0.096/M eff on DS-V4-Flash
     # (in 0.44 / out 1.32 / cached 0.044 $/M); Kalman refines from live data.
     "chutes":        0.096,
+    # DeepSeek Direct — per-token seed from published off-peak rates.
+    # Flash: in 0.22 / cache-hit 0.007 / out 0.66 → ~0.22 blended (75:25
+    # in:out) at zero cache-hit; Kalman refines toward the real cache-hit mix.
+    # PAE-6/7 warm-context should raise the cache-hit ratio → lower effective.
+    "deepseek":     0.30,
 }
 
 # Map proxy provider names to shadow optimizer names
@@ -309,6 +321,7 @@ PROVIDER_TIER: dict[str, str] = {
     "routstr":        "per_token",
     "routstrd":       "per_token",
     "chutes":         "per_token",
+    "deepseek":       "per_token",
 }
 
 # ── Tier-specific constants ──────────────────────────────────────────────────

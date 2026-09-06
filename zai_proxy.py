@@ -664,6 +664,8 @@ def _load_external_keys():
                     keys["telnyx"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("TELNYX_STARTING_BALANCE=") and "telnyx_balance" not in keys:
                     keys["telnyx_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPSEEK_API_KEY=") and "deepseek" not in keys:
+                    keys["deepseek"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("ROUTSTR_API_KEY=") and "routstr" not in keys:
                     keys["routstr"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("ROUTSTR_BASE=") and "routstr_base" not in keys:
@@ -726,6 +728,12 @@ TELNYX_KEY = _EXTERNAL_KEYS.get("telnyx", "")
 TELNYX_BASE = "https://api.telnyx.com/v2/ai"
 TELNYX_DEMO_URL = "https://telnyx.com/api/inference"
 TELNYX_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("telnyx_balance", "10.0") or "10.0")
+
+# DeepSeek Direct — per-token provider, operator-pasted key 2026-09-06.
+# Pricing from https://api-docs.deepseek.com/quick_start/pricing (verified live).
+# DeepSeek uses its own peak hours (UTC 01:00-04:00 + 06:00-10:00 Mon-Fri).
+DEEPSEEK_KEY = _EXTERNAL_KEYS.get("deepseek", "")
+DEEPSEEK_BASE = "https://api.deepseek.com"
 
 # OpenCode Go — $10/month flat-rate subscription (GLM-5.2/5.3, Kimi, DeepSeek)
 OPENCODE_GO_KEY = _EXTERNAL_KEYS.get("opencode_go", "")
@@ -882,6 +890,12 @@ EXTERNAL_PROVIDERS = {
         # NeuralWatt — per-token, deepseek-v4-flash $0.14/M, prompt caching.
         "base_url": NEURALWATT_BASE,
         "key": NEURALWATT_KEY,
+    },
+    "deepseek": {
+        # DeepSeek Direct — per-token, $0.22/$0.007 cache-miss/cache-hit input, $0.66 output (off-peak flash).
+        # Peak UTC 01:00-04:00 + 06:00-10:00 Mon-Fri (half price all other hours).
+        "base_url": DEEPSEEK_BASE,
+        "key": DEEPSEEK_KEY,
     },
 }
 

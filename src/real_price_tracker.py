@@ -198,6 +198,7 @@ LAST_RESORT_RATES: dict[str, float] = {
     "ollama_cloud":       0.0155,   # MEASURED included rate (pre-RP-3 observation)
     "ollama_cloud_extra": 0.15,     # above-quota rate (above PPQ $0.14/M so optimizer reroutes)
     "ollama_cloud_2":     0.0155,   # second subscription, same economics as #1
+    "ollama_cloud_4":     0.0155,   # fourth subscription (sleepy_easley_477, 2026-09-06)
     "opencode_go":        0.0155,   # $10/mo flat-rate → marginal $0, floored
     "neuralwatt":         2.21,     # glm-5.2 blended (primary model, 77% of traffic) — conservative seed
     "ppq":                0.14,     # known list price
@@ -236,6 +237,7 @@ PROVIDER_WINDOW_HOURS: dict[str, float] = {
     "friend":       365 * 24,   # 8760 — z.ai amortization
     "ollama_cloud": 90 * 24,    # 2160 — slow-moving subscription
     "ollama_cloud_2": 90 * 24,  # 2160 — second subscription, same window
+    "ollama_cloud_4": 90 * 24,     # 2160 — fourth subscription, same window
     "opencode_go":  90 * 24,   # 2160 — flat-rate subscription
     "neuralwatt":   30 * 24,   # 720  — pay-per-token
     "ppq":          30 * 24,    # 720  — pay-per-token
@@ -255,6 +257,7 @@ SEED_RATES: dict[str, float] = {
     "friend":       0.001,
     "ollama_cloud": 0.0155,   # measured blended rate (pre-RP-3)
     "ollama_cloud_2": 0.0155, # second subscription, same economics
+    "ollama_cloud_4": 0.0155, # fourth subscription (sleepy_easley_477, 2026-09-06)
     "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
     "neuralwatt":   2.21,     # glm-5.2 blended (primary model, conservative seed)
     "ppq":          0.14,     # list price
@@ -714,16 +717,19 @@ def get_trailing_rate(
     window = _provider_window(provider)
     rate = get_real_rate(provider, model, window_hours=window, db_path=db, _now=now)
 
-    # ollama_cloud + ollama_cloud_2 + ollama_cloud_3: real measurement may
+    # ollama_cloud + 2/3/4: real measurement may
     # live in the billing API, not cost_usd. All are flat subscriptions with
     # ~$0 marginal per-call.
-    if rate is None and provider in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
+    if rate is None and provider in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
         _api_key = None
         if provider == "ollama_cloud_2":
             _api_key = os.environ.get("OLLAMA_CLOUD_API_KEY_2", "") or _env_file_key("OLLAMA_CLOUD_API_KEY_2")
         elif provider == "ollama_cloud_3":
             _api_key = (os.environ.get("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499", "")
                         or _env_file_key("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499"))
+        elif provider == "ollama_cloud_4":
+            _api_key = (os.environ.get("OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477", "")
+                        or _env_file_key("OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477"))
         rate = _ollama_api_rate(model, api_key=_api_key)
 
     with _cache_lock:

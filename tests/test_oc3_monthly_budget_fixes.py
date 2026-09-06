@@ -68,10 +68,11 @@ class TestOc3MonthlyOrder(unittest.TestCase):
             "ollama_cloud":   _status(weekly_pct=90.0),
             "ollama_cloud_2": _status(weekly_pct=10.0),
             "ollama_cloud_3": _status(monthly_pct=5.0, monthly_tokens=175_000_000),
+            "ollama_cloud_4": _status(weekly_pct=90.0),
         }
         self.assertEqual(
             self._order_names(statuses),
-            ["ollama_cloud_3", "ollama_cloud_2", "ollama_cloud"])
+            ["ollama_cloud_3", "ollama_cloud_2", "ollama_cloud", "ollama_cloud_4"])
 
     def test_oc3_remaining_uses_budget_not_used_tokens(self):
         """Even with a large used-token count, oc3 remaining is budget-based.
@@ -84,6 +85,7 @@ class TestOc3MonthlyOrder(unittest.TestCase):
             "ollama_cloud":   _status(weekly_pct=90.0),
             "ollama_cloud_2": _status(weekly_pct=90.0),
             "ollama_cloud_3": _status(monthly_pct=85.7, monthly_tokens=3_000_000_000),
+            "ollama_cloud_4": _status(weekly_pct=90.0),
         }
         self.assertEqual(self._order_names(statuses)[0], "ollama_cloud_3")
 

@@ -59,16 +59,30 @@ class TestOllamaPoolOrder(unittest.TestCase):
             "ollama_cloud":   _status(weekly_pct=90.0),
             "ollama_cloud_2": _status(weekly_pct=10.0),
             "ollama_cloud_3": _status(monthly_pct=5.0, monthly_tokens=96_000_000),
+            "ollama_cloud_4": _status(weekly_pct=90.0),
         }
         self.assertEqual(
             self._order_names(statuses),
-            ["ollama_cloud_3", "ollama_cloud_2", "ollama_cloud"])
+            ["ollama_cloud_3", "ollama_cloud_2", "ollama_cloud", "ollama_cloud_4"])
+
+    def test_fresh_key_four_enters_rotation_first(self):
+        """2026-09-06 regression: a fresh key #4 (full weekly pool) enters
+        the rotation at the head — exactly what its addition was for, since
+        keys 1-3 exhaust mid-week at fleet demand."""
+        statuses = {
+            "ollama_cloud":   _status(weekly_pct=90.0),
+            "ollama_cloud_2": _status(weekly_pct=50.0),
+            "ollama_cloud_3": _status(monthly_pct=90.0, monthly_tokens=350_000_000),
+            "ollama_cloud_4": _status(weekly_pct=0.0),
+        }
+        self.assertEqual(self._order_names(statuses)[0], "ollama_cloud_4")
 
     def test_exhausted_key_sinks_last(self):
         statuses = {
             "ollama_cloud":   _status(weekly_pct=100.0),
             "ollama_cloud_2": _status(weekly_pct=50.0),
             "ollama_cloud_3": _status(monthly_pct=95.0, monthly_tokens=96_000_000),
+            "ollama_cloud_4": _status(weekly_pct=50.0),
         }
         self.assertEqual(
             self._order_names(statuses)[0], "ollama_cloud_2")
@@ -81,6 +95,7 @@ class TestOllamaPoolOrder(unittest.TestCase):
             "ollama_cloud":   _status(weekly_pct=0.0),
             "ollama_cloud_2": _status(weekly_pct=10.0),
             "ollama_cloud_3": _status(monthly_pct=5.0, monthly_tokens=96_000_000),
+            "ollama_cloud_4": _status(weekly_pct=30.0),
         }
         order = self._order_names(
             statuses, paywall={"ollama_cloud": True})
@@ -146,3 +161,20 @@ class TestRoutstrdDailyCap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnvParserReadsKeyFour(unittest.TestCase):
+    """2026-09-06: _load_external_keys must pick up the 4th ollama key from
+    the profile .env (the A2 lesson: wiring a key means the parser sees it)."""
+
+    def test_parses_key_four(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            envdir = home / ".hermes" / "profiles" / "manager"
+            envdir.mkdir(parents=True)
+            (envdir / ".env").write_text(
+                "OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477=testkey-four-xyz\n")
+            with patch.object(Path, "home", return_value=home):
+                keys = z._load_external_keys()
+        self.assertEqual(keys.get("ollama_cloud_4"), "testkey-four-xyz")

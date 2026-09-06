@@ -558,7 +558,7 @@ LOCK_THRESHOLDS = {
 #   ollama_cloud  1.0   — flat-rate cloud ($100/mo, rate from real_price_tracker). Preferred
 #                         during z.ai peak hours (UTC 6-10) or when z.ai is dead.
 #   ppq           — pay-per-token; most expensive, last-resort failover only.
-_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0, "ollama_cloud_2": 1.0, "ollama_cloud_3": 1.0, "opencode_go": 1.0, "neuralwatt": 1.0}
+_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0, "ollama_cloud_2": 1.0, "ollama_cloud_3": 1.0, "ollama_cloud_4": 1.0, "opencode_go": 1.0, "neuralwatt": 1.0}
 UPSTREAM   = "https://api.z.ai/api/coding/paas/v4"
 QUOTA_URL  = "https://api.z.ai/api/monitor/usage/quota/limit"
 CACHE_TTL  = 300                                # 5 min
@@ -584,6 +584,8 @@ def _load_external_keys():
                     keys["ollama_cloud_2"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499=") and "ollama_cloud_3" not in keys:
                     keys["ollama_cloud_3"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477=") and "ollama_cloud_4" not in keys:
+                    keys["ollama_cloud_4"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("DEEPINFRA_API_KEY=") and "deepinfra" not in keys:
                     keys["deepinfra"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
                 elif line.startswith("DEEPINFRA_STARTING_BALANCE=") and "deepinfra_balance" not in keys:
@@ -618,16 +620,25 @@ OLLAMA_CLOUD_KEY_2 = _EXTERNAL_KEYS.get("ollama_cloud_2", "")
 # monthly window + ~90% delist guard (dead-time penalty ~30 days). See plan
 # plans/ollama3-burn-reduction-2026-09-02.md Phases A/C.
 OLLAMA_CLOUD_KEY_3 = _EXTERNAL_KEYS.get("ollama_cloud_3", "")
+# Ollama Cloud key #4 (sleepy_easley_477, ollama4@embedsmart.de) — $20/mo
+# weekly-pool subscription, same shape as #1/#2 (500M/wk included + 5h session
+# windows; no monthly special-casing). Added 2026-09-06: keys 1-3 exhaust
+# mid-week at fleet demand (~1.78B in-tokens/wk) and the relief fell to
+# metered lanes. plans/fleet-recovery-chutes-wiring-2026-09-06.md Phase 0.
+OLLAMA_CLOUD_KEY_4 = _EXTERNAL_KEYS.get("ollama_cloud_4", "")
 
 # All registered Ollama Cloud keys — the _try_ollama_cloud_any dispatcher
 # iterates this list. Key #1 first (backward compat), key #2 as failover, key
 # #3 LAST as the monthly-budget relief valve (oc/oc2 drain 5h windows daily, so
 # they stay primary; oc3 absorbs overflow to protect its ~30-day pool from early
-# exhaustion). Empty keys are dropped below.
+# exhaustion). Key #4 rides the remaining-quota order (fullest first) — a fresh
+# pool enters rotation at the head until it draws down. Empty keys are dropped
+# below.
 _OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = [
     ("ollama_cloud", OLLAMA_CLOUD_KEY),
     ("ollama_cloud_2", OLLAMA_CLOUD_KEY_2),
     ("ollama_cloud_3", OLLAMA_CLOUD_KEY_3),
+    ("ollama_cloud_4", OLLAMA_CLOUD_KEY_4),
 ]
 _OLLAMA_CLOUD_KEYS = [(n, k) for n, k in _OLLAMA_CLOUD_KEYS if k]  # drop empty
 
@@ -731,6 +742,10 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
     "ollama_cloud_3": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_4": {
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
     },
@@ -940,6 +955,7 @@ _OLLAMA_PAYWALL_FLAGS: dict[str, Path] = {
     "ollama_cloud": _OLLAMA_PAYWALL_FLAG,
     "ollama_cloud_2": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_2",
     "ollama_cloud_3": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_3",
+    "ollama_cloud_4": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_4",
 }
 
 
@@ -1660,7 +1676,7 @@ def _snapshot_quota() -> dict:
         # oc/oc2 = session + weekly windows; oc3 (stoic_herschel_499) = MONTHLY
         # budget pool only (no 5h sessions) — used_pct driven by the monthly
         # usage fraction from /api/usage, with a ~90% scarcity guard.
-        for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
+        for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
             oc_status = _get_ollama_quota_status(_oc_key)
             if _oc_key == "ollama_cloud_3":
                 oc_used_pct = float(oc_status.get("monthly_used_pct", 0.0))
@@ -1774,6 +1790,7 @@ def _snapshot_health() -> dict:
         h["ollama_cloud"] = _is_key_healthy("ollama_cloud")
         h["ollama_cloud_2"] = _is_key_healthy("ollama_cloud_2")
         h["ollama_cloud_3"] = _is_key_healthy("ollama_cloud_3")
+        h["ollama_cloud_4"] = _is_key_healthy("ollama_cloud_4")
         h["opencode_go"] = _is_key_healthy("opencode_go")
         # NW-API: daily-cap guardrail (real /v1/usage/summary).
         # When today's REAL spend from /v1/usage/summary exceeds
@@ -1957,6 +1974,11 @@ try:
     # qu Total displayed as session-width for the legacy shadow path only.
     _shadow_optimizer.add_provider(
         "ollama_cloud_3", _shadow_pk(0.001), _ShadowConsumptionKalman(),
+        quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
+    )
+    # ollama_cloud_4 (sleepy_easley_477) — 4th weekly-pool sub (2026-09-06).
+    _shadow_optimizer.add_provider(
+        "ollama_cloud_4", _shadow_pk(0.001), _ShadowConsumptionKalman(),
         quota_remaining=500_000, model_tier="standard", quota_total=1_000_000,
     )
     # opencode_go — T3 flat-rate $10/mo subscription: marginal cost $0,
@@ -2849,6 +2871,7 @@ _FALLBACK_RATES: dict[str, float] = {
     "ollama_cloud": _FALLBACK_OLLAMA_CLOUD_BASE,
     "ollama_cloud_2": _FALLBACK_OLLAMA_CLOUD_BASE,
     "ollama_cloud_3": _FALLBACK_OLLAMA_CLOUD_BASE,
+    "ollama_cloud_4": _FALLBACK_OLLAMA_CLOUD_BASE,
     "opencode_go":  0.0155,   # $10/mo flat-rate → marginal $0, floored
     "neuralwatt":   2.21,     # glm-5.2 blended (primary model, conservative seed)
     "friend":       0.015,    # z.ai $300/yr amortized seed
@@ -3292,7 +3315,7 @@ def _spend_tier(key_name: str | None) -> str:
     telnyx/ppq/openrouter/routstr (paid external failover providers)."""
     if key_name in ("ours", "friend"):
         return key_name
-    elif key_name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
+    elif key_name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
         return key_name
     elif key_name == "deepinfra":
         return "deepinfra"
@@ -4254,7 +4277,7 @@ def _build_key_state_overview() -> str:
     # Key states
     health = _snapshot_health()
     quota = _snapshot_quota()
-    all_keys = ["ours", "friend", "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "opencode_go",
+    all_keys = ["ours", "friend", "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4", "opencode_go",
                 "neuralwatt", "deepinfra", "telnyx", "ppq", "openrouter",
                 "routstr", "routstrd"]
 
@@ -4294,7 +4317,7 @@ def _build_key_state_overview() -> str:
             allow = _opencode_go_allowance.get("remaining_usd")
             if allow is not None:
                 status += f" (allowance ${allow:.2f} remaining)"
-        elif name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3"):
+        elif name in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
             sess = qp.get("session_used_pct", 0) if isinstance(qp, dict) else 0
             wkly = qp.get("weekly_used_pct", 0) if isinstance(qp, dict) else 0
             moly = qp.get("monthly_used_pct", 0) if isinstance(qp, dict) else 0
@@ -6118,7 +6141,7 @@ class Handler(BaseHTTPRequestHandler):
                         chosen_key=_pick,
                         reason=f"live_kalman_failover_{_pick}")
                     response_buffer = bytearray()
-                    if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
+                    if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3 or OLLAMA_CLOUD_KEY_4):
                         if self._try_ollama_cloud_any(
                                 body, original_model, response_buffer, t0):
                             return
@@ -6235,7 +6258,7 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key=_pick,
                     reason=f"live_kalman_failover_{_pick}")
                 response_buffer = bytearray()
-                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
+                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3 or OLLAMA_CLOUD_KEY_4):
                     if self._try_ollama_cloud_any(body, original_model, response_buffer, t0):
                         return
                 elif _pick in EXTERNAL_PROVIDERS or _pick == "deepinfra":
@@ -6265,7 +6288,7 @@ class Handler(BaseHTTPRequestHandler):
         # fall through to the hardcoded failover chain below.
         if chosen not in KEYS:
             response_buffer = bytearray()
-            if chosen in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
+            if chosen in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3 or OLLAMA_CLOUD_KEY_4):
                 if self._try_ollama_cloud_any(body, original_model, response_buffer, t0):
                     return
             elif chosen in EXTERNAL_PROVIDERS or chosen == "deepinfra":
@@ -6584,7 +6607,7 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key=_pick,
                     reason=f"live_kalman_failover_{_pick}")
                 response_buffer = bytearray()
-                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3):
+                if _pick in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4") and (OLLAMA_CLOUD_KEY or OLLAMA_CLOUD_KEY_2 or OLLAMA_CLOUD_KEY_3 or OLLAMA_CLOUD_KEY_4):
                     if self._try_ollama_cloud_any(body, model, response_buffer, t0):
                         return
                 elif _pick in EXTERNAL_PROVIDERS:
@@ -6781,6 +6804,7 @@ class Handler(BaseHTTPRequestHandler):
             data["ollama_cloud"] = _sq.get("ollama_cloud", {})
             data["ollama_cloud_2"] = _sq.get("ollama_cloud_2", {})
             data["ollama_cloud_3"] = _sq.get("ollama_cloud_3", {})
+            data["ollama_cloud_4"] = _sq.get("ollama_cloud_4", {})
             data["opencode_go"] = _sq.get("opencode_go", {})
             data["neuralwatt"] = _sq.get("neuralwatt", {})
             payload = json.dumps(data, indent=2).encode()

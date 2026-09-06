@@ -1146,6 +1146,8 @@ class TestPhase0Hardening:
                           return_value=(True, 0.0, 100.0)), \
              patch.object(zai_proxy, "_pressure_shadow",
                           return_value=None), \
+             patch.object(zai_proxy, "_tier_resolution_shadow",
+                          return_value=None), \
              patch.object(zai_proxy.Handler, "_pressure_enforce",
                           return_value=False), \
              patch("flat_router.select_provider",
@@ -1172,6 +1174,8 @@ class TestPhase0Hardening:
         with patch.object(zai_proxy, "_check_global_spend_cap",
                           return_value=(True, 0.0, 100.0)), \
              patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy, "_tier_resolution_shadow",
                           return_value=None), \
              patch.object(zai_proxy.Handler, "_pressure_enforce",
                           return_value=False), \
@@ -1317,6 +1321,270 @@ class TestChutesExtractCost:
         # Zero-token call → cost 0.0 is fine; must never raise.
         assert cost is None or cost >= 0
 
+
+
+# ── Benchmark-tier model resolution (plans/benchmark-tier-…-2026-09-06) ────
+from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
+
+import flat_router
+from flat_router import resolve_tier
+
+_TIER_TEST_CFG = {
+    "mode": "shadow",
+    "hysteresis_switch_cost_ratio": 0.75,
+    "stickiness_ttl_hours": 24,
+    "stickiness_max_sessions": 10000,
+    "shadow_min_interval_seconds": 300,
+    "empty_rate_window_hours": 6,
+    "empty_rate_min_samples": 50,
+    "tiers": {
+        "tier/test": {
+            "min_context": 262144,
+            "min_coding_class": "solid",
+            "min_tool_use": "good",
+            "max_empty_rate": 0.01,
+            "candidates": ["alpha-pro", "beta-flash", "gamma-tiny"],
+            "fallback_model": "alpha-pro",
+        }
+    },
+}
+
+_TIER_TEST_BENCH = {
+    "models": {
+        "alpha-pro": {"context_window": 1000000, "coding_class": "pro",
+                      "tool_use": "strong", "reported_as": ["alpha-pro"]},
+        "beta-flash": {"context_window": 1000000, "coding_class": "solid",
+                       "tool_use": "good", "reported_as": ["beta-flash"]},
+        "gamma-tiny": {"context_window": 32768, "coding_class": "solid",
+                       "tool_use": "good", "reported_as": ["gamma-tiny"]},
+    }
+}
+
+
+class TestTierResolution:
+    """HERMETIC tier-resolution tests — nothing touches the live DB, the
+    live YAML files, zai_proxy_state.json, or the network. Registry, cost
+    table, empty-rate gate, kill-switch and logger are all patched."""
+
+    def setup_method(self):
+        flat_router._TIER_STICKINESS.clear()
+        flat_router._TIER_SHADOW_TS.clear()
+
+    @contextmanager
+    def _env(self, *, costs=None, rates=None, killswitch=False, cfg=None):
+        """Hermetic patch context; yields the resolve-log mock. `costs` maps
+        model -> $/M (None = no healthy provider; the dict may be mutated
+        between resolve calls to simulate price/health changes). `rates`
+        maps model -> (empty_rate, samples)."""
+        costs = costs if costs is not None else {
+            "alpha-pro": 0.40, "beta-flash": 0.02}
+        rates = rates or {}
+
+        def fake_sp(model, task_type="coding", **kw):
+            c = costs.get(model)
+            if c is None:
+                return [SimpleNamespace(name="fallback",
+                                        effective_cost=float("inf"))]
+            return [SimpleNamespace(name="prov", effective_cost=c)]
+
+        def fake_rate(model, reported_as, window_hours, min_samples):
+            return rates.get(model, (0.0, 0))
+
+        with ExitStack() as stack:
+            log = stack.enter_context(
+                patch("flat_router._tier_log_resolution"))
+            stack.enter_context(patch(
+                "flat_router._tier_registry",
+                return_value=(cfg or _TIER_TEST_CFG, _TIER_TEST_BENCH)))
+            stack.enter_context(patch(
+                "flat_router.select_provider", side_effect=fake_sp))
+            stack.enter_context(patch(
+                "flat_router._model_empty_rate", side_effect=fake_rate))
+            stack.enter_context(patch(
+                "flat_router._tier_killswitch_active",
+                return_value=killswitch))
+            yield log
+
+    def test_concrete_models_pass_through_untouched(self):
+        with self._env():
+            assert resolve_tier("glm-5.3", "s1") == \
+                ("glm-5.3", "concrete_passthrough")
+            assert resolve_tier("deepseek/deepseek-v4-flash", "s2")[1] == \
+                "concrete_passthrough"
+
+    def test_unconfigured_registry_passthrough(self):
+        with ExitStack() as st:
+            st.enter_context(patch("flat_router._tier_registry",
+                                   return_value=(None, None)))
+            m, r = resolve_tier("tier/test", "s1")
+        assert m == "tier/test" and r == "tier_system_unconfigured"
+
+    def test_context_window_filter(self):
+        with self._env() as log:
+            m, r = resolve_tier("tier/test", "s1")
+        assert (m, r) == ("beta-flash", "cheapest_qualified")
+        considered = log.call_args[0][-1]
+        gamma = [c for c in considered if c.get("model") == "gamma-tiny"]
+        assert gamma and gamma[0]["rejected"] == "context_below_min"
+
+    def test_coding_class_filter(self):
+        cfg = json.loads(json.dumps(_TIER_TEST_CFG))
+        cfg["tiers"]["tier/test"]["min_coding_class"] = "pro"
+        with self._env(cfg=cfg) as log:
+            m, r = resolve_tier("tier/test", "s1")
+        assert (m, r) == ("alpha-pro", "cheapest_qualified")
+        considered = log.call_args[0][-1]
+        beta = [c for c in considered if c.get("model") == "beta-flash"]
+        assert beta and beta[0]["rejected"] == "coding_class_below_min"
+
+    def test_tool_use_filter(self):
+        cfg = json.loads(json.dumps(_TIER_TEST_CFG))
+        cfg["tiers"]["tier/test"]["min_tool_use"] = "strong"
+        with self._env(cfg=cfg) as log:
+            m, _ = resolve_tier("tier/test", "s1")
+        assert m == "alpha-pro"
+        considered = log.call_args[0][-1]
+        beta = [c for c in considered if c.get("model") == "beta-flash"]
+        assert beta and beta[0]["rejected"] == "tool_use_below_min"
+
+    def test_allowlist_and_benchmark_entry_filters(self):
+        cfg = json.loads(json.dumps(_TIER_TEST_CFG))
+        cfg["tiers"]["tier/test"]["candidates"] = ["alpha-pro", "unheard-of"]
+        with self._env(cfg=cfg) as log:
+            m, r = resolve_tier("tier/test", "s1")
+        assert (m, r) == ("alpha-pro", "cheapest_qualified")
+        considered = log.call_args[0][-1]
+        rejects = {c["model"]: c.get("rejected") for c in considered
+                   if c.get("rejected")}
+        assert rejects.get("unheard-of") == "no_benchmark_entry"
+        # beta-flash is excluded from the allowlist -> never iterated at all
+        models_seen = {c["model"] for c in considered}
+        assert "beta-flash" not in models_seen
+
+    def test_empty_rate_gate_excludes_sick_model(self):
+        with self._env(rates={"beta-flash": (0.06, 200)}) as log:
+            m, r = resolve_tier("tier/test", "s1")
+        assert (m, r) == ("alpha-pro", "cheapest_qualified")
+        beta = [c for c in log.call_args[0][-1]
+                if c.get("model") == "beta-flash"]
+        assert beta and beta[0]["rejected"] == "empty_rate"
+
+    def test_empty_rate_gate_fails_open_on_thin_data(self):
+        with self._env(rates={"beta-flash": (0.06, 5)}) as log:
+            m, _ = resolve_tier("tier/test", "s1")
+        assert m == "beta-flash"
+
+    def test_no_healthy_provider_falls_back_to_pinned_model(self):
+        with self._env(costs={"alpha-pro": None, "beta-flash": None}) as log:
+            m, r = resolve_tier("tier/test", "s1")
+        assert (m, r) == ("alpha-pro", "empty_pool_fallback")
+
+    def test_cheapest_qualified_wins(self):
+        with self._env(costs={"alpha-pro": 0.10, "beta-flash": 0.50}):
+            assert resolve_tier("tier/test", "sA")[0] == "alpha-pro"
+        with self._env(costs={"alpha-pro": 0.50, "beta-flash": 0.10}):
+            assert resolve_tier("tier/test", "sB")[0] == "beta-flash"
+
+    def test_unknown_tier_passes_alias_through_uncached(self):
+        with self._env() as log:
+            m, r = resolve_tier("tier/nope", "s1")
+            assert (m, r) == ("tier/nope", "unknown_tier")
+            assert not flat_router._TIER_STICKINESS
+            log.reset_mock()
+            assert resolve_tier("tier/test", "s1")[0] == "beta-flash"
+
+    def test_stickiness_same_session_same_model(self):
+        with self._env() as log:
+            first = resolve_tier("tier/test", "s9")
+            second = resolve_tier("tier/test", "s9")
+        assert first[1] == "cheapest_qualified"
+        assert second == (first[0], "sticky")
+        reason = log.call_args[0][3]
+        assert reason == "sticky_kept"
+
+    def test_hysteresis_keeps_incumbent_without_decisive_win(self):
+        costs = {"alpha-pro": 0.40, "beta-flash": 0.02}
+        with self._env(costs=costs) as log:
+            assert resolve_tier("tier/test", "s9")[0] == "beta-flash"
+            # Alpha drops to 0.016 $/M — cheaper, but 0.016 >= 0.75*0.02:
+            # not decisive enough to switch mid-sticky-window.
+            costs["alpha-pro"] = 0.016
+            m, r = resolve_tier("tier/test", "s9")
+            assert (m, r) == ("beta-flash", "sticky")
+
+    def test_hysteresis_switches_on_decisive_win(self):
+        costs = {"alpha-pro": 0.40, "beta-flash": 0.02}
+        with self._env(costs=costs) as log:
+            assert resolve_tier("tier/test", "s9")[0] == "beta-flash"
+            costs["alpha-pro"] = 0.01   # < 0.75 * 0.02 — decisive
+            m, r = resolve_tier("tier/test", "s9")
+            assert m == "alpha-pro" and r == "re_resolved_switched"
+            assert log.call_args[0][6] is True   # switched flag
+
+    def test_hysteresis_switches_when_incumbent_unhealthy(self):
+        costs = {"alpha-pro": 0.40, "beta-flash": 0.02}
+        with self._env(costs=costs) as log:
+            assert resolve_tier("tier/test", "s9")[0] == "beta-flash"
+            costs["beta-flash"] = None    # incumbent loses all providers
+            costs["alpha-pro"] = 0.80     # even expensive — it's the only one
+            m, r = resolve_tier("tier/test", "s9")
+            assert m == "alpha-pro" and r == "re_resolved_switched"
+
+    def test_killswitch_pins_including_sticky_sessions(self):
+        with self._env():
+            assert resolve_tier("tier/test", "s9")[0] == "beta-flash"
+        with self._env(killswitch=True):
+            m, r = resolve_tier("tier/test", "s9")
+        assert (m, r) == ("alpha-pro", "killswitch_active")
+        assert "s9" not in flat_router._TIER_STICKINESS
+
+    def test_resolver_error_passes_alias_through(self):
+        with ExitStack() as st:
+            st.enter_context(patch("flat_router._tier_registry",
+                                   return_value=(_TIER_TEST_CFG,
+                                                 _TIER_TEST_BENCH)))
+            st.enter_context(patch(
+                "flat_router._tier_resolve_uncached",
+                side_effect=RuntimeError("boom")))
+            m, r = resolve_tier("tier/test", "s1")
+        assert m == "tier/test" and r == "resolver_error"
+
+    def test_shadow_evaluation_logs_and_rate_limits(self):
+        with self._env() as log:
+            flat_router.shadow_tier_evaluate("glm-5.3", "sess-1")
+            assert log.call_count == 1
+            args = log.call_args[0]
+            assert args[0] == "shadow" and args[1] == "tier/test"
+            assert args[2] == "beta-flash" and args[8] == "glm-5.3"
+            log.reset_mock()
+            # Within shadow_min_interval_seconds — suppressed.
+            flat_router.shadow_tier_evaluate("glm-5.3", "sess-2")
+            assert log.call_count == 0
+            # Past the interval — logged again.
+            flat_router._TIER_SHADOW_TS["tier/test"] -= 301
+            flat_router.shadow_tier_evaluate("glm-5.3", "sess-3")
+            assert log.call_count == 1
+
+    def test_emergency_flags_pin_without_router_consultation(self):
+        """With .emergency_ollama_only active, tier resolution must fall to
+        the configured pin WITHOUT consulting select_provider (the emergency
+        dispatch contract — see TestPhase0Hardening)."""
+        with self._env() as log, \
+                patch("flat_router.os.path.exists",
+                      side_effect=lambda p:
+                          p.endswith(".emergency_ollama_only")):
+            flat_router.select_provider.side_effect = \
+                AssertionError("select_provider must not be consulted")
+            m, r = resolve_tier("tier/test", "sE")
+        assert (m, r) == ("alpha-pro", "flat_router_disabled")
+
+    def test_shadow_silent_in_live_mode(self):
+        cfg = json.loads(json.dumps(_TIER_TEST_CFG))
+        cfg["mode"] = "live"
+        with self._env(cfg=cfg) as log:
+            flat_router.shadow_tier_evaluate("glm-5.3", "sess-1")
+            assert log.call_count == 0
 
 
 if __name__ == "__main__":

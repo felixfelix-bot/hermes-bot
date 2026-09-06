@@ -1,0 +1,91 @@
+# ── model_tiers.yaml — shared tier registry (benchmark-tier resolution) ────
+#	Profiles set model.default: "tier/<name>" instead of a concrete model.
+#	The proxy resolves each tier to the CHEAPEST healthy model that meets
+#	the tier minimums (context, coding_class, tool_use from
+#	model_benchmarks.yaml) AND the live gates (provider health, garbage
+#	demotion, trailing empty-rate).
+#
+#	Resolution contract (see plans/benchmark-tier-model-resolution-2026-09-06.md):
+#	  - stickiness: resolved ONCE per session (X-Hermes-Session), TTL below;
+#	    a conversation never switches models mid-flight.
+#	  - hysteresis: on re-resolution an incumbent model is kept unless it
+#	    fails a gate or a challenger costs < switch_cost_ratio of it.
+#	  - fallback: empty pool -> fallback_model (today's manual pin) — never 503.
+#	  - kill-switch: touch ~/.hermes/bot/.disable_tier_resolution to pin
+#	    every tier to its fallback_model instantly (no restart).
+#	  - concrete model strings are NEVER alias-resolved (permanent escape
+#	    hatch: hard pins keep working).
+#
+#	candidates: explicit allowlist (belt-and-suspenders — a model must ALSO
+#	pass the benchmark minima; two layers, plus tier minima themselves).
+#	Profiles that stay pinned BY DESIGN (do not tier-flip): worker-reviewer-*
+#	(model-comparison duty), kimi-consultant (model-specific), vision
+#	auxiliary (glm-4.6v).
+
+version: 1
+mode: shadow                     # shadow | live — gates the PERIODIC shadow
+                                 # evaluation only. An incoming tier/* alias is
+                                 # always resolved for real (better than a
+                                 # 503 on an unknown model); flipping profiles
+                                 # is what activates live resolution at scale.
+                                 # Phase 1 = NO profile flips: no aliases flow.
+
+hysteresis_switch_cost_ratio: 0.75   # switch incumbent only if challenger < 75% of incumbent cost
+stickiness_ttl_hours: 24
+stickiness_max_sessions: 10000
+shadow_min_interval_seconds: 300    # per-tier shadow evaluation rate limit
+empty_rate_window_hours: 6
+empty_rate_min_samples: 50          # below this: fail-open (gate passes)
+kill_switch_file: .disable_tier_resolution
+
+tiers:
+  tier/manager-min:
+    description: "Manager + delegation duty — highest reliability bar"
+    min_context: 262144
+    min_coding_class: pro
+    min_tool_use: strong
+    max_empty_rate: 0.005
+    candidates:
+      - deepseek/deepseek-v4-pro
+      - deepseek/deepseek-v4-flash
+      - glm-5.3
+      - kimi-k3
+    fallback_model: deepseek/deepseek-v4-flash
+
+  tier/worker-heavy:
+    description: "Inspector/plebeian class — v4-pro grade reasoning today"
+    min_context: 262144
+    min_coding_class: pro
+    min_tool_use: good
+    max_empty_rate: 0.01
+    candidates:
+      - deepseek/deepseek-v4-pro
+      - glm-5.3
+      - kimi-k3
+    fallback_model: deepseek/deepseek-v4-pro
+
+  tier/coding-worker:
+    description: "Fleet workhorse — solid coding class, tool-reliable"
+    min_context: 262144
+    min_coding_class: solid
+    min_tool_use: good
+    max_empty_rate: 0.01
+    candidates:
+      - deepseek/deepseek-v4-flash
+      - deepseek/deepseek-v4-pro
+      - glm-5.2
+      - glm-5.3
+      - kimi-k2.7-code
+      - kimi-k3
+    fallback_model: deepseek/deepseek-v4-flash
+
+  tier/consultant:
+    description: "Reasoning consultant duty — narrow pool by design"
+    min_context: 262144
+    min_coding_class: pro
+    min_tool_use: strong
+    max_empty_rate: 0.005
+    candidates:
+      - kimi-k3
+      - deepseek/deepseek-v4-pro
+    fallback_model: kimi-k3

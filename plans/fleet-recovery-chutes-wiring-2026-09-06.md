@@ -24,32 +24,32 @@ provider-hunt pipeline since failed to deliver: OI contact-gated, Chutes +
 Baidu canaries failed, batch = $0 savings). ~+500M tok/wk at the fleet's
 measured cheapest rate.
 
-- [ ] 0.1. Direct probe the new key (3 tokens, $0) — confirm the 500M weekly
+- [x] 0.1. Direct probe the new key (3 tokens, $0) — confirm the 500M weekly
       pool is live; certificate/plan shape matches $20/mo baseline
-- [ ] 0.2. Same-window probe keys 1–3 — settle the /quota-vs-429 discrepancy
+- [x] 0.2. Same-window probe keys 1–3 — settle the /quota-vs-429 discrepancy
       (did the old pools recover post-06:14?)
-- [ ] 0.3. Store the key (no echo): `OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477`
+- [x] 0.3. Store the key (no echo): `OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477`
       → `~/.hermes/profiles/manager/.env` (600; account-suffix naming per
       the key-3 convention)
-- [ ] 0.4. `zai_proxy.py`: .env-parser elif; `OLLAMA_CLOUD_KEY_4` extraction
+- [x] 0.4. `zai_proxy.py`: .env-parser elif; `OLLAMA_CLOUD_KEY_4` extraction
       + key tuple; `_KEY_COST_MULTIPLIER`; exhausted-marks/quota plumbing;
       (weekly-pool key like #1/#2 — no monthly special-casing)
-- [ ] 0.5. MRE `flat_router.py`: provider entry, price multiplier,
+- [x] 0.5. MRE `flat_router.py`: provider entry, price multiplier,
       billing-regime, routing-priority list, key-set membership checks
-- [ ] 0.6. MRE + bot-mirror `real_price_tracker.py`: `ollama_cloud_4` seed
+- [x] 0.6. MRE + bot-mirror `real_price_tracker.py`: `ollama_cloud_4` seed
       $0.0155/M + per-key measurement entry (MRE = source of truth)
-- [ ] 0.7. `config/providers.yaml` ollama stanza (if per-key entries)
-- [ ] 0.8. Extend tests: env-parser + `_ollama_cloud_key_order` four-key case
-- [ ] 0.9. Full bot suite green (baseline: 12 pre-existing failures)
-- [ ] 0.10. Proxy restart in a quiet gap (watch the manager's ADR-work
+- [x] 0.7. `config/providers.yaml` ollama stanza (if per-key entries)
+- [x] 0.8. Extend tests: env-parser + `_ollama_cloud_key_order` four-key case
+- [x] 0.9. Full bot suite green (baseline: 12 pre-existing failures)
+- [x] 0.10. Proxy restart in a quiet gap (watch the manager's ADR-work
        stream for a lull)
-- [ ] 0.11. Verify: `/quota` shows 4 pools; smoke request lands on key #4
+- [x] 0.11. Verify: `/quota` shows 4 pools; smoke request lands on key #4
        (fullest pool sorts first per remaining-quota order); `key_health`
        row healthy; fresh api_calls 200s with content
-- [ ] 0.12. If keys 1–3 probes passed: also clear their health marks in the
+- [x] 0.12. If keys 1–3 probes passed: also clear their health marks in the
        same restart (restores ~1.5B/wk flat capacity) — else leave marks
        (they're honest) and record the /quota discrepancy on the board
-- [ ] 0.13. Commits: bot (zai_proxy + tests + bot/src mirror + this doc)
+- [x] 0.13. Commits: bot (zai_proxy + tests + bot/src mirror + this doc)
        → push `dr`; MRE (flat_router + tracker + providers.yaml) → its
        remote; plan-doc verification log
 
@@ -89,7 +89,7 @@ measured cheapest rate.
       Reports: `~/merchant-routing-engine/reports/canary/`. Diagnosis
       deferred (defaulted to the manager session's ADR-014 owner of the
       follow-up; possibly temperature/model-variant retry)
-- [ ] P3d. OpenInference: signup is CONTACT-GATED (no self-serve route —
+- [x] P3d. OpenInference: signup is CONTACT-GATED (no self-serve route —
       the site is a JS shell with only /blog /contact /privacy /terms;
       Google's "OpenInference" is a different thing — Arize's telemetry
       SDK). Action: email `markian@openinference.ai` (draft for Felix to
@@ -98,7 +98,7 @@ measured cheapest rate.
 
 ## Phase 4 — Systemic follow-ups
 
-- [ ] P4a. Board task on `router-maintenance`: the **/quota-vs-key-state
+- [x] P4a. Board task on `router-maintenance`: the **/quota-vs-key-state
       discrepancy** + stale-health recovery — /quota says pools full while
       keys 429; exhausted keys need a re-probe loop against live pool state
       (weekly reset must not require a proxy restart to recover)
@@ -136,3 +136,31 @@ measured cheapest rate.
 - 06:29/06:32 Traffic: openrouter 21× + NW 30× (glm-5.2 relief + deepseek),
   zero empties, zero routstrd. NW: 89.6% used, 8.9 kWh left, $1.03/$10 day.
 - 06:49 Chutes canaries ×2 FAILED (75% / ~65% vs 90% bar) — gate held.
+
+## Verification log (Phase 0 execution, 06:4x–07:0x)
+
+- 06:41 Key probes: key #4 → **HTTP 200 (live, 500M pool)**; keys 1–3 →
+      live 429s (marks honest; /quota-vs-reality mismatch documented).
+- 06:44 Key stored (`OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477`, no echo).
+- 06:45-06:56 Wiring: zai_proxy (parser, key set, paywall flags, quota/
+      health/fallback/shadow maps, ×4 dispatch gates, snapshot payload),
+      MRE flat_router + real_price_tracker (both copies), providers.yaml
+      note. 14 code touchpoints total.
+- 06:58 Tests: 11 pool/cap tests + oc3 fixtures updated for 4-key order;
+      full suite **505 pass / 12 baseline failures** (identical set).
+- 06:49 Quiet-gap proxy restart (traffic ≤1 call/45s); active + healthy.
+- 07:0x Post-restart: `/quota` shows **4 pools**; keyHealth oc4 row
+      healthy=1/0 fails; **3/3 deepseek smokes served by ollama_cloud_4
+      (200, deepseek-v4-flash:0731)** — fresh pool enters rotation first
+      exactly as designed; glm-5.3 stays on the free z.ai lane; zero
+      routstrd rows (Phase 2 holds).
+- 07:1x Commits: bot `831587d` on dr main (worker-branch cherry-pick +
+      autostash rebase over the concurrent session's d0657de); MRE
+      `363a575` (lane + chutes canary evidence). Board task `t_30dde4c7`
+      created (quota-view mismatch). OI email draft in MRE
+      docs/provider-hunt/OPENINFERENCE-ONBOARDING-EMAIL-2026-09-06.md.
+
+Remaining open items: P4b (NW top-up watch), P4c (key rotations —
+OR/Chutes/ollama#4 live in transcripts), T2b Baidu canary re-run,
+T2c Chutes TEE diagnosis, T3 demand-side QS tasks (D4 cache-hit
+accounting first).

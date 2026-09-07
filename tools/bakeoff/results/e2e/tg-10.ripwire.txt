@@ -1,0 +1,3 @@
+The file named `spilman_mock_mint.rs` is the direct match for "Spilman mock mint integration."
+
+./crates/tollgate-net/tests/spilman_mock_mint.rs

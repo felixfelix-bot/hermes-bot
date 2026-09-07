@@ -1,0 +1,5 @@
+The top hit resolves tier→provider/model. The concrete resolution is `resolve_tier` in `flat_router.py`, which delegates to `_tier_resolve_uncached` and `_tier_registry`.
+
+- /home/c03rad0r/.hermes/bot/flat_router.py
+
+The alias `tier/coding-worker` itself is used as `DIGEST_MODEL` in session_archiver.py, but the resolution is in flat_router.py. Primary answer: flat_router.py.

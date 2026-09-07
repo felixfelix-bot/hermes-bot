@@ -1,0 +1,3 @@
+Confirmed. `_tier_log_resolution()` (flat_router.py:1226) is what records tier-resolution decisions into the `tier_resolutions` table of `zai_usage.db`. It's defined in flat_router.py, and all calls (resolve_tier at 1314) are in the same file.
+
+flat_router.py

@@ -1,0 +1,35 @@
+CMD: graphify explain resolve_tier
+RC: 0  ERR: 
+
+Node: resolve_tier()
+  ID:        flat_router_resolve_tier
+  Source:    flat_router.py L1314
+  Type:      code
+  Community: Model Tier Resolution
+  Degree:    28
+
+Connections (28):
+  <-- zai_proxy.py [imports] [EXTRACTED] zai_proxy.py:L563
+  --> select_provider() [calls] [EXTRACTED] flat_router.py:L1345
+  <-- flat_router.py [contains] [EXTRACTED] flat_router.py:L1314
+  <-- test_flat_router.py [imports] [EXTRACTED] test_flat_router.py:L1329
+  --> _tier_resolve_uncached() [calls] [EXTRACTED] flat_router.py:L1349
+  --> _tier_registry() [calls] [EXTRACTED] flat_router.py:L1321
+  --> _tier_killswitch_active() [calls] [EXTRACTED] flat_router.py:L1333
+  --> _tier_log_resolution() [calls] [EXTRACTED] flat_router.py:L1335
+  <-- .test_emergency_flags_pin_without_router_consultation() [calls] [EXTRACTED] test_flat_router.py:L1577
+  <-- _tier_alias_resolve() [calls] [EXTRACTED] zai_proxy.py:L564
+  <-- .test_allowlist_and_benchmark_entry_filters() [calls] [EXTRACTED] test_flat_router.py:L1453
+  <-- .test_cheapest_qualified_wins() [calls] [EXTRACTED] test_flat_router.py:L1483
+  <-- .test_coding_class_filter() [calls] [EXTRACTED] test_flat_router.py:L1433
+  <-- .test_concrete_models_pass_through_untouched() [calls] [EXTRACTED] test_flat_router.py:L1409
+  <-- .test_context_window_filter() [calls] [EXTRACTED] test_flat_router.py:L1423
+  <-- .test_empty_rate_gate_excludes_sick_model() [calls] [EXTRACTED] test_flat_router.py:L1465
+  <-- .test_empty_rate_gate_fails_open_on_thin_data() [calls] [EXTRACTED] test_flat_router.py:L1473
+  <-- .test_hysteresis_keeps_incumbent_without_decisive_win() [calls] [EXTRACTED] test_flat_router.py:L1507
+  <-- .test_hysteresis_switches_on_decisive_win() [calls] [EXTRACTED] test_flat_router.py:L1517
+  <-- .test_hysteresis_switches_when_incumbent_unhealthy() [calls] [EXTRACTED] test_flat_router.py:L1526
+  ... and 8 more
+  Grouped by file:
+    <-- test_flat_router.py: 7 connections
+    <-- flat_router.py: 1 connection

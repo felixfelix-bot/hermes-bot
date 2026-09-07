@@ -1,0 +1,828 @@
+CMD: rg -i --no-heading -n -m 50 FreqGate .
+RC: 0  ERR: 
+
+./firmware/e80-stm32-bench/tools/test_e80_bench_ctl.py:448:class FreqGateTests(unittest.TestCase):
+
+<<<naive-read ./firmware/e80-stm32-bench/tools/test_e80_bench_ctl.py>>>
+#!/usr/bin/env python3
+"""Host tests for e80_bench_ctl.py — pure functions, CSV, gates, dry-run and a
+FakeBoard-driven matrix run (no serial hardware; plan §5 offline surface).
+
+Run:  python3 -m unittest test_e80_bench_ctl -v
+"""
+import argparse
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import e80_bench_ctl as m  # noqa: E402
+
+
+def make_args(**kw):
+    """argparse.Namespace with every field the tool touches."""
+    base = dict(
+        tx="/dev/ttyUSB3", rx="/dev/ttyUSB4", freq=915000000, n=1000,
+        length=255, gap_us=5000, dbm=22, dry_run=False,
+        matrix=["flrc650", "flrc2600", "sf7", "sf12"], anchor=True,
+        csv=None, band_override=True, site="siteA", stop="S3", dist_m="200",
+        repeat=2, gps_tx="52.01,4.04", gps_rx="52.02,4.01", h_tx="1.5",
+        h_rx="1.5", ground="grass", weather="12C clear", t0=None,
+        t0_margin=120, guard=20, rx_lead=10, settle=2, skip_fw_check=True,
+        # Distributed / preset-mode fields
+        mode=None, configs=None, port=None, probe=None, session_id=None,
+        tx_log="tx-log.csv", rx_log="rx-log.csv",
+        skip_late_configs=False,
+        prime_discard=2,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+class FakeBoard:
+    """Stateful firmware stand-in: one shared world dict per (port) side."""
+
+    def __init__(self, port, world):
+        self.port = port
+        self.world = world            # {'tx': {...}, 'rx': {...}}
+        self.side = "tx" if "ttyUSB3" in port else "rx"
+        self.log = []
+
+    # console API used by the tool
+    def drain(self):
+        pass
+
+    def close(self):
+        self.log.append("CLOSE")
+
+    def cmd(self, line, expect_ok=True, timeout=15.0):
+        return self._reply(line, expect_ok)
+
+    def query(self, line, prefixes=("OK", "ERR", "STAT", "ID"), timeout=15.0):
+        return self._reply(line, True)
+
+    def stat(self):
+        return self._reply("STAT?", True)
+
+    # firmware model
+    def _reply(self, line, expect_ok):
+        self.log.append(line)
+        w = self.world[self.side]
+        if line == "ID?":
+            band = "OVERRIDE" if w.get("band_override") else "863-870MHz"
+            pcap = "+22dBm(OUTDOOR)" if w.get("power_outdoor") else "+10dBm"
+            role = {"tx": "TX", "rx": "RX"}[self.side]
+            return ("ID E80BENCH v1.0 role={} armed=1 mod=flrc br=650000 "
+                    "freq={} band={} pa=22 pcap={} chip=2.1 radio=awake"
+                    .format(role, w["freq"], band, pcap))
+        if line == "STAT?":
+            n = w["n"]
+            if self.side == "tx":
+                return ("STAT role=TX sent={} sent_ok={} rx=0 crc_err=0 "
+                        "per_x1e6=0 elapsed_s=42.0 kbps=64 rssi_avg_dbm=0.0 "
+                        "snr_avg_db=0.0 drops=0".format(n, n))
+            rx = w.get("rx_ok", n - 3)
+            return ("STAT role=RX sent=0 sent_ok=0 rx={} crc_err=1 "
+                    "per_x1e6=300 per_ci_x1e6=[100,900] elapsed_s=42.5 "
+                    "kbps=63 rssi_avg_dbm=-87.5 snr_avg_db=9.8 drops=0"
+                    .format(rx))
+        if line.startswith("BAND OVERRIDE"):
+            assert line == "BAND OVERRIDE 2026", line
+            w["band_override"] = True
+            return "OK BAND OVERRIDE PIN 2026 ACCEPTED"
+        if line.startswith("POWER MODE OUTDOOR"):
+            assert line == "POWER MODE OUTDOOR 2026", line
+            w["power_outdoor"] = True
+            return "OK POWER MODE OUTDOOR PIN 2026 ACCEPTED"
+        if line.startswith("FREQ"):
+            hz = int(line.split()[1])
+            lo, hi = (410000000, 2483500000) if w.get("band_override") \
+                else (863000000, 870000000)
+            if not lo <= hz <= hi:
+                reply = "ERR BAND (EU SRD 863-870MHZ ONLY)"
+                if expect_ok:
+                    raise RuntimeError("{} rejected '{}': {}".format(self.port, line, reply))
+                return reply
+            w["freq"] = hz
+            return "OK FREQ {}".format(hz)
+        if line == "ROLE TX":
+            w["role"] = "tx"
+            return "OK ROLE TX (TX INHIBITED - SEND 'ARM TX' TO ENABLE)"
+        if line == "ROLE RX":
+            w["role"] = "rx"
+            return "OK ROLE RX (CONTINUOUS)"
+        if line == "ROLE NONE":
+            w["role"] = "none"
+            return "OK ROLE NONE (RADIO ASLEEP)"
+        if line == "ARM TX":
+            return "OK ARMED (TX ENABLED)"
+        if line.startswith("MOD"):
+            return "OK MOD"
+        if line.startswith("PA"):
+            if not w.get("power_outdoor") and int(line.split()[1]) > 10:
+                reply = "ERR RANGE (INDOOR CAP 0-10 DBM)"
+                if expect_ok:
+                    raise RuntimeError("{} rejected '{}': {}".format(self.port, line, reply))
+                return reply
+            return "OK PA {} DBM".format(line.split()[1])
+        if line.startswith("START"):
+            return "OK START"
+        if line == "STOP":
+            return "OK STOP (RADIO ASLEEP)"
+        raise AssertionError("FakeBoard: unhandled line {!r}".format(line))
+
+
+class VirtualClock:
+    def __init__(self, t0):
+        self.t = float(t0)
+
+    def now(self):
+        return self.t
+
+    def sleep(self, d):
+        self.t += max(0.0, d)
+
+
+class AirtimeTests(unittest.TestCase):
+    def test_plan_table_51b(self):
+        # plan §3: 0.7 ms / 0.2 ms / 0.1 s / 2.5 s for 51 B
+        self.assertTrue(0.0006 <= m.airtime_s("flrc650", 51) <= 0.0010)
+        self.assertTrue(0.00015 <= m.airtime_s("flrc2600", 51) <= 0.0004)
+        self.assertTrue(0.090 <= m.airtime_s("sf7", 51) <= 0.120)
+        self.assertTrue(2.2 <= m.airtime_s("sf12", 51) <= 2.8)
+
+    def test_anchor_255b_flrc650(self):
+        self.assertTrue(0.0029 <= m.airtime_s("flrc650", 255) <= 0.0036)
+
+    def test_unknown_mod_raises(self):
+        with self.assertRaises(ValueError):
+            m.airtime_s("fsk", 51)
+
+
+class NRegimeTests(unittest.TestCase):
+    def test_no_prior_rows_is_s0_rule(self):
+        self.assertEqual(m.n_for_mod("flrc650", []), 10000)
+
+    def test_ci_hi_le_2pct_gives_1e4(self):
+        rows = [dict(mod="flrc650", len="51", per_ci_hi="1.500000")]
+        self.assertEqual(m.n_for_mod("flrc650", rows), 10000)
+
+    def test_ci_hi_gt_2pct_gives_1e3(self):
+        rows = [dict(mod="flrc650", len="51", per_ci_hi="5.000000")]
+        self.assertEqual(m.n_for_mod("flrc650", rows), 1000)
+
+    def test_sf12_capped_always(self):
+        rows = [dict(mod="sf12", len="51", per_ci_hi="0.100000")]
+        self.assertEqual(m.n_for_mod("sf12", rows), 1000)
+        self.assertEqual(m.n_for_mod("sf12", []), 1000)
+
+    def test_anchor_len255_rows_ignored(self):
+        rows = [dict(mod="flrc650", len="255", per_ci_hi="0.100000"),
+                dict(mod="flrc650", len="51", per_ci_hi="9.000000")]
+        self.assertEqual(m.n_for_mod("flrc650", rows), 1000)
+
+    def test_latest_row_wins(self):
+        rows = [dict(mod="sf7", len="51", per_ci_hi="9.000000"),
+                dict(mod="sf7", len="51", per_ci_hi="0.500000")]
+        self.assertEqual(m.n_for_mod("sf7", rows), 10000)
+
+    def test_other_mods_do_not_leak(self):
+        rows = [dict(mod="flrc2600", len="51", per_ci_hi="0.100000")]
+        self.assertEqual(m.n_for_mod("sf7", rows), 10000)  # no sf7 row -> S0 rule
+
+
+class MatrixCellTests(unittest.TestCase):
+    def test_default_matrix_plus_anchor(self):
+        cells = m.build_matrix_cells(make_args(matrix=m.MATRIX_KEYS), [])
+        self.assertEqual([c["key"] for c in cells],
+                         ["flrc650", "flrc2600", "sf7", "sf12", "flrc650"])
+        self.assertEqual([c["len_bytes"] for c in cells],
+                         [51, 51, 51, 51, 255])
+        self.assertEqual([c["gap_us"] for c in cells],
+                         [5000, 5000, 1000, 1000, 5000])
+        self.assertEqual([c["n"] for c in cells],
+                         [10000, 10000, 10000, 1000, 10000])
+        self.assertTrue(cells[-1]["anchor"])
+        self.assertFalse(cells[0]["anchor"])
+
+    def test_no_anchor(self):
+        cells = m.build_matrix_cells(make_args(matrix=["sf7"], anchor=False), [])
+        self.assertEqual(len(cells), 1)
+
+    def test_explicit_length_respected(self):
+        # single-shot CSV rows carry the actual payload length
+        self.assertEqual(m.make_cell("flrc650", 1000, length=255)["len_bytes"], 255)
+        self.assertEqual(m.make_cell("flrc650", 1000)["len_bytes"], 51)
+
+    def test_edge_regime_from_prior_rows(self):
+        rows = [dict(mod=k, len="51", per_ci_hi="5.0") for k in m.MATRIX_KEYS]
+        cells = m.build_matrix_cells(make_args(), rows)
+        self.assertEqual([c["n"] for c in cells],
+                         [1000, 1000, 1000, 1000, 10000])
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_monotonic_with_margin_and_guard(self):
+        cells = m.build_matrix_cells(make_args(matrix=["flrc650", "sf7"]), [])
+        t0 = m.parse_t0("2026-08-30 14:05:00")
+        starts = m.build_stop_schedule(cells, t0, t0_margin_s=120, guard_s=20)
+        self.assertEqual(starts[0], t0 + 120)
+        self.assertTrue(all(b > a for a, b in zip(starts, starts[1:])))
+        self.assertGreaterEqual(starts[1] - starts[0],
+                                cells[0]["expected_s"] + 20)
+
+    def test_parse_t0_formats(self):
+        # Space-separator with seconds (primary documented format)
+        self.assertEqual(m.parse_t0("2026-08-30 14:05:00"),
+                         m.parse_t0("2026-08-30 14:05"))
+        # Epoch integer (timezone-safe, used for distributed tests)
+        epoch = m.parse_t0("2026-08-30 14:05:00")
+        self.assertEqual(m.parse_t0(str(int(epoch))), epoch)
+        with self.assertRaises(ValueError):
+            m.parse_t0("tomorrow")
+
+
+class LateSkipTests(unittest.TestCase):
+    """Tests for compute_late_skip() + apply_late_skip() — the launch-lateness
+    guard added per docs/timing-tolerance-analysis.md §6.
+
+    These functions replace the previous silent-desync behaviour of
+    wait_until() (which no-ops on past timestamps) with a clear abort by
+    default, or an optional explicit recovery via --skip-late-configs.
+
+    All tests use synthetic schedules so they're independent of wall-clock
+    time (compute_late_skip is a pure function — no time.time()).
+    """
+
+    def _synthetic_schedule(self):
+        """4-config preset schedule with starts at offsets
+        120, 220, 320, 420 (relative to T0)."""
+        t0 = 1000
+        starts = [t0 + 120, t0 + 220, t0 + 320, t0 + 420]
+        cfgs = [
+            {"label": "cfg0"},
+            {"label": "cfg1"},
+            {"label": "cfg2"},
+            {"label": "cfg3"},
+        ]
+        return t0, starts, cfgs
+
+    # ---------- compute_late_skip pure function ----------
+
+    def test_on_time_returns_zero(self):
+        """Well-before-time launch → no skip needed (returns 0)."""
+        t0, starts, _ = self._synthetic_schedule()
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 10, rx_lead=0),
+            0,
+            "On-time launch must return index 0 (no skip needed)",
+        )
+
+    def test_late_launch_skips_past_starts(self):
+        """Launched well past cfg 0 + cfg 1 → returns the next future index."""
+        t0, starts, _ = self._synthetic_schedule()
+        # now = T0+250: cfg 0 (1120) past, cfg 1 (1220) past, cfg 2 (1320)
+        # future. min_ahead_s=5 → (1320 - 0) >= 1255? Yes → returns 2.
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 250, rx_lead=0),
+            2,
+        )
+
+    def test_all_past_returns_none(self):
+        """When even the last config's arm point is in the past → None
+        (operator must re-T0)."""
+        t0, starts, _ = self._synthetic_schedule()
+        self.assertIsNone(
+            m.compute_late_skip(starts, now=t0 + 9999, rx_lead=0),
+        )
+
+    def test_rx_lead_subtraction(self):
+        """RX uses rx_lead: each effective arm point is `start - rx_lead`.
+        A start that would be a valid join-point for TX (rx_lead=0) may be
+        too-late-to-arm for RX (rx_lead=10) — must skip one extra. Need
+        a `now` value where the only difference between TX and RX is the
+        skip count, demonstrating that rx_lead is correctly subtracted."""
+        t0, starts, _ = self._synthetic_schedule()
+        # starts = [1120, 1220, 1320, 1420], min_ahead_s=5 (default)
+        # Pick now = T0+310 = 1310 → earliest acceptable arm point = 1315:
+        #   TX (rx_lead=0): starts[2]=1320 >= 1315 → returns 2
+        #   RX (rx_lead=10): starts[2]-10=1310 < 1315 → must skip;
+        #                    starts[3]-10=1410 >= 1315 → returns 3
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 310, rx_lead=0),
+            2,
+        )
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 310, rx_lead=10),
+            3,
+        )
+
+    def test_min_ahead_s_prevents_racing_init(self):
+        """Without min_ahead_s, a start 1s in the future would be returned
+        but the local machine can't possibly board-open + configure in time.
+        With min_ahead_s=5, must skip to the next future start."""
+        t0, starts, _ = self._synthetic_schedule()
+        # now = T0 + 318; for TX (rx_lead=0): start T0+320 is only 2s in the
+        # future (< min_ahead_s=5), so must be skipped.
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 318, rx_lead=0,
+                                min_ahead_s=5.0),
+            3,
+            "start 2 is only 2s ahead — below min_ahead_s=5, must skip to 3",
+        )
+        # With min_ahead_s=1 (tight), start 2 (2s ahead) is acceptable.
+        self.assertEqual(
+            m.compute_late_skip(starts, now=t0 + 318, rx_lead=0,
+                                min_ahead_s=1.0),
+            2,
+        )
+
+    # ---------- apply_late_skip wrapper (calls sys.exit on abort) ----------
+
+    def test_apply_late_skip_on_time_no_mutation(self):
+        """On-time launch returns the same lists unchanged."""
+        _, starts, cfgs = self._synthetic_schedule()
+        c, s = m.apply_late_skip(cfgs, starts, now=1010, rx_lead=0,
+                                 mode_label="TX")
+        self.assertEqual(c, cfgs)
+        self.assertEqual(s, starts)
+
+    def test_apply_late_skip_aborts_when_not_skipping(self):
+        """Late launch without --skip-late-configs raises SystemExit with an
+        actionable message."""
+        t0, starts, cfgs = self._synthetic_schedule()
+        with self.assertRaises(SystemExit) as cm:
+            m.apply_late_skip(cfgs, starts, now=t0 + 250, rx_lead=0,
+                              skip_late=False, mode_label="TX")
+        msg = str(cm.exception)
+        self.assertIn("TX", msg)
+        self.assertIn("configs 0..1", msg)
+        self.assertIn("--skip-late-configs", msg)
+        self.assertIn("cfg2", msg)
+
+    def test_apply_late_skip_recovers_when_skip_late(self):
+        """--skip-late-configs slices cfgs/starts to the first future start
+        and prints a [LATE] notice."""
+        t0, starts, cfgs = self._synthetic_schedule()
+        # Capture stdout for the [LATE] notice
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            c, s = m.apply_late_skip(cfgs, starts, now=t0 + 250,
+                                     rx_lead=0, skip_late=True,
+                                     mode_label="TX")
+        self.assertEqual(len(c), 2, "Should recover cfg 2 and cfg 3")
+        self.assertEqual(c[0]["label"], "cfg2")
+        self.assertEqual(c[1]["label"], "cfg3")
+        self.assertEqual(s[0], starts[2])
+        notice = buf.getvalue()
+        self.assertIn("[LATE - TX]", notice)
+        self.assertIn("Skip", notice)
+        self.assertIn("cfg2", notice)
+
+    def test_apply_late_skip_all_past_aborts_with_reT0(self):
+        """When all starts are in the past, abort with a re-T0 message
+        even if --skip-late-configs is set (nothing to skip to)."""
+        t0, starts, cfgs = self._synthetic_schedule()
+        with self.assertRaises(SystemExit) as cm:
+            m.apply_late_skip(cfgs, starts, now=t0 + 9999, rx_lead=0,
+                              skip_late=True, mode_label="RX")
+        msg = str(cm.exception)
+        self.assertIn("RX", msg)
+        self.assertIn("Re-set T0", msg)
+
+    # ---------- End-to-end: against real build_preset_schedule ----------
+
+    def test_integration_with_real_preset_schedule(self):
+        """Smoke test the helper against the real production schedule
+        builder, to confirm the contract is honoured (start - rx_lead >=
+        now + min_ahead_s, indices into the cfgs list line up)."""
+
+        class MockArgs:
+            t0 = 1747000000  # arbitrary epoch ts
+            t0_margin = 120
+            guard = 20
+            rx_lead = 10
+            settle = 2
+            swd_reset_s = 10
+
+        # Build a minimal synthetic preset (2 configs, distinct mod/sf so
+        # they trigger _mod_params_changed; expected_s ~ 30 and 60 each).
+        cfgs = [
+            {"label": "f650", "mod": "flrc", "sf": None, "br": 650,
+             "bw": None, "pa": 10, "freq": 868000000, "plen": 51,
+             "gap": 5000, "n_pkts": 100, "airtime_s": 0.001,
+             "expected_s": 30.0, "idx": 0},
+            {"label": "sf7", "mod": "lora", "sf": 7, "br": None,
+             "bw": 125, "pa": 10, "freq": 868000000, "plen": 51,
+             "gap": 1000, "n_pkts": 100, "airtime_s": 0.06,
+             "expected_s": 60.0, "idx": 1},
+        ]
+        starts = m.build_preset_schedule(
+            cfgs, MockArgs.t0,
+            t0_margin=MockArgs.t0_margin, guard=MockArgs.guard,
+            settle=MockArgs.settle, rx_lead=MockArgs.rx_lead,
+            swd_reset_s=MockArgs.swd_reset_s,
+        )
+        # Sanity: starts[0] = T0 + 120
+        self.assertEqual(starts[0], MockArgs.t0 + 120)
+        # starts[1] = starts[0] + 30(expected) + 2(settle) + 20(guard)
+        #           + 10(rx_lead) + 10(extra: swd_reset_s, since flrc->lora
+        #                          is a mod change) = starts[0] + 72
+        self.assertEqual(starts[1], starts[0] + 72)
+
+        # On-time: now < T0+120-10-5
+        self.assertEqual(
+            m.compute_late_skip(starts, now=MockArgs.t0 + 100,
+                                rx_lead=10),
+            0,
+        )
+
+        # Late: now falls between starts[0] and starts[1] (past cfg 0,
+        # in time for cfg 1 with rx_lead room).
+        late_now = starts[0] + 40  # 40s after cfg 0 started
+        self.assertEqual(
+            m.compute_late_skip(starts, now=late_now, rx_lead=10),
+            1,
+        )
+
+
+class FreqGateTests(unittest.TestCase):
+    def test_eu_default(self):
+        ok, _ = m.freq_gate(868000000, False)
+        self.assertTrue(ok)
+        ok, msg = m.freq_gate(915000000, False)
+        self.assertFalse(ok)
+        self.assertIn("--band-override", msg)
+
+    def test_override_window(self):
+        # Override window is the full LR2021 dual-band range 410-2483.5 MHz
+        # (sub-GHz LF + 2.4 GHz HF path), matching E80_BENCH_OVERRIDE_*_HZ.
+        for hz in (410000000, 868000000, 915000000, 960000000,
+                   961000000, 2400000000, 2483500000):
+            ok, _ = m.freq_gate(hz, True)
+            self.assertTrue(ok, hz)
+        for hz in (409000000, 2484000000):
+            ok, _ = m.freq_gate(hz, True)
+            self.assertFalse(ok, hz)
+
+
+class ParseStatTests(unittest.TestCase):
+    FW_TX = ("STAT role=TX sent=10000 sent_ok=10000 rx=0 crc_err=0 "
+             "per_x1e6=0 elapsed_s=82.4 kbps=210 rssi_avg_dbm=0.0 "
+             "snr_avg_db=0.0 drops=0")
+    FW_RX = ("STAT role=RX sent=0 sent_ok=0 rx=9970 crc_err=3 per_x1e6=3000 "
+             "per_ci_x1e6=[19000,33000] elapsed_s=42.5 kbps=63 "
+             "rssi_avg_dbm=-87.5 snr_avg_db=9.8 drops=0")
+
+    def test_firmware_tx_line(self):
+        s = m.parse_stat(self.FW_TX)
+        self.assertEqual(s["sent"], 10000)
+        self.assertEqual(s["sent_ok"], 10000)
+        self.assertEqual(s["recv"], 0)
+        self.assertIsNone(s["per_ci_lo_pct"])
+
+    def test_firmware_rx_line(self):
+        s = m.parse_stat(self.FW_RX)
+        self.assertEqual(s["recv"], 9970)
+        self.assertEqual(s["crc_err"], 3)
+        self.assertAlmostEqual(s["per_pct"], 0.3)
+        self.assertAlmostEqual(s["per_ci_lo_pct"], 1.9)
+        self.assertAlmostEqual(s["per_ci_hi_pct"], 3.3)
+        self.assertEqual(s["rssi"], -87.5)
+        self.assertEqual(s["snr"], 9.8)
+        self.assertEqual(s["kbps"], 63)
+        self.assertEqual(s["elapsed_s"], 42.5)
+        self.assertEqual(s["drops"], 0)
+
+    def test_legacy_shape_tolerated(self):
+        s = m.parse_stat("OK STAT sent=100 recv=99 per=1.0 rssi=-90 snr=8 "
+                         "per_ci_lo=0.4 per_ci_hi=2.2 kbps=42")
+        self.assertEqual(s["sent"], 100)
+        self.assertEqual(s["recv"], 99)
+        self.assertAlmostEqual(s["per_pct"], 1.0)
+        self.assertAlmostEqual(s["per_ci_hi_pct"], 2.2)
+
+
+class CsvLogTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "camp.csv")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_header_written_once(self):
+        log = m.CsvLog(self.path)
+        log2 = m.CsvLog(self.path)   # append-only: no duplicate header
+        with open(self.path) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].split(","), m.CSV_COLUMNS)
+        self.assertEqual(len(m.CSV_COLUMNS), 19)
+
+    def test_meta_and_row_roundtrip(self):
+        args = make_args(csv=self.path)
+        log = m.CsvLog(self.path)
+        log.stop_meta(args, id_tx="ID ... band=OVERRIDE", id_rx="ID ...",
+                      t0_str="2026-08-30T14:05:00")
+        cell = m.make_cell("flrc650", 10000)
+        rx_stat = m.parse_stat(ParseStatTests.FW_RX)
+        tx_stat = m.parse_stat(ParseStatTests.FW_TX)
+        row = log.cell_row(args, cell, rx_stat, tx_stat, ts="2026-08-30T14:07:33")
+        with open(self.path) as f:
+            lines = [ln.rstrip("\n") for ln in f]
+        self.assertTrue(lines[1].startswith("# STOP site=siteA stop=S3 dist_m=200"))
+        self.assertTrue(any(ln.startswith("# gps_tx=52.01,4.04") for ln in lines))
+        self.assertTrue(any(ln.startswith("# id_tx: ID ... band=OVERRIDE") for ln in lines))
+        data = [ln for ln in lines if not ln.startswith("#") and ln != lines[0]]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0].split(",")[0:9],
+                         ["siteA", "S3", "200", "2", "flrc650", "51", "22",
+                          "915000000", "10000"])
+        toks = data[0].split(",")
+        self.assertEqual(toks[10], "9970")          # recv
+        self.assertEqual(toks[11], "0.300000")      # per pct
+        self.assertEqual(toks[12], "1.900000")
+        self.assertEqual(toks[13], "3.300000")
+        self.assertEqual(toks[14], "-87.5")
+        self.assertEqual(toks[18], "2026-08-30T14:07:33")
+
+    def test_read_prior_rows_feeds_n_regime(self):
+        args = make_args(csv=self.path)
+        log = m.CsvLog(self.path)
+        cell = m.make_cell("sf7", 1000)
+        rx_stat = m.parse_stat(ParseStatTests.FW_RX)
+        tx_stat = m.parse_stat(ParseStatTests.FW_TX)
+        log.cell_row(args, cell, rx_stat, tx_stat)
+        rows = m.read_prior_rows(self.path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(m.n_for_mod("sf7", rows), 1000)   # ci_hi 3.3% > 2%
+
+    def test_abort_comment(self):
+        log = m.CsvLog(self.path)
+        log.abort("KeyboardInterrupt: ")
+        with open(self.path) as f:
+            self.assertIn("# ABORT", f.read())
+
+
+class ScriptBuilderTests(unittest.TestCase):
+    def test_single_shot_default_kept(self):
+        tx, rx = m.build_script(make_args(matrix=None, band_override=False,
+                                          dbm=10, freq=868000000,
+                                          prime_discard=0))
+        self.assertNotIn("BAND OVERRIDE 2026", tx)
+        self.assertEqual(tx[0], "ID?")
+        self.assertIn("ARM TX", tx)
+        self.assertIn("START N=1000 LEN=255 GAP=5000", tx)
+
+    def test_single_shot_unlock_prelude(self):
+        tx, _ = m.build_script(make_args(matrix=None, prime_discard=0))
+        i_band, i_freq = tx.index("BAND OVERRIDE 2026"), tx.index("FREQ 915000000")
+        i_pow = tx.index("POWER MODE OUTDOOR 2026")
+        self.assertTrue(i_band < i_freq and i_pow < i_freq)
+
+
+class DryRunTests(unittest.TestCase):
+    def _main(self, argv):
+        old_argv = sys.argv
+        sys.argv = ["e80_bench_ctl.py"] + argv
+        buf, err = io.StringIO(), io.StringIO()
+        code = 0
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                m.main()
+        except SystemExit as e:
+            if isinstance(e.code, str):      # sys.exit("msg") -> stderr text
+                err.write(e.code + "\n")
+                code = 1
+            else:
+                code = e.code or 0
+        finally:
+            sys.argv = old_argv
+        return code, buf.getvalue() + err.getvalue()
+
+    def test_full_matrix_dry_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            csv_path = os.path.join(d, "camp.csv")
+            code, out = self._main([
+                "--dry-run", "--matrix", "flrc650,flrc2600,sf7,sf12",
+                "--csv", csv_path, "--site", "siteA", "--stop", "S3",
+                "--dist-m", "200", "--repeat", "2",
+                "--freq", "915000000", "--dbm", "22", "--band-override",
+                "--t0", "2026-08-30 14:05:00",
+                "--prime-discard", "0"])
+            self.assertEqual(code, 0)
+            for needle in ("cell 1 FLRC-650 N=10000 LEN=51",
+                           "cell 4 LoRa-SF12 N=1000",
+                           "cell 5 FLRC-650 N=10000 LEN=255",
+                           "BAND OVERRIDE 2026",
+                           "POWER MODE OUTDOOR 2026",
+                           "MOD loRa 12 125",
+                           "START N=1000 LEN=51 GAP=1000",
+                           "START N=10000 LEN=255 GAP=5000",
+                           "T0+00:00:30",           # margin 30 s
+                           "ROLE NONE",
+                           "SF12 time cap"):
+                self.assertIn(needle, out, needle)
+            self.assertFalse(os.path.exists(csv_path))  # dry-run writes nothing
+
+    def test_bad_matrix_token_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, out = self._main([
+                "--dry-run", "--matrix", "flrc650,fsk", "--freq", "915000000",
+                "--band-override", "--csv", os.path.join(d, "c.csv")])
+            self.assertNotEqual(code, 0)
+            self.assertIn("unknown --matrix entry(ies) fsk", out)
+
+    def test_freq_gate_rejects_915_without_override(self):
+        code, out = self._main(["--dry-run", "--freq", "915000000"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("--band-override", out)
+
+
+class MatrixLiveTests(unittest.TestCase):
+    """run_matrix() against FakeBoard + VirtualClock — no serial hardware."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.csv_path = os.path.join(self.dir.name, "camp.csv")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _run(self, world=None, **kw):
+        world = world or {"tx": {"freq": 868000000, "n": 10000},
+                          "rx": {"freq": 868000000, "n": 10000}}
+        boards = {}
+
+        def board_cls(port):
+            b = FakeBoard(port, world)
+            boards[port] = b
+            return b
+
+        t0 = m.parse_t0("2026-08-30 14:05:00")
+        clock = VirtualClock(t0 - 60)
+        args = make_args(csv=self.csv_path, matrix=["flrc650", "sf7"],
+                         anchor=True, t0="2026-08-30 14:05:00",
+                         prime_discard=0, **kw)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.run_matrix(args, board_cls=board_cls,
+                         sleep_fn=clock.sleep, now_fn=clock.now)
+        return boards, world, clock
+
+    def test_happy_path_915_band_override(self):
+        boards, world, clock = self._run()
+        tx, rx = boards["/dev/ttyUSB3"], boards["/dev/ttyUSB4"]
+
+        # unlock order: BAND/POWER before FREQ; ROLE TX before ARM TX
+        txlog = tx.log
+        self.assertLess(txlog.index("BAND OVERRIDE 2026"),
+                        txlog.index("FREQ 915000000"))
+        self.assertLess(txlog.index("POWER MODE OUTDOOR 2026"),
+                        txlog.index("FREQ 915000000"))
+        self.assertLess(txlog.index("ROLE TX"), txlog.index("ARM TX"))
+        self.assertLess(txlog.index("ARM TX"), txlog.index("FREQ 915000000"))
+
+        # per-cell scripts: RX arms before TX starts
+        self.assertIn("START N=10000 LEN=51 GAP=5000", rx.log)
+        self.assertIn("MOD flrc 650 22", tx.log)
+        self.assertIn("MOD loRa 7 125", tx.log)
+        self.assertIn("PA 22", tx.log)
+        self.assertIn("START N=10000 LEN=51 GAP=5000", tx.log)
+        self.assertIn("START N=10000 LEN=51 GAP=1000", tx.log)   # sf7 @ 10^4
+        self.assertIn("START N=10000 LEN=255 GAP=5000", tx.log)  # anchor
+
+        # schedule respected: first START no earlier than T0+margin
+        # (virtual clock started 60 s before T0)
+        # teardown: ROLE NONE on both
+        self.assertEqual(tx.log[-2], "ROLE NONE")
+        self.assertEqual(rx.log[-2], "ROLE NONE")
+
+        with open(self.csv_path) as f:
+            lines = [ln.rstrip("\n") for ln in f]
+        self.assertEqual(lines[0].split(","), m.CSV_COLUMNS)
+        meta = [ln for ln in lines if ln.startswith("#")]
+        self.assertTrue(any("id_tx: ID E80BENCH" in ln and "band=OVERRIDE" in ln
+                            for ln in meta))
+        data = [ln for ln in lines[1:] if not ln.startswith("#")]
+        self.assertEqual(len(data), 3)          # flrc650 + sf7 + anchor
+        row1 = data[0].split(",")
+        self.assertEqual(row1[4], "flrc650")
+        self.assertEqual(row1[9], "10000")      # sent = TX sent_ok
+        self.assertEqual(row1[10], "9997")      # recv = RX rx_ok (n-3)
+        self.assertEqual(row1[11], "0.030000")
+        anchor = data[2].split(",")
+        self.assertEqual(anchor[4], "flrc650+anchor")
+        self.assertEqual(anchor[5], "255")
+
+    def test_gate_verification_failure_aborts(self):
+        # Boards whose ID? never reports OVERRIDE acceptance -> preflight
+        # RuntimeError, STOP + ROLE NONE attempted, CSV gains an ABORT row,
+        # no cells run. RX opens first, so only the RX board is ever opened.
+        world = {"tx": {"freq": 868000000, "n": 100},
+                 "rx": {"freq": 868000000, "n": 100}}
+        boards = {}
+
+        def board_cls(port):
+            b = FakeBoard(port, world)
+            boards[port] = b
+            return b
+
+        orig = FakeBoard._reply
+
+        def stuck(self, line, expect_ok):
+            r = orig(self, line, expect_ok)
+            if line == "ID?":
+                r = r.replace("band=OVERRIDE", "band=863-870MHz")
+            return r
+
+        FakeBoard._reply = stuck
+        t0 = m.parse_t0("2026-08-30 14:05:00")
+        clock = VirtualClock(t0 - 60)
+        args = make_args(csv=self.csv_path, matrix=["flrc650"],
+                         anchor=False, t0="2026-08-30 14:05:00",
+                         prime_discard=0)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError) as cm:
+                    m.run_matrix(args, board_cls=board_cls,
+                                 sleep_fn=clock.sleep, now_fn=clock.now)
+            self.assertIn("BAND gate not accepted", str(cm.exception))
+        finally:
+            FakeBoard._reply = orig
+        rx = boards["/dev/ttyUSB4"]
+        self.assertIn("STOP", rx.log)
+        self.assertIn("ROLE NONE", rx.log)
+        self.assertNotIn("MOD flrc 650 22", rx.log)   # no cell ran
+        with open(self.csv_path) as f:
+            self.assertIn("# ABORT", f.read())
+
+    def test_no_tx_without_band_override_at_915(self):
+        # FakeBoard firmware model rejects FREQ 915 when not overridden; the
+        # tool must issue the unlock first, so this run succeeds end-to-end.
+        boards, world, _ = self._run(band_override=True)
+        self.assertIn("BAND OVERRIDE 2026", boards["/dev/ttyUSB4"].log)
+
+
+# ---------------------------------------------------------------------------
+# _detect_board_for_mode — fallback loud-fail (never silently pick ch340[0])
+# ---------------------------------------------------------------------------
+
+class TestDetectBoardForModeFallback(unittest.TestCase):
+    """When e80_detect cannot be imported, the manual-CH340 fallback must
+    STILL loud-fail on multiple ports instead of picking the first one.
+
+    The 9209aaf desk crash was exactly this: both tx and rx grabbed the same
+    CH340 port. The fallback must print override commands, never ch340[0].
+    """
+
+    def _force_import_failure(self):
+        """Make `import e80_detect` fail inside _detect_board_for_mode."""
+        real_import = __builtins__["__import__"]
+
+        def fake_import(name, *a, **kw):
+            if name == "e80_detect":
+                raise ImportError("simulated: e80_detect unavailable")
+            return real_import(name, *a, **kw)
+
+        return mock.patch("builtins.__import__", side_effect=fake_import)
+
+    def test_multiple_ch340_loud_fails_with_override_commands(self):
+        with self._force_import_failure(), \
+             mock.patch("glob.glob", return_value=["/dev/ttyUSB0", "/dev/ttyUSB1"]), \
+             mock.patch("subprocess.run") as mock_run, \
+             mock.patch.object(m.sys, "exit") as mock_exit:
+            mock_run.return_value = FakeSubprocessResult(stdout="ID_VENDOR_ID=1a86\nID_MODEL=CH340\n")
+            m._detect_board_for_mode("tx", None, None)
+        # sys.exit must be called (not return a port)
+        mock_exit.assert_called_once()
+        msg = mock_exit.call_args[0][0]
+        self.assertIn("Multiple CH340 ports", msg)
+        self.assertIn("make tx PORT=", msg)
+        self.assertIn("PROBE=", msg)
+
+    def test_single_ch340_still_returns_port(self):
+        """Single-board behavior unchanged: one CH340 → return it."""
+        with self._force_import_failure(), \
+             mock.patch("glob.glob", return_value=["/dev/ttyUSB0"]), \
+             mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeSubprocessResult(stdout="ID_VENDOR_ID=1a86\nID_MODEL=CH340\n")
+            port, probe = m._detect_board_for_mode("tx", None, None)
+        self.assertEqual(port, "/dev/ttyUSB0")
+
+
+class FakeSubprocessResult:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+if __name__ == "__main__":
+    unittest.main()

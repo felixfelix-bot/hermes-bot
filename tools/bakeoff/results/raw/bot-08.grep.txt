@@ -1,0 +1,1144 @@
+CMD: rg -i --no-heading -n -m 50 chat/completions .
+RC: 0  ERR: 
+
+./config/providers.yaml:97:    # Direct endpoint: https://api.telnyx.com/v2/ai/chat/completions
+./session_archiver.py:36:PROXY_URL = "http://127.0.0.1:9099/v1/chat/completions"
+./dynamic_context_length_governor.py:48:PROXY_URL = "http://localhost:9099/v1/chat/completions"
+./plans/fix-and-deepseek-analysis-2026-08-23.md:78:     https://opencode.ai/zen/go/v1/chat/completions
+./plans/fix-and-deepseek-analysis-2026-08-23.md:81:   - `https://opencode.ai/zen/api/v1/chat/completions`
+./plans/fix-and-deepseek-analysis-2026-08-23.md:82:   - `https://opencode.ai/api/v1/chat/completions`
+./plans/fix-and-deepseek-analysis-2026-08-23.md:104:     https://api.neuralwatt.com/v1/chat/completions
+./kimi_review.py:42:    "http://127.0.0.1:9099/v1/chat/completions",
+./skills/kanban-quota-aware-dispatch/SKILL.md:142:curl -s -X POST localhost:9099/v1/chat/completions \
+./tools/bakeoff/gold_questions.jsonl:8:{"id": "bot-08", "repo": "bot", "qtype": "orient", "question": "Where does an incoming OpenAI-compatible chat completion request enter the proxy before routing?", "gold_files": ["zai_proxy.py"], "gold_symbols": [], "keywords": "chat/completions"}
+./tools/bakeoff/results/raw/bot-05.grep.txt:15:{"id": "bot-08", "repo": "bot", "qtype": "orient", "question": "Where does an incoming OpenAI-compatible chat completion request enter the proxy before routing?", "gold_files": ["zai_proxy.py"], "gold_symbols": [], "keywords": "chat/completions"}
+./tools/bakeoff/results/raw/bot-04.grep.txt:27:{"id": "bot-08", "repo": "bot", "qtype": "orient", "question": "Where does an incoming OpenAI-compatible chat completion request enter the proxy before routing?", "gold_files": ["zai_proxy.py"], "gold_symbols": [], "keywords": "chat/completions"}
+./src/external_failover.py:77:            url = prov["base_url"] + "/chat/completions"
+./scripts/vision_health_check.py:169:    # Normalize endpoint (proxy uses /chat/completions, NOT /v1/chat/completions)
+./scripts/vision_health_check.py:173:    endpoint = endpoint + "/chat/completions"
+./test_user_agent_headers.py:303:        # Find TELNYX_BASE + "/chat/completions" then the hdrs dict
+./test_user_agent_headers.py:304:        h = _extract_headers_near(_PROXY_SRC, r'TELNYX_BASE \+ "/chat/completions"')
+./test_user_agent_headers.py:309:        h = _extract_headers_near(_PROXY_SRC, r'OLLAMA_CLOUD_BASE \+ "/chat/completions"')
+./test_user_agent_headers.py:325:        h = _extract_headers_near(_PROXY_SRC, r'prov\["base_url"\] \+ "/chat/completions"')
+./dynamic-context-length-design.md:191:| Probe request to proxy | `POST /v1/chat/completions` | On-demand | 1 API call (minimal tokens) | High — response `model` field shows served model |
+./dynamic-context-length-design.md:244:    "http://localhost:9099/v1/chat/completions",
+./test_flat_router.py:641:        2026-08-27: POST /chat/completions → 200), though it is unlisted
+./test_flat_router.py:739:            url="https://opencode.ai/api/v1/chat/completions",
+./test_flat_router.py:773:            url="https://opencode.ai/api/v1/chat/completions",
+./scripts/zai_proxy.py:682:                    # Strip /v1 prefix (OpenAI SDK sends /v1/chat/completions but
+./zai_proxy.py:5047:            url = OLLAMA_CLOUD_BASE + "/chat/completions"
+./zai_proxy.py:5184:            if not path.endswith("/chat/completions"):
+./zai_proxy.py:5188:                self.wfile.write(b'{"error":"only /chat/completions is proxied"}')
+./zai_proxy.py:5358:            url = OPENCODE_GO_BASE + "/chat/completions"
+./zai_proxy.py:5562:                url = TELNYX_BASE + "/chat/completions"
+./zai_proxy.py:5673:            url = prov["base_url"] + "/chat/completions"
+./zai_proxy.py:5867:                url = prov["base_url"] + "/chat/completions"
+./zai_proxy.py:6662:                    # Strip /v1 prefix (OpenAI SDK sends /v1/chat/completions but
+./zai_proxy.py:6666:                    # Only proxy /chat/completions to z.ai.  Non-chat paths
+./zai_proxy.py:6670:                    if not path.endswith("/chat/completions"):
+./zai_proxy.py:6674:                        self.wfile.write(b'{"error":"only /chat/completions is proxied"}')
+./tests/test_silent_substitution.py:133:            "http://localhost:9099/v1/chat/completions",
+
+<<<naive-read ./zai_proxy.py>>>
+#!/usr/bin/env python3
+"""zai_proxy — local reverse proxy for z.ai that auto-rotates API keys.
+
+ContextVM-pattern: a local service that fetches + caches external data (key quotas)
+and serves routing decisions transparently. Hermes points base_url here; the proxy
+picks the best key per request + retries on 429.
+
+Endpoints:
+  POST /* → forwarded to z.ai (with the healthiest key; retries on 429)
+  GET  /quota → both keys' cached quotas + which is active
+  GET  /health → simple liveness check
+
+Usage logging (separate SQLite DB at ~/.hermes/bot/zai_usage.db, WAL mode):
+  api_calls      — one row per request (tokens, model, key, status, duration,
+                   cache/ollama/ppq hit flags)
+  key_decisions  — one row per key-selection decision (chosen key, reason, both
+                   quota percentages, availability flags)
+Logging never raises — all write paths are wrapped to swallow errors so a
+logging failure can never break a proxied request.
+"""
+from __future__ import annotations
+import json, os, sqlite3, sys, threading, time, urllib.request, urllib.error
+from datetime import datetime, timezone, date as _date
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+# ── Shadow mode (Phase 2) — price-first optimizer running read-only ──────────
+# Import bridge: logs shadow routing decisions alongside live best_key() picks.
+# Wrapped so a missing repo or import error NEVER breaks production routing.
+_shadow_hook = None
+try:
+    _MRE_PATH = os.path.expanduser("~/merchant-routing-engine")
+    if _MRE_PATH not in sys.path:
+        sys.path.insert(0, _MRE_PATH)
+    from src.shadow_hook import ShadowHook
+    # ── Token audit (Phase 2.5.4) ──────────────────────────────────────
+    # Extracted into src/token_audit.py so the billed-vs-actual mismatch
+    # check is unit-testable.  Falls back to a local stub below if missing.
+    from src.token_audit import audit_token_count as _audit_token_count
+    # ── Converged rates (Phase 3.0) ────────────────────────────────────
+    # Load converged Kalman base rates from historical daily_spend data at
+    # startup instead of using static seed costs.  This gives the shadow
+    # optimizer an immediately-converged cost model.  Falls back to seeds
+    # (inside the ShadowHook constructor) on any failure.
+    _converged_rates: dict[str, float] | None = None
+    try:
+        from scripts.feed_historical_costs import load_historical_rates
+        _converged_rates = load_historical_rates()
+        if _converged_rates:
+            print(f"[shadow] Converged rates loaded:", flush=True)
+            for _p, _r in sorted(_converged_rates.items()):
+                print(f"[shadow]   {_p:15s}  ${_r:.6f}/M", flush=True)
+    except Exception as _ce:
+        print(f"[shadow] converged-rate load failed — using seed costs: {_ce}", flush=True)
+        _converged_rates = None
+    _shadow_hook = ShadowHook(
+        db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"),
+        converged_rates=_converged_rates,
+    )
+    print(f"[shadow] ShadowHook initialized — logging to zai_usage.db", flush=True)
+except Exception as _e:
+    print(f"[shadow] DISABLED — {_e}", flush=True)
+    _shadow_hook = None
+    _converged_rates = None
+
+# ── Dispatch gate (P5.1) ─────────────────────────────────────────────────────
+# Pure three-dimension decision fn (hardware → quota-margin → price) extracted
+# into src/dispatch_gate.py so it is unit-testable.  Falls back to None on any
+# import error — the endpoint then degrades to a coarse candidate check.
+_evaluate_dispatch = None
+try:
+    from src.dispatch_gate import evaluate_dispatch as _evaluate_dispatch
+except Exception as _dge:
+    print(f"[dispatch_gate] DISABLED — {_dge}", flush=True)
+    _evaluate_dispatch = None
+
+# ── Ollama Cloud quota tracker (EUv2-5) ──────────────────────────────────────
+# Real quota regime from cumulative token usage in zai_usage.db.
+# Falls back to "included" (no penalty) on any failure — never breaks routing.
+_ollama_quota_status = None
+try:
+    from src.ollama_quota_tracker import get_quota_status as _get_quota_status
+    from src.ollama_quota_tracker import DEFAULT_SESSION_LIMIT as _OC_SESSION_LIMIT
+    from src.ollama_quota_tracker import DEFAULT_MONTHLY_LIMIT as _OC_MONTHLY_LIMIT
+    from src.ollama_quota_tracker import _load_limits as _oc_load_limits
+except Exception as _oqe:
+    print(f"[ollama_quota] DISABLED — {_oqe}", flush=True)
+    _get_quota_status = None
+    _OC_SESSION_LIMIT = 500_000_000  # fallback default
+    _OC_MONTHLY_LIMIT = 3_500_000_000  # fallback default
+    _oc_load_limits = None
+
+# ── Cost extraction (RP-2) ───────────────────────────────────────────────────
+# Parses the real $ cost from each provider's API response body. Falls back to
+# None (no per-call cost extraction) on any import error — the proxy's
+# _extract_cost wrapper then zeroes flat-rate providers and estimates ollama.
+_extract_cost_module = None
+try:
+    from src.cost_extraction import extract_cost as _ce_extract_cost
+    _extract_cost_module = _ce_extract_cost
+except Exception as _cee:
+    print(f"[cost_extraction] DISABLED — {_cee}", flush=True)
+    _extract_cost_module = None
+
+# ── Real price tracker (RP-4) ────────────────────────────────────────────────
+# Replaces ALL hardcoded rate constants with real measured rates from
+# real_price_tracker.get_rate_with_fallback(). The tracker resolves:
+#   1. Real measured cost_usd data from the DB
+#   2. Ollama billing API (for ollama_cloud)
+#   3. LAST_RESORT_RATES (clearly-marked estimates)
+# Every import failure degrades gracefully to the inline _FALLBACK_RATES below.
+_rpt_get_rate = None
+try:
+    from src.real_price_tracker import get_rate_with_fallback as _rpt_get_rate
+    print("[real_price_tracker] loaded — cost estimation uses measured rates", flush=True)
+except Exception as _rpte:
+    print(f"[real_price_tracker] DISABLED — {_rpte}", flush=True)
+    _rpt_get_rate = None
+
+# Kill switch: set OLLAMA_EXTRA_USAGE_ENABLED=false to disable regime-based pricing
+_OLLAMA_EXTRA_USAGE_ENABLED = os.environ.get("OLLAMA_EXTRA_USAGE_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# Cache the quota status to avoid DB queries on every snapshot call.
+# Updated by _snapshot_quota() at most every _OLLAMA_QUOTA_CACHE_TTL seconds.
+# Per-key caches so each Ollama Cloud subscription has independent tracking.
+_ollama_quota_cache: dict[str, dict] = {}
+_ollama_quota_cache_ts: dict[str, float] = {}
+_OLLAMA_QUOTA_CACHE_TTL = 30.0  # seconds
+
+# OpenCode Go allowance cache — parsed from response body's cost.allowance_remaining_usd.
+# Go is a $10/mo flat-rate subscription with an allowance that depletes; once it
+# hits $0, requests switch to pay-per-use. Tracking it lets the flat router apply
+# per-model pressure (models burning more of the allowance get penalized).
+_opencode_go_allowance: dict = {"remaining_usd": None, "ts": 0.0}
+_OPENCODE_GO_INITIAL_ALLOWANCE = 10.0  # $10/mo
+
+# Per-(provider, model) burn share cache. Updated from api_calls table by
+# _compute_model_burn_share(). Used by the flat router's effective price
+# formula to push high-burn models off scarce providers.
+_model_burn_cache: dict[str, dict[str, float]] = {}  # provider → {model → share}
+_model_burn_cache_ts: float = 0.0
+_MODEL_BURN_CACHE_TTL = 60.0  # seconds
+
+# Key-state transition tracking for sustained-down alerts.
+# _key_down_since[name] = timestamp when the key first went unhealthy.
+# _key_alerted[name] = True after the 15-min CRITICAL alert fires (once per down period).
+_key_down_since: dict[str, float] = {}
+_key_alerted: dict[str, bool] = {}
+_KEY_SUSTAINED_DOWN_THRESHOLD = 900.0  # 15 minutes
+
+def _get_ollama_quota_status(key_name: str = "ollama_cloud") -> dict:
+    """Get cached or fresh ollama_cloud quota status for a specific key.
+    Thread-safe.
+
+    Returns a dict with: regime, session_used_pct, weekly_used_pct,
+    monthly_used_pct, session_tokens, weekly_tokens, monthly_tokens. Falls
+    back to an 'included' default on any error so routing is never broken.
+
+    For monthly-budget plans (ollama_cloud_3) the monthly_used_pct is driven
+    by the server /api/usage ``limits.monthly.usage`` fraction (authoritative);
+    oc/oc2 use session+weekly windows as before.
+    """
+    if _get_quota_status is None or not _OLLAMA_EXTRA_USAGE_ENABLED:
+        return {
+            "regime": "included",
+            "session_used_pct": 0.0,
+            "weekly_used_pct": 0.0,
+            "monthly_used_pct": 0.0,
+            "session_tokens": 0,
+            "weekly_tokens": 0,
+            "monthly_tokens": 0,
+            "monthly_limit": _OC_MONTHLY_LIMIT,
+        }
+    now = time.time()
+    cached = _ollama_quota_cache.get(key_name)
+    cache_ts = _ollama_quota_cache_ts.get(key_name, 0.0)
+    if cached is not None and (now - cache_ts) < _OLLAMA_QUOTA_CACHE_TTL:
+        return cached
+    try:
+        status = _get_quota_status(str(USAGE_DB), key_name=key_name)
+        # Server-truth override (t_30dde4c7): the LOCAL token counter (sum of
+        # api_calls.total_tokens in session/weekly/monthly windows) is blind to
+        # server-side exhaustion — an exhausted key stops being dispatched, so
+        # its local counts freeze near 0 and /quota reports "included/0%" while
+        # the subscription actually serves 100% of its pool. The authoritative
+        # source is ollama.com/api/usage (limits.*.usage fractions). Override
+        # the local window fractions with the server fractions for EVERY key,
+        # not just ollama_cloud_3. Falls back to the local rolling estimates if
+        # the server fetch is unavailable so routing never breaks.
+        #
+        # Probe markers exposed to /quota:
+        #   probe_exhausted  True if the server used_pct >= 100 (pool fully
+        #                    consumed) — so operators can trust the view.
+        #   server_used_pct  Server-derived used_pct (0-100), if fetched.
+        #   probe_ts         Wall-clock of the last successful server fetch.
+        _probe_exhausted = False
+        _srv_pct = None
+        try:
+            from src.ollama_extra_usage import fetch_ollama_usage
+            _key_var = {
+                "ollama_cloud": OLLAMA_CLOUD_KEY,
+                "ollama_cloud_2": OLLAMA_CLOUD_KEY_2,
+                "ollama_cloud_3": OLLAMA_CLOUD_KEY_3,
+                "ollama_cloud_4": OLLAMA_CLOUD_KEY_4,
+            }.get(key_name)
+            if _key_var:
+                _usage = fetch_ollama_usage(api_key=_key_var, now=now)
+                _lim = (_usage or {}).get("limits", {}) or {}
+                _srv_fracs = {}
+                for _win in ("session", "weekly", "monthly"):
+                    _w = _lim.get(_win)
+                    if isinstance(_w, dict) and _w.get("usage") is not None:
+                        _srv_fracs[_win] = float(_w.get("usage") or 0)
+                if _srv_fracs:
+                    # Override local window fractions with server truth.
+                    if "session" in _srv_fracs:
+                        status["session_used_pct"] = _srv_fracs["session"] * 100.0
+                    if "weekly" in _srv_fracs:
+                        status["weekly_used_pct"] = _srv_fracs["weekly"] * 100.0
+                    if "monthly" in _srv_fracs:
+                        status["monthly_used_pct"] = _srv_fracs["monthly"] * 100.0
+                    _srv_pct = max(_srv_fracs.values()) * 100.0
+                    _probe_exhausted = bool(_srv_pct >= 100.0)
+                    # regime from server truth: 100% → exhausted, >=90% → extra
+                    # (scarcity ramp), else included. Preserves the oc3 monthly
+                    # delist intent and generalises to oc/oc2/oc4 weekly pools.
+                    if _srv_pct >= 100.0:
+                        status["regime"] = "exhausted"
+                    elif _srv_pct >= 90.0:
+                        status["regime"] = "extra"
+                    else:
+                        status["regime"] = "included"
+        except Exception:
+            pass  # server fetch unavailable → keep local estimates
+        status["probe_exhausted"] = _probe_exhausted
+        status["server_used_pct"] = _srv_pct
+        status["probe_ts"] = now if _srv_pct is not None else None
+        if key_name == "ollama_cloud_3":
+            # oc3 is monthly-only: surface the budget limit (BUG A fix). The
+            # tracker returns it, but older cached/fallback dicts may lack it.
+            if not status.get("monthly_limit"):
+                try:
+                    if _oc_load_limits is not None:
+                        status["monthly_limit"] = _oc_load_limits()[2]
+                    else:
+                        status["monthly_limit"] = _OC_MONTHLY_LIMIT
+                except Exception:
+                    status["monthly_limit"] = _OC_MONTHLY_LIMIT
+            status["monthly_tokens"] = int(status.get("monthly_tokens", 0))
+        _ollama_quota_cache[key_name] = status
+        _ollama_quota_cache_ts[key_name] = now
+        return status
+    except Exception:
+        if cached is not None:
+            return cached
+        return {
+            "regime": "included",
+            "session_used_pct": 0.0,
+            "weekly_used_pct": 0.0,
+            "monthly_used_pct": 0.0,
+            "session_tokens": 0,
+            "weekly_tokens": 0,
+            "monthly_tokens": 0,
+            "monthly_limit": _OC_MONTHLY_LIMIT,
+        }
+
+def _probe_hardware(hardware_req: str) -> dict:
+    """Probe physical hardware state for the dispatch gate (Dimension 1).
+
+    Only runs when ``hardware_req != "none"``.  Fault-tolerant: missing files,
+    failed udevadm/ssh calls, and parse errors all degrade to safe defaults
+    (absent / unknown / unreachable).  Sources per IMPL-SPEC v2:
+      - board presence: ``ls /dev/ttyACM*``
+      - board identity: ``udevadm`` serial of the first ttyACM device
+      - lock status: ``~/.hermes/peripheral_locks/board-lock-monitor.json``
+      - DQ05 reachability: ``ssh -o ConnectTimeout=3 dq05 true``
+    """
+    import glob as _glob, subprocess as _sp
+    if hardware_req == "none":
+        return {"required": "none"}
+    state: dict = {}
+    if hardware_req in ("board", "dual_board"):
+        acm: list = []
+        try:
+            acm = sorted(_glob.glob("/dev/ttyACM*"))
+            state["board_present"] = len(acm) > 0
+            state["board_count"] = len(acm)
+        except Exception:
+            state["board_present"] = False
+            state["board_count"] = 0
+        # Board identity (udevadm serial of first device).
+        try:
+            if acm:
+                out = _sp.run(
+                    ["udevadm", "info", "-q", "property", "-n", acm[0]],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout
+                for _line in out.splitlines():
+                    if _line.startswith("ID_SERIAL_SHORT="):
+                        state["board_id"] = _line.split("=", 1)[1]
+                        break
+        except Exception:
+            pass
+        # Lock status from the board-lock monitor JSON.
+        try:
+            import json as _json
+            _lp = os.path.expanduser(
+                "~/.hermes/peripheral_locks/board-lock-monitor.json")
+            with open(_lp) as _f:
+                _lmon = _json.load(_f) or {}
+            _locks = _lmon.get("locks", []) or []
+            _board_locks = [l for l in _locks
+                            if str(l.get("resource", "")).startswith("board")]
+            _free = [l for l in _board_locks if l.get("status") == "free"]
+            _held = [l for l in _board_locks if l.get("status") == "locked"]
+            state["lock_status"] = (
+                "free" if _free else ("held" if _held else "unknown"))
+            state["queue_depth"] = len(_held)
+            state["estimated_wait_minutes"] = sum(
+                int(l.get("age_minutes", 0) or 0) for l in _held)
+        except Exception:
+            state.setdefault("lock_status", "unknown")
+    elif hardware_req == "dq05":
+        # Lightweight reachability probe — 3s connect timeout, no shell.
+        try:
+            _r = _sp.run(
+                ["ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes",
+                 "dq05", "true"],
+                capture_output=True, timeout=6)
+            state["dq05_reachable"] = (_r.returncode == 0)
+        except Exception:
+            state["dq05_reachable"] = False
+    return state
+
+# ── Token-audit fallback (Phase 2.5.4) ──────────────────────────────────────
+# If the src import above failed, define a never-raising stub so the request
+# path's audit call is still safe.  Real logic lives in src/token_audit.py.
+#
+# IMPORTANT (false-positive fix): `billed_tokens` MUST be the provider's
+# completion_tokens — NOT total_tokens.  The estimate is derived from
+# len(response_buffer)//4, and the response buffer contains ONLY the completion
+# text (the prompt is never echoed back).  Passing total_tokens (prompt +
+# completion) makes the billed count always much larger than the completion-only
+# estimate, which guarantees a spurious >20% mismatch on any request with a
+# non-trivial prompt.
+if "_audit_token_count" not in globals():
+
+    def _audit_token_count(billed_tokens, response_buffer, threshold=0.20):
+        try:
+            _buf = response_buffer if response_buffer is not None else b""
+            _actual = len(_buf) // 4
+            _billed = int(billed_tokens or 0)
+            if _billed <= 0 or _actual <= 0:
+                return (_actual, False, 0.0)
+            _rate = abs(_billed - _actual) / max(_billed, 1)
+            return (_actual, _rate > threshold, _rate)
+        except Exception:
+            return (0, False, 0.0)
+
+# ── LiveRouter (Phase 1.2) — Kalman-driven failover selection ───────────────
+# LiveRouter wraps the RoutingOptimizer for LIVE failover routing.  It is
+# ONLY called when BOTH z.ai keys are exhausted (best_key() Phase 4 sets
+# chosen = None).  Normal ours/friend routing is completely unaffected.
+#
+# Kill switch: touch ~/.hermes/bot/.enable_live_routing to enable.
+#             rm    ~/.hermes/bot/.enable_live_routing to disable.
+# No restart needed — the flag is checked on every failover call.
+#
+# Safety: every LiveRouter call is wrapped in try/except.  If LiveRouter
+# fails (import error, exception, no provider found), best_key() returns
+# None and the existing hardcoded ollama → ppq → openrouter chain runs.
+_LIVE_ROUTER = None
+_LIVE_ROUTING_FLAG = os.path.expanduser("~/.hermes/bot/.enable_live_routing")
+try:
+    from src.live_router import LiveRouter as _LiveRouterCls
+    _LIVE_ROUTER = _LiveRouterCls.get_instance(
+        db_path=os.path.expanduser("~/.hermes/bot/zai_usage.db"),
+        converged_rates=_converged_rates,
+    )
+    print(f"[live] LiveRouter initialized — failover selection ready "
+          f"(kill switch: {_LIVE_ROUTING_FLAG})", flush=True)
+except Exception as _le:
+    print(f"[live] LiveRouter DISABLED — {_le}", flush=True)
+    _LIVE_ROUTER = None
+
+# ── PPQ credit-balance bridge (P3-PPQ) ───────────────────────────────────────
+# quota_state['ppq'] used to be hardcoded {'used_pct': 0.0} — PPQ credit
+# depletion never reached the pricing engine. This imports the bridge fn from
+# the merged collector (src.balance_collectors.ppq_quota_entry), which reads
+# the newest 'ppq' row from provider_balances in api_burn.db (written by
+# the every-5min balance_collectors --provider ppq cron). _snapshot_quota()
+# calls _ppq_quota_snapshot() instead of the old hardcoded dict. Revert-safe:
+# any failure → the old optimistic {'used_pct': 0.0} so routing never breaks.
+_ppq_quota_entry_fn = None
+try:
+    from src.balance_collectors import ppq_quota_entry as _ppq_quota_entry_fn
+    print("[ppq] balance bridge loaded — quota_state['ppq'] reads real credit balance",
+          flush=True)
+except Exception as _pqe:
+    print(f"[ppq] balance bridge DISABLED — {_pqe}", flush=True)
+    _ppq_quota_entry_fn = None
+
+# ── OpenRouter credit-balance bridge (T1T3) ──────────────────────────────────
+# quota_state['openrouter'] was hardcoded {used_pct:0.0, remaining:inf} — credit
+# depletion never reached the pricing engine. Mirrors the PPQ bridge above:
+# imports openrouter_quota_entry from the merged balance_collectors module
+# (reads newest 'openrouter' row from provider_balances, written by the
+# every-5min balance_collectors --provider openrouter cron). Revert-safe: any
+# failure → old optimistic {used_pct:0.0, remaining:inf} so routing never
+# breaks. REVERT: delete this block + restore the one-line hardcode
+# `snap["openrouter"] = {"used_pct": 0.0, "remaining": float("inf")}`
+# in _snapshot_quota().
+_openrouter_quota_entry_fn = None
+try:
+    from src.balance_collectors import openrouter_quota_entry as _openrouter_quota_entry_fn
+    print("[openrouter] balance bridge loaded — quota_state['openrouter'] reads real credit balance",
+          flush=True)
+except Exception as _oqe:
+    print(f"[openrouter] balance bridge DISABLED — {_oqe}", flush=True)
+    _openrouter_quota_entry_fn = None
+
+# ── Telnyx self-tracking balance bridge (TELNYX-3.2) ───────────────────────────
+# quota_state['telnyx'] was hardcoded {used_pct:0.0, remaining:inf} — balance
+# depletion never reached the pricing engine. Mirrors the PPQ/OpenRouter
+# bridges above: imports telnyx_quota_entry from the merged balance_collectors
+# module (reads newest 'telnyx' row from provider_balances, written by the
+# every-5min balance_collectors --provider telnyx cron). Revert-safe: any
+# failure → old optimistic {used_pct:0.0, remaining:inf} so routing never
+# breaks. REVERT: delete this block + restore the one-line hardcode
+# `snap["telnyx"] = {"used_pct": 0.0, "remaining": float("inf")}`
+# in _snapshot_quota().
+_telnyx_quota_entry_fn = None
+try:
+    from src.balance_collectors import telnyx_quota_entry as _telnyx_quota_entry_fn
+    print("[telnyx] balance bridge loaded — quota_state['telnyx'] reads real balance",
+          flush=True)
+except Exception as _tqe:
+    print(f"[telnyx] balance bridge DISABLED — {_tqe}", flush=True)
+    _telnyx_quota_entry_fn = None
+
+_routstr_quota_entry_fn = None
+try:
+    from src.balance_collectors import routstr_quota_entry as _routstr_quota_entry_fn
+    print("[routstr] balance bridge loaded — quota_state['routstr'] reads real sats balance",
+          flush=True)
+except Exception as _rqe:
+    print(f"[routstr] balance bridge DISABLED — {_rqe}", flush=True)
+    _routstr_quota_entry_fn = None
+
+# ── NeuralWatt credit-balance bridge (NW-API) ───────────────────────────────
+# quota_state['neuralwatt'] was hardcoded {used_pct:0.0, remaining:inf} —
+# spend tracking was invisible to the pricing engine. The $258-in-one-day
+# incident burned ~3,300 glm-5.2 calls through neuralwatt with no guardrail
+# in place because the proxy literally saw "infinity remaining".
+#
+# 2026-08-23: Felix found NeuralWatt's REAL billing API:
+#   * GET /v1/quota           → balance, subscription, kWh allowance
+#   * GET /v1/usage/summary   → daily cost time_series (period → today → total)
+#
+# NeuralWatt uses ENERGY-based pricing (kWh, not per-token). The Pro plan
+# ($100/mo) includes 13.33 kWh/month. 94% of prompt tokens are cached at a
+# 5× discount, so our per-token cost estimate OVERCOUNTS by ~5.7×. The bridge
+# imports `neuralwatt_quota_entry` from src.balance_collectors — which calls
+# /v1/quota for real kWh remaining and /v1/usage/summary for today's real USD
+# spend — exposes a NEURALWATT_DAILY_CAP guardrail (default $10/day), and a
+# `get_neuralwatt_cost_correction_factor()` helper used by
+# `_estimate_cost_usd()` to scale our over-estimated per-token cost down to
+# the real spend ratio.
+#
+# When daily spend exceeds the cap (real number from the API), the entry
+# surfaces is_daily_cap_exceeded=True and we mark the key unhealthy so the
+# router drops neuralwatt from rotation until UTC midnight. Revert-safe: any
+# failure → the old optimistic {used_pct:0.0, remaining:inf} so routing
+# never breaks.
+# REVERT: delete this block + restore the one-line hardcode
+# `snap["neuralwatt"] = {"used_pct": 0.0, "remaining": float("inf")}` in
+# _snapshot_quota(), and `h["neuralwatt"] = True` in _snapshot_health().
+_neuralwatt_quota_entry_fn = None
+try:
+    from src.balance_collectors import neuralwatt_quota_entry as _neuralwatt_quota_entry_fn
+    print("[neuralwatt] balance bridge loaded — quota_state['neuralwatt'] reads real /v1/quota API",
+          flush=True)
+except Exception as _nwe:
+    print(f"[neuralwatt] balance bridge DISABLED — {_nwe}", flush=True)
+    _neuralwatt_quota_entry_fn = None
+
+# Optional: mirror key_health gate so the daily-cap call can flag exhaustion.
+_NEURALWATT_DAILY_CAP_DEFAULT = 10.0  # USD/day — synced with balance_collectors
+
+# Cost-correction factor (cached) — applied in _estimate_cost_usd() so the
+# per-token cost estimate is brought in-line with the real NeuralWatt bill.
+# Computed as real_api_total / db_sum_cost_usd, refreshed every 10 minutes.
+_neuralwatt_cost_correction_fn = None
+try:
+    from src.balance_collectors import (
+        get_neuralwatt_cost_correction_factor as _neuralwatt_cost_correction_fn,
+    )
+    print("[neuralwatt] cost-correction bridge loaded — _estimate_cost_usd will scale to real API spend",
+          flush=True)
+except Exception as _nce:
+    print(f"[neuralwatt] cost-correction bridge DISABLED — {_nce}", flush=True)
+    _neuralwatt_cost_correction_fn = None
+
+# ── Pressure FSM bridge (S2b two-layer pressure routing, t_4dfaf0d5) ────────
+# Layer-2 request-time half of DESIGN-two-layer-pressure-routing.md:
+# GREEN/AMBER/RED band FSM over friend-key quota + Kalman exhaust
+# predictions. SHADOW MODE ONLY — computes and logs the decision it
+# WOULD make (pressure_decisions table); never reroutes a live request.
+# Kill switches: touch ~/.hermes/bot/.pressure_routing_disabled OR set
+# pressure_policy.json {"mode":"off"}. Revert-safe: None → all hooks
+# no-op. Enforce mode is a later stage (S2c+) and behaves as shadow here.
+_pressure_tracker = None
+try:
+    from pressure_fsm import PressureTracker as _PressureTrackerCls
+    _pressure_tracker = _PressureTrackerCls()
+    print(f"[pressure] FSM bridge loaded — shadow mode "
+          f"(state: {_pressure_tracker.mode()}, kill switch: "
+          f"{_pressure_tracker.flag_path})", flush=True)
+except Exception as _pre:
+    print(f"[pressure] FSM bridge DISABLED — {_pre}", flush=True)
+    _pressure_tracker = None
+
+
+def _pressure_shadow(model: str | None, session_id: str | None,
+                     ollama_regime: str | None = None) -> object | None:
+    """Shadow-only pressure decision (t_4dfaf0d5). NEVER raises.
+
+    Reads the Ollama regime from the live quota status when the caller
+    doesn't supply one, and forwards the proxy's current friend-key lock
+    verdict (LOCK_THRESHOLDS) so decisions never overstate capacity
+    (cold review pass 1). Returns a pressure_fsm.Decision or None
+    (tracker missing / kill switch active / any internal error).
+    """
+    if _pressure_tracker is None or not model:
+        return None
+    try:
+        regime = ollama_regime
+        if regime is None:
+            regime = _get_ollama_quota_status().get("regime")
+        friend_locked = False
+        try:
+            windows = quota_cache.get("friend", ([], 0.0))[0]
+            friend_locked = bool(is_key_locked("friend", windows)[0])
+        except Exception:
+            pass  # no cache yet / helper missing -> unlocked default
+        return _pressure_tracker.shadow_decision(
+            model, session_id=session_id, ollama_regime=regime,
+            friend_locked=friend_locked)
+    except Exception:
+        return None  # shadow hooks must never break request handling
+
+
+# ── Benchmark-tier resolution hooks (plans/benchmark-tier-…-2026-09-06) ─────
+# Thin module-level wrappers so (a) the request handler stays linear and
+# (b) tests can patch these exactly like _pressure_shadow (see
+# TestPhase0Hardening) instead of flat_router internals.
+def _tier_alias_resolve(model: str, session_id: str | None) -> tuple[str, str]:
+    """Resolve a tier/* alias to a concrete model (flat_router contract:
+    stickiness/hysteresis/kill-switch/fallback). NEVER raises; on any
+    failure the alias is returned unchanged (fails exactly like an
+    unknown concrete model would downstream)."""
+    try:
+        from flat_router import resolve_tier
+        return resolve_tier(model, session_id) or (model, "no_result")
+    except Exception:
+        return model, "resolver_error"
+
+
+def _tier_resolution_shadow(model: str | None,
+                            session_id: str | None) -> None:
+    """Shadow-evaluate every tier (rate-limited) and log the would-be
+    resolution. Read-only with respect to routing. NEVER raises."""
+    if not model:
+        return
+    try:
+        from flat_router import shadow_tier_evaluate
+        shadow_tier_evaluate(model, session_id)
+    except Exception:
+        pass  # shadow hooks must never break request handling
+
+# ── ProfitTracker (consumer-mode savings ledger, MRE Phase 2.3) ─────────────
+# Records every external-failover routing decision + savings vs the next-best
+# alternative into the routing_profit table. Fire-and-forget daemon writer;
+# revert-safe (None → calls are skipped).
+_PROFIT_TRACKER = None
+try:
+    from src.profit_tracker import ProfitTracker as _ProfitTrackerCls
+    _PROFIT_TRACKER = _ProfitTrackerCls()
+    print("[profit] ProfitTracker loaded — routing_profit savings ledger active",
+          flush=True)
+except Exception as _pte:
+    print(f"[profit] ProfitTracker DISABLED — {_pte}", flush=True)
+    _PROFIT_TRACKER = None
+
+# ── config ──────────────────────────────────────────────────────────────────
+def _load_keys():
+    """Load keys from the manager .env (gitignored, never in repo)."""
+    keys = {}
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env",
+               Path.home()/".hermes/bot/.env"]:
+        if ep.exists():
+            for line in ep.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("ZAI_API_KEY=") and "ZAI_OUR_KEY" not in line and "friend" not in keys:
+                    keys["friend"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ZAI_OUR_KEY=") and "ours" not in keys:
+                    keys["ours"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+    return keys
+
+KEYS = _load_keys()
+# Per-window lock thresholds: a key is "locked" when ANY window's used_pct
+# meets/exceeds its threshold for that key name.  Burst protection on the short
+# window, quota preservation on the weekly window for the friend key.
+LOCK_THRESHOLDS = {
+    "5-hour":  {"ours": 90, "friend": 80},   # burst protection; switch off friend earlier (80%)
+    "weekly":  {"ours": 60, "friend": 80},   # proactive: switch off ours at 60% (40% buffer)
+    "monthly": {"ours": 95, "friend": 95},   # tools limit (high — rarely hit)
+}
+
+# Cost-aware routing tie-breaker. Cheapest key wins when both are unlocked
+# AND healthy. NOTE: cost is a TIE-BREAKER only — Kalman exhaustion prediction
+# and per-window lock thresholds remain the primary signals in best_key().
+#
+#   ours          1.0   — base rate (z.ai subscription); CHEAPEST when healthy.
+#                         Subscription may be cancelled → mark dead with:
+#                         touch ~/.hermes/bot/.key_disabled_ours
+#   friend        1.21  — z.ai courtesy key (21% premium over base rate).
+#   ollama_cloud  1.0   — flat-rate cloud ($100/mo, rate from real_price_tracker). Preferred
+#                         during z.ai peak hours (UTC 6-10) or when z.ai is dead.
+#   ppq           — pay-per-token; most expensive, last-resort failover only.
+_KEY_COST_MULTIPLIER = {"ours": 1.0, "friend": 1.21, "ollama_cloud": 1.0, "ollama_cloud_2": 1.0, "ollama_cloud_3": 1.0, "ollama_cloud_4": 1.0, "opencode_go": 1.0, "neuralwatt": 1.0}
+UPSTREAM   = "https://api.z.ai/api/coding/paas/v4"
+QUOTA_URL  = "https://api.z.ai/api/monitor/usage/quota/limit"
+CACHE_TTL  = 300                                # 5 min
+PORT       = int(os.environ.get("PORT", "9099"))
+STATE_FILE = Path.home() / ".hermes" / "bot" / "zai_proxy_state.json"
+
+# ── external failover providers ─────────────────────────────────────────────
+def _load_external_keys():
+    """Load PPQ, OpenRouter, Ollama Cloud, DeepInfra, and Telnyx keys from .env."""
+    keys = {}
+    for ep in [Path.home()/".hermes/profiles/manager/.env", Path.home()/".hermes/.env",
+               Path.home()/".hermes/bot/.env"]:
+        if ep.exists():
+            for line in ep.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("PPQ_API_KEY=") and "ppq" not in keys:
+                    keys["ppq"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OPENROUTER_API_KEY=") and "openrouter" not in keys:
+                    keys["openrouter"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY=") and "ollama_cloud" not in keys:
+                    keys["ollama_cloud"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY_2=") and "ollama_cloud_2" not in keys:
+                    keys["ollama_cloud_2"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY_3_STOIC_HERSCHEL_499=") and "ollama_cloud_3" not in keys:
+                    keys["ollama_cloud_3"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OLLAMA_CLOUD_API_KEY_4_SLEEPY_EASLEY_477=") and "ollama_cloud_4" not in keys:
+                    keys["ollama_cloud_4"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPINFRA_API_KEY=") and "deepinfra" not in keys:
+                    keys["deepinfra"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPINFRA_STARTING_BALANCE=") and "deepinfra_balance" not in keys:
+                    keys["deepinfra_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("TELNYX_API_KEY=") and "telnyx" not in keys:
+                    keys["telnyx"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("TELNYX_STARTING_BALANCE=") and "telnyx_balance" not in keys:
+                    keys["telnyx_balance"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("DEEPSEEK_API_KEY=") and "deepseek" not in keys:
+                    keys["deepseek"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTR_API_KEY=") and "routstr" not in keys:
+                    keys["routstr"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTR_BASE=") and "routstr_base" not in keys:
+                    keys["routstr_base"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTRD_API_KEY=") and "routstrd" not in keys:
+                    keys["routstrd"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("ROUTSTRD_BASE=") and "routstrd_base" not in keys:
+                    keys["routstrd_base"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("OPENCODE_GO_API_KEY=") and "opencode_go" not in keys:
+                    keys["opencode_go"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("NEURALWATT_API_KEY=") and "neuralwatt" not in keys:
+                    keys["neuralwatt"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+                elif line.startswith("CHUTES_API_KEY=") and "chutes" not in keys:
+                    keys["chutes"] = line.split("=",1)[1].split("#")[0].strip().strip("'").strip('"')
+    return keys
+
+_EXTERNAL_KEYS = _load_external_keys()
+
+# Ollama Cloud — primary provider (same tier as z.ai, not just failover)
+OLLAMA_CLOUD_KEY = _EXTERNAL_KEYS.get("ollama_cloud", "")
+OLLAMA_CLOUD_BASE = "https://ollama.com/v1"
+# Ollama Cloud key #2 — second subscription account (market-routed, own Kalman)
+OLLAMA_CLOUD_KEY_2 = _EXTERNAL_KEYS.get("ollama_cloud_2", "")
+# Ollama Cloud key #3 (stoic_herschel_499) — $20/mo MONTHLY-budget credit-pool plan
+# (no 5h session windows; limits.monthly only). Market-routed as T4-included with a
+# monthly window + ~90% delist guard (dead-time penalty ~30 days). See plan
+# plans/ollama3-burn-reduction-2026-09-02.md Phases A/C.
+OLLAMA_CLOUD_KEY_3 = _EXTERNAL_KEYS.get("ollama_cloud_3", "")
+# Ollama Cloud key #4 (sleepy_easley_477, ollama4@embedsmart.de) — $20/mo
+# weekly-pool subscription, same shape as #1/#2 (500M/wk included + 5h session
+# windows; no monthly special-casing). Added 2026-09-06: keys 1-3 exhaust
+# mid-week at fleet demand (~1.78B in-tokens/wk) and the relief fell to
+# metered lanes. plans/fleet-recovery-chutes-wiring-2026-09-06.md Phase 0.
+OLLAMA_CLOUD_KEY_4 = _EXTERNAL_KEYS.get("ollama_cloud_4", "")
+
+# All registered Ollama Cloud keys — the _try_ollama_cloud_any dispatcher
+# iterates this list. Key #1 first (backward compat), key #2 as failover, key
+# #3 LAST as the monthly-budget relief valve (oc/oc2 drain 5h windows daily, so
+# they stay primary; oc3 absorbs overflow to protect its ~30-day pool from early
+# exhaustion). Key #4 rides the remaining-quota order (fullest first) — a fresh
+# pool enters rotation at the head until it draws down. Empty keys are dropped
+# below.
+_OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = [
+    ("ollama_cloud", OLLAMA_CLOUD_KEY),
+    ("ollama_cloud_2", OLLAMA_CLOUD_KEY_2),
+    ("ollama_cloud_3", OLLAMA_CLOUD_KEY_3),
+    ("ollama_cloud_4", OLLAMA_CLOUD_KEY_4),
+]
+_OLLAMA_CLOUD_KEYS = [(n, k) for n, k in _OLLAMA_CLOUD_KEYS if k]  # drop empty
+
+# DeepInfra — preferred external failover (prompt caching reduces effective cost)
+DEEPINFRA_KEY = _EXTERNAL_KEYS.get("deepinfra", "")
+DEEPINFRA_BASE = "https://api.deepinfra.com/v1/openai"
+DEEPINFRA_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("deepinfra_balance", "5.0") or "5.0")
+
+# Telnyx — Kimi K3 failover provider (demo endpoint needs no API key)
+# Demo endpoint: POST https://telnyx.com/api/inference (10 req/min, SSE streaming)
+# Production API: https://api.telnyx.com/v2/ai (requires account + API key)
+TELNYX_KEY = _EXTERNAL_KEYS.get("telnyx", "")
+TELNYX_BASE = "https://api.telnyx.com/v2/ai"
+TELNYX_DEMO_URL = "https://telnyx.com/api/inference"
+TELNYX_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("telnyx_balance", "10.0") or "10.0")
+
+# DeepSeek Direct — per-token provider, operator-pasted key 2026-09-06.
+# Pricing from https://api-docs.deepseek.com/quick_start/pricing (verified live).
+# DeepSeek uses its own peak hours (UTC 01:00-04:00 + 06:00-10:00 Mon-Fri).
+DEEPSEEK_KEY = _EXTERNAL_KEYS.get("deepseek", "")
+DEEPSEEK_BASE = "https://api.deepseek.com"
+
+# OpenCode Go — $10/month flat-rate subscription (GLM-5.2/5.3, Kimi, DeepSeek)
+OPENCODE_GO_KEY = _EXTERNAL_KEYS.get("opencode_go", "")
+OPENCODE_GO_BASE = "https://opencode.ai/zen/go/v1"
+
+# NeuralWatt — per-token (deepseek-v4-flash $0.14/M, prompt caching at $0.03/M)
+NEURALWATT_KEY = _EXTERNAL_KEYS.get("neuralwatt", "")
+NEURALWATT_BASE = "https://api.neuralwatt.com/v1"
+
+# Startup diagnostics — print key/balance status like other external providers
+print(f"[telnyx] key={'loaded' if TELNYX_KEY else 'MISSING'} "
+      f"suffix={TELNYX_KEY[-4:] if TELNYX_KEY else 'N/A'} "
+      f"starting_balance=${TELNYX_STARTING_BALANCE:.2f}", flush=True)
+
+# Models that have Telnyx fallback when Ollama Cloud fails
+_TELNYX_FALLBACK_MODELS = {"kimi-k2.7-code", "kimi-k3:cloud", "kimi-k3"}
+
+# Models that route DIRECTLY to Telnyx (bypass z.ai entirely — these models
+# don't exist on z.ai).  The proxy sends them straight to Telnyx's API.
+_TELNYX_DIRECT_MODELS = {"kimi-k3"}
+
+# Provider failover sort: cost is primary (cheapest first). When costs tie,
+# providers with fewer recent failures are tried first (from _provider_health).
+# The old static _PROVIDER_PRIORITY dict was removed — the Kalman-adjusted
+# cost from _get_provider_cost() + failure_count from _provider_health now
+# fully determine ordering. LiveRouter (Kalman-based) runs as the primary
+# routing system; this only affects the fallback path.
+
+# Per-provider model name translation.
+# PPQ/OpenRouter use canonical short IDs (e.g., "deepseek/deepseek-v4-pro")
+# but DeepInfra expects case-sensitive dotted form (e.g., "deepseek-ai/DeepSeek-V4-Pro").
+# Any provider not in this dict uses ext_model verbatim.
+_PROVIDER_MODEL_NAMES = {
+    "deepinfra": {
+        "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
+        "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+        "glm-5.2":                    "zai-org/GLM-5.2",
+        "glm-5.3":                    "zai-org/GLM-5.3",
+    },
+    # Telnyx is Kimi-only by operator decision (2026-08-20): glm-5.2 ran
+    # ~$12/M blended here vs ~$0.26-1.30/M on deepinfra/ppq/openrouter.
+    # The generic failover guard below skips Telnyx for any model missing
+    # from this map (verbatim-name passthrough would otherwise still hit it).
+    "telnyx": {
+        "kimi-k3":         "moonshotai/Kimi-K3",
+        "kimi-k2.5":       "moonshotai/Kimi-K2.5",
+        "gpt-5":           "openai/gpt-5",
+        "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
+        "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",
+        "kimi-k3:cloud":   "moonshotai/Kimi-K2.5",  # Fallback to cheaper K2.5 (K3 costs extra on Ollama Cloud)
+        "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
+    },
+    "openrouter": {
+        "glm-5.2":                    "z-ai/glm-5.2",
+        "kimi-k3":                    "moonshotai/kimi-k3",
+        "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro":    "deepseek/deepseek-v4-pro",
+    },
+    # Chutes — transient lane (ADR-014, onboarded 2026-09-06). Verified live
+    # slugs from llm.chutes.ai/v1. NOTE: Chutes serves reasoning models whose
+    # completion_tokens include hidden CoT — GLM-5.2 needs max_tokens >= 2048
+    # on dispatch or responses come back empty. The proxy forwards the
+    # client's max_tokens verbatim (no special handling, by design): clients
+    # requesting glm-5.2 via chutes must send max_tokens >= 2048 themselves.
+    "chutes": {
+        "deepseek/deepseek-v4-flash":  "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
+    },
+    "ppq": {
+        "glm-5.2":                    "z-ai/glm-5.2",
+        "kimi-k3":                    "moonshotai/kimi-k3",
+        "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
+    },
+    "opencode_go": {
+        "glm-5.2":                    "glm-5.2",
+        "glm-5.3":                    "glm-5.3",
+        "kimi-k3":                    "kimi-k3",
+        "kimi-k2.7-code":             "kimi-k2.7-code",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
+    },
+    "neuralwatt": {
+        "glm-5.2":                    "glm-5.2",
+        "kimi-k3":                    "kimi-k3",
+        "kimi-k2.7-code":             "kimi-k2.7-code",
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
+        "deepseek/gemma-4-31b":        "gemma-4-31b",
+    },
+    "ollama_cloud": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_2": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_3": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+    "ollama_cloud_4": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+    },
+}
+
+# NeuralWatt per-model pricing ($/M tokens) for accurate cost_usd logging.
+# The Kalman filter refines from this seed as real cost_usd data accumulates.
+NEURALWATT_RATES: dict[str, dict[str, float]] = {
+    "deepseek-v4-flash":     {"input": 0.14, "cached_input": 0.03, "output": 0.28},
+    "deepseek-v4-pro":       {"input": 1.00, "cached_input": 0.10, "output": 3.00},
+    "gemma-4-31b":            {"input": 0.14, "cached_input": 0.01, "output": 0.42},
+    "glm-5.2":               {"input": 1.45, "cached_input": 0.14, "output": 4.50},
+    "kimi-k3":               {"input": 1.45, "cached_input": 0.14, "output": 4.50},  # same tier as glm
+}
+
+EXTERNAL_PROVIDERS = {
+    "deepinfra": {
+        "base_url": DEEPINFRA_BASE,
+        "key": DEEPINFRA_KEY,
+    },
+    "telnyx": {
+        "base_url": TELNYX_BASE,
+        "key": TELNYX_KEY,
+    },
+    "ppq": {
+        "base_url": "https://api.ppq.ai/v1",
+        "key": _EXTERNAL_KEYS.get("ppq", ""),
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "key": _EXTERNAL_KEYS.get("openrouter", ""),
+    },
+    # Chutes — transient inference lane (ADR-014, onboarded 2026-09-06).
+    # Plus plan: 2000 req/day + $50/mo + $4.17/4h-burst caps. $0.096/M eff
+    # seed on DS-V4-Flash; Kalman refines from real cost data.
+    "chutes": {
+        "base_url": "https://llm.chutes.ai/v1",
+        "key": _EXTERNAL_KEYS.get("chutes", ""),
+    },
+    "routstr": {
+        # Our own VPS2 routstr node — z.ai-backed upstream, Cashu-metered.
+        # Identity model mapping (node uses the same IDs as us).
+        "base_url": _EXTERNAL_KEYS.get("routstr_base", "http://23.182.128.51:8009") + "/v1",
+        "key": _EXTERNAL_KEYS.get("routstr", ""),
+    },
+    "routstrd": {
+        # Local routstrd daemon — buys from cheapest network node via Cashu.
+        # Model IDs come from the network catalog (same short IDs as ours).
+        "base_url": _EXTERNAL_KEYS.get("routstrd_base", "http://localhost:8008") + "/v1",
+        "key": _EXTERNAL_KEYS.get("routstrd", ""),
+    },
+    "neuralwatt": {
+        # NeuralWatt — per-token, deepseek-v4-flash $0.14/M, prompt caching.
+        "base_url": NEURALWATT_BASE,
+        "key": NEURALWATT_KEY,
+    },
+    "deepseek": {
+        # DeepSeek Direct — per-token, $0.22/$0.007 cache-miss/cache-hit input, $0.66 output (off-peak flash).
+        # Peak UTC 01:00-04:00 + 06:00-10:00 Mon-Fri (half price all other hours).
+        "base_url": DEEPSEEK_BASE,
+        "key": DEEPSEEK_KEY,
+    },
+}
+
+# Fallback models — chosen based on the requesting profile's quality tier.
+# Manager (glm-5.2): quality floor at deepseek-v4-pro (55.4% SWE-bench).
+#   NEVER falls back to flash — returns error instead of low-quality output.
+# Workers (glm-4.5-flash): cheapest available is fine (output gets vetted).
+MANAGER_FALLBACK_MODEL = "glm-5.2"
+WORKER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+
+# ── Known external model detection (FIX: silent substitution, 2026-08-25) ───
+# Models that are recognized by at least one external provider. If a model
+# is in this set (or starts with a known provider prefix), _try_external_failover
+# passes it through to the provider verbatim instead of silently substituting
+# WORKER_FALLBACK_MODEL. Unknown models cause failover to return False so the
+# caller sends a proper 404/503 — never HTTP 200 with a different model.
+_KNOWN_EXTERNAL_PREFIXES = ("deepseek/", "qwen", "minimax", "mimo")
+
+def _is_known_external_model(model: str | None) -> bool:
+    """Check if a model is known to at least one external provider.
+
+    A model is 'known' if:
+      1. It appears in _PROVIDER_MODEL_NAMES for any provider, OR
+      2. It starts with a known provider prefix (deepseek/, qwen, minimax, mimo), OR
+      3. It matches any model in the flat router's PROVIDER_MODELS sets.
+
+    Short-form aliases (e.g. "deepseek-v4-flash") are canonicalized first
+    (single source of truth: flat_router.canonicalize_model) so they are
+    recognized even though registries list the canonical ID.
+    """
+    if not model:
+        return False
+    model = model.strip()
+    # Canonicalize aliases before any registry/prefix check
+    try:
+        from flat_router import canonicalize_model as _fr_canonicalize
+        model = _fr_canonicalize(model) or model
+    except Exception:
+        pass
+    # Check known prefixes
+    if model.startswith(_KNOWN_EXTERNAL_PREFIXES):
+        return True
+    # Check _PROVIDER_MODEL_NAMES (per-provider model mapping)
+    for _prov_map in _PROVIDER_MODEL_NAMES.values():
+        if model in _prov_map:
+            return True
+    # Check flat router PROVIDER_MODELS
+    try:
+        from flat_router import PROVIDER_MODELS
+        for _models in PROVIDER_MODELS.values():
+            if model in _models:
+                return True
+    except Exception:
+        pass
+    # Check z.ai native models (these are handled by z.ai keys, but if
+    # they reach failover, ollama_cloud can serve them)
+    if model in ("glm-5.2", "glm-5.3", "glm-4.5-flash", "glm-4.5-air", "glm-4.5"):
+        return True
+    return False
+
+# z.ai peak hours: Beijing 14:00-18:00 = UTC 6-10. During peak, z.ai burns 3x quota.
+# Ollama Cloud has no peak pricing — prefer it during these hours.
+_PEAK_HOURS_UTC = {6, 7, 8, 9, 10}
+
+def _is_peak_hour() -> bool:
+    """Check if current UTC hour is a z.ai peak hour."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).hour in _PEAK_HOURS_UTC
+
+# ── provider funding tracker ────────────────────────────────────────────────
+# Tracks which providers have credits remaining. A 402 response marks a
+# provider unfunded for 1 hour (credits may be replenished). The failover
+# logic only tries funded providers, sorted by cost.
+_UNFUNDED_RETRY_SECONDS = 300  # retry unfunded provider after 5 min
+
+_provider_health: dict[str, dict] = {}
+
+
+def _is_provider_funded(name: str) -> bool:
+    """Check if a provider has credits. Unfunded providers are retried
+    after _UNFUNDED_RETRY_SECONDS."""
+    h = _provider_health.get(name)
+    if not h or h.get("funded", True):
+        return True
+    return time.time() >= h.get("retry_after", 0)
+
+
+def _mark_unfunded(name: str) -> None:
+    """Mark a provider as out of credits (after receiving 402)."""
+    _provider_health[name] = {
+        "funded": False,
+        "last_402": time.time(),
+        "retry_after": time.time() + _UNFUNDED_RETRY_SECONDS,
+    }
+
+
+def _mark_funded(name: str) -> None:
+    """Mark a provider as funded again (successful response)."""
+    _provider_health[name] = {"funded": True}
+
+
+# ── z.ai key health tracker ─────────────────────────────────────────────────
+# Same pattern as _provider_health, but for z.ai keys. When a key returns
+# an empty response or 429, it's marked exhausted with BINARY EXPONENTIAL
+# BACKOFF: each consecutive failure doubles the retry-after delay (capped
+# at 1 hour). best_key() skips exhausted keys. When both are exhausted,
+# the proxy fails over to external providers (PPQ/OpenRouter).
+#
+# Manual override: drop a flag file ~/.hermes/bot/.key_disabled_<name> to
+# force a key to be treated as unhealthy (e.g. a cancelled subscription).
+# Re-enable with: rm ~/.hermes/bot/.key_disabled_<name>
+
+# Exponential backoff ramp for QUOTA-EXHAUSTION failures (429 / empty response).
+# Spec: 2s→4s→8s→16s→32s→60s (capped). A single 429 blocks a key for only 2s so
+# the other key / external failover covers traffic immediately; repeated 429s
+# escalate up to the 60s cap.
+# Extended for high failure counts: after 6 consecutive exhaustions, the key is
+# clearly quota-exhausted (not transient). Backoff escalates to 5min (11-20
+# failures) then 15min (21+) to stop retry storms on keys that take hours to
+# reset. This prevents the ollama_cloud_2 scenario (79 consecutive 60s retries).
+_BACKOFF_SEQUENCE = (2, 4, 8, 16, 32, 60)
+_BACKOFF_HIGH_THRESHOLD = 6     # failures beyond _BACKOFF_SEQUENCE length
+_BACKOFF_HIGH_SECONDS = 300     # 5 min for failures 7-20
+_BACKOFF_VERY_HIGH_THRESHOLD = 20  # failures beyond this → 15 min
+_BACKOFF_VERY_HIGH_SECONDS = 900   # 15 min for 21+ failures
+
+# Dead key (401/403) — auth failure, likely revoked/cancelled. Flat 1h: a dead
+# key will not recover by retrying quickly, so park it for an hour.
+_DEAD_KEY_BACKOFF_SECONDS = 3600
+
+# Upstream server error (500/502/503/504) — transient, not the key's fault.
+# Medium flat backoff.
+_SERVER_ERROR_BACKOFF_SECONDS = 30
+
+# Log a KEY_DEAD anomaly after this many consecutive failures of any type —
+# surfaces persistently-failing keys (e.g. a cancelled subscription) to dashboards.
+_KEY_DEAD_THRESHOLD     = 7
+
+_zai_key_health: dict[str, dict] = {}
+
+
+def _disabled_flag_path(name: str) -> Path:
+    """Filesystem flag path used to manually disable key *name*."""
+    return Path.home() / ".hermes" / "bot" / f".key_disabled_{name}"
+
+
+# ── Ollama Cloud paywall flag (G1/G2) ───────────────────────────────────────
+# Ollama signals quota exhaustion on the largest plan as 403 "requires a
+# subscription" — NOT 429 — and the quota tracker's LOCAL token counting
+# can't see the server-side weekly window. The 403 handler arms this file
+# with the next Monday-00:00-UTC reset (minus probe margin). While fresh:
+#   * _is_key_healthy('ollama_cloud') → False (skip round-trips)
+#   * quota state used_pct=100 → quota_pressure +inf (price-level avoidance)
+_OLLAMA_PAYWALL_FLAG = Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until"
+
+# Per-key paywall flag paths. Key #1 keeps the historical filename (no
+# migration needed); key #2 gets its own suffix. Looked up by key_name.
+_OLLAMA_PAYWALL_FLAGS: dict[str, Path] = {
+    "ollama_cloud": _OLLAMA_PAYWALL_FLAG,
+    "ollama_cloud_2": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_2",
+    "ollama_cloud_3": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_3",
+    "ollama_cloud_4": Path.home() / ".hermes" / "bot" / ".ollama_exhausted_until_4",
+}
+
+
+def _next_monday_utc(now: float | None = None) -> float:
+    """Next Monday 00:00 UTC strictly after *now* (86400*4 probe margin is
+    subtracted by the caller, not here)."""
+    import datetime as _dt
+    now = now if now is not None else time.time()
+    d = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc)
+    days_ahead = (7 - d.weekday()) % 7  # Monday=0
+    if days_ahead == 0 and d.time() == _dt.time(0, 0):
+        days_ahead = 7
+    nxt = (d + _dt.timedelta(days=days_ahead)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return nxt.timestamp()
+
+
+def _arm_ollama_paywall_flag(key_name: str = "ollama_cloud") -> float:
+    """Arm the per-key paywall flag until next Monday 00:00 UTC minus a 4h
+    probe margin. Returns the armed expiry. Never raises."""
+    try:
+        until = _next_monday_utc() - 4 * 3600
+        flag = _OLLAMA_PAYWALL_FLAGS.get(key_name, _OLLAMA_PAYWALL_FLAG)
+        flag.write_text(str(until))
+        return until
+    except Exception:
+        return 0.0
+
+
+def _ollama_paywall_active(key_name: str = "ollama_cloud") -> bool:
+    """True while the per-key persisted paywall flag is fresh. Never raises."""
+    try:
+        flag = _OLLAMA_PAYWALL_FLAGS.get(key_name, _OLLAMA_PAYWALL_FLAG)
+        if not flag.exists():
+            return False
+        return time.time() < float(flag.read_text().strip())
+    except Exception:
+        return False
+
+
+def _is_manually_disabled(name: str) -> bool:
+    """True iff the operat

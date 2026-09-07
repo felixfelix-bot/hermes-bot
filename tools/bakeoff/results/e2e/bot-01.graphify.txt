@@ -1,0 +1,6 @@
+The concrete resolve function is `resolve_tier()` in `flat_router.py` (community Model Tier Resolution). That's where a tier alias like `tier/coding-worker` is resolved to provider and model.
+
+flat_router.py
+model_selector.py
+model_tier_router.py
+zai_proxy.py

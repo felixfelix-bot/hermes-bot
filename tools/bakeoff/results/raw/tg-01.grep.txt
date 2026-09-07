@@ -1,0 +1,781 @@
+CMD: rg -i --no-heading -n -m 50 fn main .
+RC: 0  ERR: 
+
+./crates/tollgate-net/src/main.rs:216:async fn main() {
+
+<<<naive-read ./crates/tollgate-net/src/main.rs>>>
+use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use tollgate_net::{cdk_wallet, client, mock, server, v1};
+
+#[cfg(feature = "spilman")]
+use {cashu::nuts::SecretKey, tollgate_net::spilman_service::SpilmanService, tollgate_net::SqliteChannelStorage};
+
+#[derive(Parser)]
+#[command(name = "tollgate-net", about = "TollGate v2 network node")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum WalletType {
+    Mock,
+    Cdk,
+    #[cfg(feature = "spilman")]
+    Spilman,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run as a provider (sells network access)
+    Provider {
+        /// Port to listen on
+        #[arg(long, default_value = "3001")]
+        port: u16,
+        /// Wallet backend: "mock" (default) or "cdk"
+        #[arg(long, default_value = "mock")]
+        wallet: WalletType,
+        /// Mint URL (only used with --wallet cdk)
+        #[arg(long, default_value = "https://testnut.cashu.exchange")]
+        mint_url: String,
+        /// Path to SQLite channel database (persists channels across restarts, only for --wallet spilman)
+        #[arg(long)]
+        channel_db: Option<String>,
+    },
+    /// Run as a client (buys network access)
+    Client {
+        /// Provider URL to connect to
+        #[arg(long, default_value = "http://localhost:3001")]
+        peer: String,
+        /// Number of metering intervals to run
+        #[arg(long, default_value = "20")]
+        intervals: u32,
+        /// Interval duration in seconds
+        #[arg(long, default_value = "1")]
+        interval_secs: u64,
+        /// Wallet backend: "mock" (default) or "cdk"
+        #[arg(long, default_value = "mock")]
+        wallet: WalletType,
+        /// Mint URL (only used with --wallet cdk)
+        #[arg(long, default_value = "https://testnut.cashu.exchange")]
+        mint_url: String,
+        /// Seller's Spilman receiver public key (hex, required for --wallet spilman)
+        #[arg(long)]
+        receiver_pubkey: Option<String>,
+        /// Skip cooperative close and disconnect (for unilateral close testing)
+        #[arg(long, default_value = "false")]
+        no_close: bool,
+        /// Path to SQLite channel database (persists channels across restarts, only for --wallet spilman)
+        #[arg(long)]
+        channel_db: Option<String>,
+    },
+    /// Run as a v1 server (accepts Cashu token payments for network access)
+    V1Server {
+        /// Port to listen on (default: 2121)
+        #[arg(long, default_value = "2121")]
+        port: u16,
+        /// Metric type: "milliseconds" or "bytes"
+        #[arg(long, default_value = "milliseconds")]
+        metric: String,
+        /// Step size (e.g. 60000 for 1 minute when metric is milliseconds)
+        #[arg(long, default_value = "60000")]
+        step_size: u64,
+        /// Mint URL to accept
+        #[arg(long, default_value = "https://testnut.cashu.exchange")]
+        mint_url: String,
+        /// Price per step in sats
+        #[arg(long, default_value = "1")]
+        price_per_step: u64,
+        /// Minimum purchase steps
+        #[arg(long, default_value = "1")]
+        min_steps: u64,
+        /// Wallet backend
+        #[arg(long, default_value = "mock")]
+        wallet: WalletType,
+        /// Path to JSON config file (overrides CLI args for metric/step_size/mints)
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to Nostr key file (loads or generates new keys)
+        #[arg(long)]
+        keys: Option<String>,
+        /// Valve backend: "stub" (default), "noop", or "nds" (NoDogSplash, requires --features nds)
+        #[arg(long, default_value = "stub", value_name = "stub|noop|nds")]
+        valve: String,
+        /// Path to ndsctl binary (only used with --valve nds, default: auto-detect)
+        #[arg(long)]
+        ndsctl_path: Option<String>,
+        /// Enable network interface monitoring via netlink (Linux) or stub (other OS).
+        /// Logs link/address/route changes. Required for upstream WiFi management.
+        #[arg(long, default_value = "false")]
+        monitor: bool,
+        /// Interfaces to monitor (comma-separated, empty = all except lo)
+        #[arg(long, value_delimiter = ',')]
+        monitor_interfaces: Vec<String>,
+        /// Path to Unix domain socket for the CLI server (e.g. /var/run/tollgate.sock).
+        /// If unset, no CLI socket is started. Matches Go v1's CLIServer.
+        #[arg(long)]
+        cli_socket: Option<String>,
+        /// Path to JSON config file for `tollgate config get/set/save` commands.
+        /// Only used when --cli-socket is set.
+        #[arg(long)]
+        cli_config: Option<String>,
+        /// Path to SQLite session database (persists sessions across restarts).
+        /// Defaults to in-memory if not provided.
+        #[arg(long)]
+        session_db: Option<String>,
+        /// Path to SQLite channel database (persists channels across restarts, only for --wallet spilman).
+        #[arg(long)]
+        channel_db: Option<String>,
+    },
+    /// Run as a v1 client (pays upstream TollGate routers via TIP-03)
+    V1Client {
+        /// Gateway IP of the upstream TollGate
+        #[arg(long)]
+        gateway: String,
+        /// MAC address of our interface (device-identifier)
+        #[arg(long, default_value = "00:00:00:00:00:00")]
+        mac: String,
+        /// Mint URL (must match an accepted mint on the upstream TollGate)
+        #[arg(long, default_value = "https://testnut.cashu.exchange")]
+        mint_url: String,
+        /// Currency unit
+        #[arg(long, default_value = "sat")]
+        unit: String,
+        /// Preferred allotment (milliseconds for time, bytes for data)
+        #[arg(long, default_value = "60000")]
+        preferred_allotment: u64,
+        /// Usage polling interval in seconds
+        #[arg(long, default_value = "1")]
+        poll_interval: u64,
+        /// Renewal threshold (0.0–1.0, renew when usage reaches this fraction)
+        #[arg(long, default_value = "0.8")]
+        renewal_threshold: f64,
+        /// Max price per millisecond (0 = no limit)
+        #[arg(long, default_value = "0.01")]
+        max_price_per_ms: f64,
+        /// Max price per byte (0 = no limit)
+        #[arg(long, default_value = "0.0001")]
+        max_price_per_byte: f64,
+    },
+    /// Send a command to the running server's CLI socket
+    Cli {
+        /// Command to send (status, version, wallet balance, wallet info, health, config get/set)
+        command: String,
+        /// Arguments for the command
+        #[arg(default_value = "")]
+        args: Vec<String>,
+        /// Output as JSON (matches Go v1's --json flag behavior)
+        #[arg(long)]
+        json: bool,
+        /// Path to the CLI socket (default: /var/run/tollgate.sock)
+        #[arg(long, default_value = "/var/run/tollgate.sock")]
+        socket: String,
+    },
+    /// Run as a v1 client with auto-discovery (probes multiple gateways, creates sessions automatically)
+    V1ClientAuto {
+        /// Gateway IPs to probe (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        gateway_ips: Vec<String>,
+        /// MAC address of our interface (device-identifier)
+        #[arg(long, default_value = "00:00:00:00:00:00")]
+        mac: String,
+        /// Network interface name (for session management)
+        #[arg(long, default_value = "eth0")]
+        interface: String,
+        /// Mint URL (must match an accepted mint on the upstream TollGate)
+        #[arg(long, default_value = "https://testnut.cashu.exchange")]
+        mint_url: String,
+        /// Currency unit
+        #[arg(long, default_value = "sat")]
+        unit: String,
+        /// Preferred allotment (milliseconds for time, bytes for data)
+        #[arg(long, default_value = "60000")]
+        preferred_allotment: u64,
+        /// Usage polling interval in seconds
+        #[arg(long, default_value = "1")]
+        poll_interval: u64,
+        /// Renewal threshold (0.0–1.0, renew when usage reaches this fraction)
+        #[arg(long, default_value = "0.8")]
+        renewal_threshold: f64,
+        /// Max price per millisecond (0 = no limit)
+        #[arg(long, default_value = "0.01")]
+        max_price_per_ms: f64,
+        /// Max price per byte (0 = no limit)
+        #[arg(long, default_value = "0.0001")]
+        max_price_per_byte: f64,
+        /// Scan interval in seconds (how often to probe gateways)
+        #[arg(long, default_value = "30")]
+        scan_interval: u64,
+        /// Probe timeout in seconds (per-gateway)
+        #[arg(long, default_value = "5")]
+        probe_timeout: u64,
+        /// Skip Nostr signature verification on advertisements
+        #[arg(long, default_value = "false")]
+        no_verify_signature: bool,
+    },
+}
+
+#[tokio::main]
+#[allow(clippy::too_many_lines)]
+async fn main() {
+    v1::server::init_logging("info");
+
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Provider {
+            port,
+            wallet: wt,
+            mint_url,
+            channel_db,
+        } => match wt {
+            WalletType::Mock => {
+                let wallet = Arc::new(mock::MockWallet::new(0));
+                server::run(port, wallet).await;
+            }
+            WalletType::Cdk => {
+                let wallet = Arc::new(
+                    cdk_wallet::CdkWallet::new(&mint_url, [1u8; 64])
+                        .await
+                        .expect("failed to create CDK wallet"),
+                );
+                server::run(port, wallet).await;
+            }
+            #[cfg(feature = "spilman")]
+            WalletType::Spilman => {
+                let wallet = Arc::new(
+                    cdk_wallet::CdkWallet::new(&mint_url, [1u8; 64])
+                        .await
+                        .expect("failed to create CDK wallet"),
+                );
+                let receiver_secret = SecretKey::generate();
+                let _ = &channel_db; // provider-side persistence not yet wired
+                server::run_spilman(port, wallet, receiver_secret, &mint_url).await;
+            }
+        },
+        Commands::Client {
+            peer,
+            intervals,
+            interval_secs,
+            wallet: wt,
+            mint_url,
+            receiver_pubkey,
+            no_close,
+            channel_db,
+        } => match wt {
+            WalletType::Mock => {
+                let _ = (&receiver_pubkey, &no_close);
+                client::run_mock(&peer, intervals, interval_secs, 200).await;
+            }
+            WalletType::Cdk => {
+                let _ = (&receiver_pubkey, &no_close);
+                let wallet = Arc::new(
+                    cdk_wallet::CdkWallet::new(&mint_url, [2u8; 64])
+                        .await
+                        .expect("failed to create CDK wallet"),
+                );
+                client::run_cdk(&peer, intervals, interval_secs, wallet, &mint_url).await;
+            }
+            #[cfg(feature = "spilman")]
+            WalletType::Spilman => {
+                let wallet = Arc::new(
+                    cdk_wallet::CdkWallet::new(&mint_url, [2u8; 64])
+                        .await
+                        .expect("failed to create CDK wallet"),
+                );
+                let sender_secret = SecretKey::generate();
+                let storage = if let Some(ref db_path) = channel_db {
+                    SqliteChannelStorage::open(std::path::Path::new(db_path))
+                        .expect("failed to open channel DB")
+                } else {
+                    SqliteChannelStorage::open_in_memory()
+                        .expect("failed to create in-memory channel storage")
+                };
+                let host = cdk_spilman::ConfigurableClientHost::new(storage);
+                #[allow(clippy::arc_with_non_send_sync)]
+                let spilman = Arc::new(SpilmanService::from_host(
+                    &mint_url,
+                    sender_secret,
+                    host,
+                ));
+                let receiver_pk = receiver_pubkey.as_deref().unwrap_or_else(|| {
+                    eprintln!("ERROR: --receiver-pubkey is required for --wallet spilman");
+                    eprintln!(
+                        "Start the provider first; it prints its receiver pubkey on startup."
+                    );
+                    std::process::exit(1);
+                });
+                client::run_spilman(
+                    &peer,
+                    intervals,
+                    interval_secs,
+                    wallet,
+                    spilman,
+                    receiver_pk,
+                    &mint_url,
+                    no_close,
+                )
+                .await;
+            }
+        },
+        Commands::V1Server {
+            port,
+            metric,
+            step_size,
+            mint_url,
+            price_per_step,
+            min_steps,
+            wallet: wt,
+            config: config_path,
+            keys: keys_path,
+            valve,
+            ndsctl_path,
+            monitor: enable_monitor,
+            monitor_interfaces,
+            cli_socket,
+            cli_config,
+            session_db,
+            channel_db: _,
+        } => {
+            use std::time::Duration;
+            use v1::server::payout::{PayoutConfig, PayoutTarget};
+            use v1::server::NetworkMonitor;
+            use v1::server::Valve;
+
+            let nostr_keys = match keys_path {
+                Some(path) => v1::server::load_or_generate_keys(&path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load/generate keys from {path}: {e}");
+                    std::process::exit(1);
+                }),
+                None => nostr::prelude::Keys::generate(),
+            };
+            let server_config = if let Some(ref path) = config_path {
+                // Load from config file, then apply CLI overrides for
+                // port/metric/step_size (UCI may provide different values
+                // than what's in the config file).
+                let mut sc = v1::server::ServerConfig::load_from_file(path).unwrap_or_else(|e| {
+                    eprintln!("Failed to load config from {path}: {e}");
+                    std::process::exit(1);
+                });
+                sc.metric.clone_from(&metric);
+                sc.step_size = step_size;
+                sc
+            } else {
+                let mut sc = v1::server::ServerConfig {
+                    metric,
+                    step_size,
+                    ..v1::server::ServerConfig::default()
+                };
+                sc.accepted_mints = vec![v1::server::config::MintConfig {
+                    url: mint_url.clone(),
+                    min_balance: 64,
+                    balance_tolerance_percent: 10,
+                    payout_interval_seconds: 60,
+                    min_payout_amount: 128,
+                    price_per_step,
+                    price_unit: "sat".to_owned(),
+                    purchase_min_steps: min_steps,
+                }];
+                sc
+            };
+            let validation_errors = server_config.validate();
+            if !validation_errors.is_empty() {
+                for e in &validation_errors {
+                    eprintln!("config error: {e}");
+                }
+                std::process::exit(1);
+            }
+            let config = server_config.to_server_config(nostr_keys, port);
+            let server = v1::server::V1Server::new(config);
+            let server = match cli_socket.clone() {
+                Some(path) => server.with_cli_socket(path),
+                None => server,
+            };
+            let server = match cli_config.clone() {
+                Some(path) => server.with_cli_config_path(path),
+                None => server,
+            };
+
+            #[allow(clippy::single_match_else)]
+            let valve: Arc<dyn Valve + Send + Sync> = match valve.as_str() {
+                "noop" => {
+                    tracing::info!("Using noop valve (RADIUS deployment, enforcement via Session-Timeout + CoA)");
+                    Arc::new(v1::server::NoopValve) as Arc<dyn Valve + Send + Sync>
+                }
+                "nds" => {
+                    #[cfg(feature = "nds")]
+                    {
+                        let ndsctl = ndsctl_path.as_deref().unwrap_or("ndsctl");
+                        let path = std::path::PathBuf::from(ndsctl);
+                        if path.exists() {
+                            tracing::info!(ndsctl_path = %path.display(), "Using NDS valve");
+                            Arc::new(v1::server::NdsValve::with_ndsctl_path(path))
+                                as Arc<dyn Valve + Send + Sync>
+                        } else {
+                            tracing::error!(
+                                ndsctl_path = %path.display(),
+                                "ndsctl not found; falling back to stub valve (NO real gating)"
+                            );
+                            Arc::new(v1::server::StubValve)
+                        }
+                    }
+                    #[cfg(not(feature = "nds"))]
+                    {
+                        let _ = ndsctl_path;
+                        tracing::error!(
+                            "--valve nds requested but binary built without the 'nds' feature; \
+                             falling back to stub valve (NO real gating). Rebuild with --features nds."
+                        );
+                        Arc::new(v1::server::StubValve)
+                    }
+                }
+                _ => {
+                    tracing::info!("Using stub valve (no real traffic control)");
+                    Arc::new(v1::server::StubValve)
+                }
+            };
+
+            // Spawn network monitor if requested. The monitor emits NetworkEvent
+            // (interface up/down, address changes) which the upcoming upstream
+            // WiFi manager will consume. For now we log events for observability.
+            let monitor_cancel = if enable_monitor {
+                let mon_config = v1::server::NetworkMonitorConfig {
+                    only_interfaces: if monitor_interfaces.is_empty() {
+                        vec![]
+                    } else {
+                        monitor_interfaces
+                    },
+                    ..v1::server::NetworkMonitorConfig::default()
+                };
+                let monitor = NetworkMonitor::new(mon_config);
+                let cancel = monitor.cancel_token();
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(100);
+
+                tokio::spawn(async move {
+                    if let Err(e) = monitor.start(event_tx).await {
+                        tracing::error!(%e, "NetworkMonitor exited with error");
+                    }
+                });
+
+                tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        match &event {
+                            v1::server::NetworkEvent::InterfaceUp {
+                                name, gateway_ip, ..
+                            } => {
+                                tracing::info!(interface = %name, ?gateway_ip, "NetworkEvent: InterfaceUp");
+                            }
+                            v1::server::NetworkEvent::InterfaceDown { name } => {
+                                tracing::info!(interface = %name, "NetworkEvent: InterfaceDown");
+                            }
+                            v1::server::NetworkEvent::AddressAdded {
+                                interface, address, ..
+                            } => {
+                                tracing::info!(interface = %interface, %address, "NetworkEvent: AddressAdded");
+                            }
+                            v1::server::NetworkEvent::AddressDeleted { interface, address } => {
+                                tracing::info!(interface = %interface, %address, "NetworkEvent: AddressDeleted");
+                            }
+                        }
+                    }
+                });
+
+                tracing::info!("Network monitor enabled");
+                Some(cancel)
+            } else {
+                None
+            };
+
+            match wt {
+                WalletType::Mock => {
+                    let wallet: Arc<dyn tollgate_core::wallet::Wallet> =
+                        Arc::new(mock::MockWallet::new(0));
+                    let merchant = Arc::new(v1::server::MerchantProvider::new(wallet));
+                    // Wire persistent session store if session DB path provided
+                    let server = if let Some(ref db_path) = session_db {
+                        let sess_store = Arc::new(
+                            v1::server::SqliteSessionStore::open(db_path)
+                                .expect("failed to open session DB"),
+                        );
+                        server.with_session_store(sess_store as Arc<dyn v1::server::SessionStore>)
+                    } else {
+                        server
+                    };
+                    server.run(merchant, valve).await;
+                }
+                WalletType::Cdk => {
+                    let mint_urls: Vec<String> = server_config
+                        .accepted_mints
+                        .iter()
+                        .map(|m| m.url.clone())
+                        .collect();
+
+                    let mint_cfg = &server_config.accepted_mints[0];
+                    let profit_share = server_config.profit_share.clone();
+
+                    // Resolve lightning_address from identities.json for payout targets
+                    let identities_path = config_path.as_ref().map_or_else(
+                        || "/etc/tollgate/identities.json".to_owned(),
+                        |p| {
+                            std::path::Path::new(p).parent().map_or_else(
+                                || "/etc/tollgate/identities.json".to_owned(),
+                                |dir| dir.join("identities.json").to_string_lossy().into_owned(),
+                            )
+                        },
+                    );
+                    let identities =
+                        v1::server::config::Identities::load_or_generate(&identities_path)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "Failed to load identities from {identities_path}: {e}"
+                                );
+                                v1::server::config::Identities::default()
+                            });
+
+                    let payout_cfg = PayoutConfig {
+                        min_balance: mint_cfg.min_balance,
+                        min_payout_amount: mint_cfg.min_payout_amount,
+                        tolerance_percent: mint_cfg.balance_tolerance_percent,
+                        payout_interval: Duration::from_secs(mint_cfg.payout_interval_seconds),
+                        targets: profit_share
+                            .into_iter()
+                            .filter_map(|ps| {
+                                let addr = identities
+                                    .lightning_address(&ps.identity)
+                                    .unwrap_or_default();
+                                if addr.is_empty() {
+                                    tracing::warn!(
+                                        identity = %ps.identity,
+                                        "No lightning_address configured for payout target, skipping"
+                                    );
+                                    return None;
+                                }
+                                Some(PayoutTarget {
+                                    identity: ps.identity,
+                                    factor: ps.factor,
+                                    lightning_address: addr,
+                                })
+                            })
+                            .collect(),
+                    };
+
+                    let wallet_result =
+                        cdk_wallet::CdkWallet::try_mints(&mint_urls, [4u8; 64]).await;
+
+                    match wallet_result {
+                        Ok(cdk_wallet) => {
+                            let wallet = Arc::new(cdk_wallet);
+                            let payout =
+                                v1::server::payout::spawn_payout_task(wallet.clone(), payout_cfg);
+                            let server = server
+                                .with_mac_resolver(Arc::new(v1::server::DhcpLeasesResolver))
+                                .with_mint_quote_wallet(wallet.clone());
+                            let wallet_dyn: Arc<dyn tollgate_core::wallet::Wallet> = wallet;
+                            let merchant = Arc::new(v1::server::MerchantProvider::new(wallet_dyn));
+
+                            tokio::select! {
+                                () = async { server.run(merchant, valve).await } => {}
+                                _ = payout => {
+                                    tracing::warn!("payout task finished");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Wallet init failed (mints may be unreachable): {e}");
+                            tracing::warn!("Falling back to degraded mode");
+
+                            let wallet: Arc<dyn tollgate_core::wallet::Wallet> =
+                                Arc::new(v1::server::DegradedWallet);
+                            let merchant = Arc::new(v1::server::MerchantProvider::new(wallet));
+
+                            let health_urls: Vec<String> = server_config
+                                .accepted_mints
+                                .iter()
+                                .map(|m| m.url.clone())
+                                .collect();
+                            let tracker = Arc::new(v1::server::MintHealthTracker::new(health_urls));
+                            tracker.run_initial_probe();
+
+                            let tracker_cb = tracker.clone();
+                            let merchant_cb = merchant.clone();
+                            let recovery_urls = mint_urls.clone();
+                            tracker.set_on_first_reachable(Box::new(move || {
+                                let merchant_cb = merchant_cb.clone();
+                                let tracker_cb = tracker_cb.clone();
+                                let recovery_urls = recovery_urls.clone();
+                                tokio::spawn(async move {
+                                    tracing::info!("Mint became reachable — attempting to upgrade from degraded mode");
+                                    match cdk_wallet::CdkWallet::try_mints(&recovery_urls, [4u8; 64]).await {
+                                        Ok(new_wallet) => {
+                                            let new_wallet: Arc<dyn tollgate_core::wallet::Wallet> = Arc::new(new_wallet);
+                                            merchant_cb.swap(new_wallet);
+                                            tracing::info!("Upgraded from degraded to full merchant");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to create wallet during recovery: {e}");
+                                            tracker_cb.reset_first_reachable();
+                                        }
+                                    }
+                                });
+                            }));
+
+                            server.run(merchant, valve).await;
+                        }
+                    }
+                }
+                #[cfg(feature = "spilman")]
+                WalletType::Spilman => {
+                    let wallet = Arc::new(
+                        cdk_wallet::CdkWallet::new(&mint_url, [4u8; 64])
+                            .await
+                            .expect("failed to create CDK wallet"),
+                    );
+                    let wallet_dyn: Arc<dyn tollgate_core::wallet::Wallet> = wallet;
+                    let merchant = Arc::new(v1::server::MerchantProvider::new(wallet_dyn));
+
+                    // Wire persistent session store if session DB path provided
+                    let server = if let Some(ref db_path) = session_db {
+                        let sess_store = Arc::new(
+                            v1::server::SqliteSessionStore::open(db_path)
+                                .expect("failed to open session DB"),
+                        );
+                        server.with_session_store(sess_store as Arc<dyn v1::server::SessionStore>)
+                    } else {
+                        server
+                    };
+
+                    server.run(merchant, valve).await;
+                }
+            }
+
+            if let Some(cancel) = monitor_cancel {
+                cancel.cancel();
+            }
+        }
+        Commands::V1Client {
+            gateway,
+            mac,
+            mint_url,
+            unit,
+            preferred_allotment,
+            poll_interval,
+            renewal_threshold,
+            max_price_per_ms,
+            max_price_per_byte,
+        } => {
+            let wallet = Arc::new(
+                cdk_wallet::CdkWallet::new(&mint_url, [3u8; 64])
+                    .await
+                    .expect("failed to create CDK wallet"),
+            );
+
+            let config = v1::V1ClientConfig {
+                gateway_ip: gateway,
+                mac_address: mac,
+                our_mint_urls: vec![mint_url],
+                unit,
+                max_price_per_ms,
+                max_price_per_byte,
+                preferred_allotment,
+                poll_interval_secs: poll_interval,
+                renewal_threshold,
+            };
+
+            let mut client = v1::V1Client::<cdk_wallet::CdkWallet>::new(config);
+            if let Err(e) = client.run(wallet).await {
+                tracing::error!("v1 client failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Cli {
+            command,
+            args,
+            json,
+            socket,
+        } => {
+            if let Err(e) = v1::cli::client::run_cli_client(&socket, &command, &args, json) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::V1ClientAuto {
+            gateway_ips,
+            mac,
+            interface,
+            mint_url,
+            unit,
+            preferred_allotment,
+            poll_interval,
+            renewal_threshold,
+            max_price_per_ms,
+            max_price_per_byte,
+            scan_interval,
+            probe_timeout,
+            no_verify_signature,
+        } => {
+            use std::time::Duration;
+
+            let wallet = Arc::new(
+                cdk_wallet::CdkWallet::new(&mint_url, [3u8; 64])
+                    .await
+                    .expect("failed to create CDK wallet"),
+            );
+
+            let client_config = v1::V1ClientConfig {
+                gateway_ip: String::new(),
+                mac_address: mac.clone(),
+                our_mint_urls: vec![mint_url],
+                unit,
+                max_price_per_ms,
+                max_price_per_byte,
+                preferred_allotment,
+                poll_interval_secs: poll_interval,
+                renewal_threshold,
+            };
+
+            let sm_config = v1::session_manager::SessionManagerConfig {
+                client_config,
+                tracker_config: v1::usage_tracker::UsageTrackerConfig {
+                    poll_interval: Duration::from_secs(poll_interval),
+                    renewal_threshold,
+                },
+            };
+
+            let session_manager = Arc::new(v1::session_manager::SessionManager::new(
+                sm_config,
+                wallet.clone(),
+            ));
+
+            let crowsnest_config = v1::crowsnest::CrowsnestConfig {
+                gateway_ips,
+                scan_interval: Duration::from_secs(scan_interval),
+                probe_timeout: Duration::from_secs(probe_timeout),
+                verify_signature: !no_verify_signature,
+                interface_name: interface.clone(),
+                mac_address: mac,
+            };
+
+            let crowsnest =
+                v1::crowsnest::Crowsnest::new(crowsnest_config, session_manager.clone());
+            let crowsnest_cancel = crowsnest.cancel_token();
+            let crowsnest_handle = crowsnest.spawn();
+
+            let sm_cancel = {
+                let sm = session_manager.clone();
+                tokio::spawn(async move {
+                    sm.run().await.ok();
+                })
+            };
+
+            tracing::info!("V1ClientAuto running. Press Ctrl+C to stop.");
+            tokio::signal::ctrl_c().await.ok();
+
+            tracing::info!("Shutting down...");
+            crowsnest_cancel.cancel();
+            session_manager.stop().await;
+            crowsnest_handle.abort();
+            sm_cancel.abort();
+        }
+    }
+}

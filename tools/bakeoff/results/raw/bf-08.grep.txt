@@ -1,0 +1,162 @@
+CMD: rg -i --no-heading -n -m 50 analyze_spi .
+RC: 0  ERR: 
+
+./Makefile:300:	@python3 scripts/analyze_spi.py "$(FILE)"
+./docs/plan-esp32-vs-rp2040-benchmark.md:126:- Run analyze_spi.py on all 3 captures
+./docs/SPI-TIMING-COMPARISON-STATUS.md:168:- **No analyze_spi.py script** — The benchmark plan references `analyze_spi.py`
+./scripts/analyze_spi.py:3:Usage: python3 analyze_spi.py captures/foo.sr
+./scripts/analyze_spi.py:36:        print("Usage: python3 analyze_spi.py <capture.sr>")
+
+<<<naive-read ./scripts/analyze_spi.py>>>
+#!/usr/bin/env python3
+"""Analyze sigrok .sr capture for SPI timing data.
+Usage: python3 analyze_spi.py captures/foo.sr
+"""
+import sys, os, struct
+import zipfile
+import numpy as np
+
+def load_sr(path):
+    """Load .sr file, return numpy uint8 array of samples."""
+    if os.path.isdir(path):
+        # Already extracted
+        chunks = []
+        i = 1
+        while True:
+            fname = os.path.join(path, f'logic-1-{i}')
+            if not os.path.exists(fname):
+                break
+            with open(fname, 'rb') as f:
+                chunks.append(np.frombuffer(f.read(), dtype=np.uint8))
+            i += 1
+        return np.concatenate(chunks)
+    else:
+        # .sr is a zip
+        with zipfile.ZipFile(path) as zf:
+            # Find logic-1-* files
+            names = sorted([n for n in zf.namelist() if n.startswith('logic-1-')],
+                          key=lambda x: int(x.split('-')[-1]))
+            chunks = []
+            for name in names:
+                chunks.append(np.frombuffer(zf.read(name), dtype=np.uint8))
+            return np.concatenate(chunks)
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 analyze_spi.py <capture.sr>")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    data = load_sr(path)
+    N = len(data)
+    SR = 24e6  # 24 MHz sample rate
+
+    # Extract signals (bit packing: bit0=D0, bit1=D1, ...)
+    cs   = data & 1          # D0 = CS (active low)
+    sck  = (data >> 1) & 1   # D1 = SCK
+    mosi = (data >> 2) & 1   # D2 = MOSI
+    busy = (data >> 4) & 1   # D4 = BUSY
+
+    print(f"=== CAPTURE OVERVIEW ===")
+    print(f"Samples: {N:,} ({N/SR*1000:.1f}ms)")
+    print(f"CS-low (active): {np.sum(cs==0):,} ({np.sum(cs==0)/N*100:.1f}%)")
+    print(f"BUSY-high: {np.sum(busy):,} ({np.sum(busy)/N*100:.1f}%)")
+
+    # Find CS-low regions (transactions)
+    cs_diff = np.diff(cs.astype(np.int8))
+    cs_falling = np.where(cs_diff == -1)[0] + 1
+    cs_rising = np.where(cs_diff == 1)[0] + 1
+
+    txns = []
+    for f in cs_falling:
+        risers = cs_rising[cs_rising > f]
+        if len(risers) > 0:
+            r = risers[0]
+            duration = r - f
+            if duration > 20:  # de-glitch
+                txns.append((f, r, duration))
+
+    print(f"\n=== TRANSACTIONS ===")
+    print(f"Total CS-low pulses (>20 samples): {len(txns)}")
+    if len(txns) == 0:
+        print("No transactions found!")
+        return
+
+    durations = [d for _, _, d in txns]
+    print(f"Avg duration: {np.mean(durations)/SR*1e6:.1f}us")
+    print(f"Min duration: {np.min(durations)/SR*1e6:.1f}us")
+    print(f"Max duration: {np.max(durations)/SR*1e6:.1f}us")
+
+    # Inter-transaction gaps
+    gaps = []
+    for i in range(1, len(txns)):
+        gap = txns[i][0] - txns[i-1][1]
+        if gap > 0:
+            gaps.append(gap)
+    if gaps:
+        print(f"Avg gap: {np.mean(gaps)/SR*1e6:.1f}us")
+        print(f"Min gap: {np.min(gaps)/SR*1e6:.1f}us")
+        print(f"Max gap: {np.max(gaps)/SR*1e6:.1f}us")
+
+    # SCK frequency from first transaction
+    if len(txns) > 0:
+        f0, r0, d0 = txns[0]
+        region = sck[f0:r0]
+        rising = np.where(np.diff(region.astype(np.int8)) == 1)[0]
+        if len(rising) > 10:
+            periods = np.diff(rising)
+            avg_period = np.mean(periods)
+            spi_clk = SR / avg_period / 1e6
+            print(f"\n=== SPI CLOCK ===")
+            print(f"SCK frequency: {spi_clk:.2f} MHz")
+            print(f"Avg SCK period: {avg_period/SR*1e9:.0f}ns")
+
+    # Decode MOSI bytes for first 30 transactions
+    print(f"\n=== FIRST 30 MOSI TRANSACTIONS ===")
+    for idx, (f, r, d) in enumerate(txns[:30]):
+        region_sck = sck[f:r]
+        region_mosi = mosi[f:r]
+        rising = np.where(np.diff(region_sck.astype(np.int8)) == 1)[0]
+        bits = region_mosi[rising + 1]
+        nbytes = len(bits) // 8
+        byte_vals = []
+        for b in range(nbytes):
+            byte_bits = bits[b*8:(b+1)*8]
+            val = 0
+            for bit in byte_bits:
+                val = (val << 1) | int(bit)
+            byte_vals.append(val)
+        hex_str = ' '.join(f'{v:02X}' for v in byte_vals)
+        print(f"  TXN {idx:3d}: [{len(bits):3d} bits, {d/SR*1e6:.1f}us] {hex_str}")
+
+    # Transaction length distribution
+    print(f"\n=== TRANSACTION LENGTH DISTRIBUTION ===")
+    bit_counts = []
+    for f, r, d in txns:
+        region_sck = sck[f:r]
+        rising = np.sum(np.diff(region_sck.astype(np.int8)) == 1)
+        bit_counts.append(rising)
+    bc = np.array(bit_counts)
+    byte_counts = bc // 8
+    for nbytes in sorted(set(byte_counts)):
+        count = np.sum(byte_counts == nbytes)
+        print(f"  {nbytes} bytes: {count} transactions")
+    print(f"  Total bits: {sum(bit_counts):,}")
+    print(f"  Total bytes: {sum(bit_counts)//8:,}")
+
+    # Throughput
+    total_active = sum(durations)
+    total_gaps = sum(gaps) if gaps else 0
+    payload_bytes = sum(bit_counts) // 8
+    print(f"\n=== THROUGHPUT ===")
+    print(f"SPI active time: {total_active/SR*1e3:.2f}ms")
+    print(f"Gap time: {total_gaps/SR*1e3:.2f}ms")
+    if total_active + total_gaps > 0:
+        print(f"Bus duty cycle: {total_active/(total_active+total_gaps)*100:.1f}%")
+    print(f"SPI bytes/sec: {payload_bytes/(N/SR):,.0f}")
+    print(f"SPI bits/sec: {payload_bytes*8/(N/SR):,.0f}")
+    if total_active > 0:
+        print(f"SPI bits/sec (active only): {payload_bytes*8/(total_active/SR):,.0f}")
+
+if __name__ == '__main__':
+    main()

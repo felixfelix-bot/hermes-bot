@@ -1,0 +1,879 @@
+CMD: rg -i --no-heading -n -m 50 range_check .
+RC: 0  ERR: 
+
+./docs/coordination/DISCOVERIES.md:31:- **Files:** firmware/e80-stm32-bench/Makefile, firmware/e80-stm32-bench/tools/range_check.py, firmware/e80-stm32-bench/tools/test_range_preflight.py
+./firmware/e80-stm32-bench/Makefile:476:RANGE_CHECK   := $(PYTHON) $(TOOLDIR)/tools/range_check.py
+./firmware/e80-stm32-bench/Makefile:520:	cd $(TOOLDIR) && $(RANGE_CHECK) \
+./firmware/e80-stm32-bench/Makefile:659:	cd $(TOOLDIR)/tools && $(PYTHON) -m pytest test_e80_range_split.py test_range_check.py -v
+./firmware/e80-stm32-bench/tools/test_range_check.py:2:"""test_range_check.py — union test suite for the consolidated range-check.
+./firmware/e80-stm32-bench/tools/test_range_check.py:4:Run:  python3 -m pytest tools/test_range_check.py -v
+./firmware/e80-stm32-bench/tools/test_range_check.py:55:import range_check            # noqa: E402
+./firmware/e80-stm32-bench/tools/test_range_check.py:137:    """Run range_check.py as a subprocess; return CompletedProcess."""
+./firmware/e80-stm32-bench/tools/test_range_check.py:138:    cmd = [sys.executable, os.path.join(TOOLS_DIR, "range_check.py"),
+./firmware/e80-stm32-bench/tools/test_range_check.py:314:        per = range_check.analyze_capture(
+./firmware/e80-stm32-bench/tools/test_range_check.py:315:            cfgs, pkts, warmup_replicates=range_check.WARMUP_REPLICATES)
+./firmware/e80-stm32-bench/tools/test_range_check.py:370:        per = range_check.analyze_capture(
+./firmware/e80-stm32-bench/tools/test_range_check.py:371:            cfgs, pkts, warmup_replicates=range_check.WARMUP_REPLICATES)
+./firmware/e80-stm32-bench/tools/test_range_check.py:449:        d = range_check.parse_stat_row(
+./firmware/e80-stm32-bench/tools/test_range_check.py:462:        assert range_check.parse_stat_row("# comment") is None
+./firmware/e80-stm32-bench/tools/test_range_check.py:463:        assert range_check.parse_stat_row("PKT,1,2,3") is None
+./firmware/e80-stm32-bench/tools/test_range_check.py:553:# range_check analysis — v2 lineage
+./firmware/e80-stm32-bench/tools/test_range_check.py:564:        per = range_check.analyze_capture(cfgs, pkts)
+./firmware/e80-stm32-bench/tools/test_range_check.py:575:        per = range_check.analyze_capture(cfgs, pkts)
+./firmware/e80-stm32-bench/tools/test_range_check.py:586:        per = range_check.analyze_capture(cfgs, pkts,
+./firmware/e80-stm32-bench/tools/test_range_check.py:587:                                          warmup_replicates=range_check.WARMUP_REPLICATES)
+./firmware/e80-stm32-bench/tools/test_range_check.py:598:        self.assertEqual(range_check.render_summary_line("872m", per),
+./firmware/e80-stm32-bench/tools/test_range_check.py:601:        self.assertEqual(range_check.render_summary_line("50m", ok),
+./firmware/e80-stm32-bench/tools/test_range_check.py:611:        preset = range_check.build_resend_preset(cfgs, per, "872m", 2608281225)
+./firmware/e80-stm32-bench/tools/test_range_check.py:615:        self.assertIsNone(range_check.build_resend_preset(
+./firmware/e80-stm32-bench/tools/test_range_check.py:619:        self.assertEqual(range_check.next_t0(300, now=1000), 1200)
+./firmware/e80-stm32-bench/tools/test_range_check.py:620:        self.assertEqual(range_check.next_t0(300, now=1200), 1500)
+./firmware/e80-stm32-bench/tools/test_range_check.py:623:        cmds = range_check.format_resend_commands(
+./firmware/e80-stm32-bench/tools/test_range_check.py:650:            pkts, sessions = range_check.parse_rx_log(path)
+./firmware/e80-stm32-bench/tools/test_range_check.py:665:            pkts, sessions = range_check.parse_rx_log(path)
+./firmware/e80-stm32-bench/tools/test_range_check.py:672:        pkts, sessions = range_check.parse_rx_log("/nonexistent/rx-log.csv")
+./firmware/e80-stm32-bench/tools/test_range_check.py:786:    def test_bench_range_check_target_exists(self):
+./firmware/e80-stm32-bench/tools/test_range_check.py:789:        assert "range_check.py" in r.stdout
+./firmware/e80-stm32-bench/tools/test_range_check.py:792:    def test_root_range_check_proxy(self):
+./firmware/e80-stm32-bench/tools/test_range_check.py:795:        assert "range_check.py" in r.stdout
+./firmware/e80-stm32-bench/tools/test_range_preflight.py:16:  5. range_check.py: rx-log and tx-log t0 (filename/header) must match —
+./firmware/e80-stm32-bench/tools/test_range_preflight.py:36:import range_check as rc           # noqa: E402
+./firmware/e80-stm32-bench/tools/test_range_preflight.py:788:# 5. range_check.py: rx-log and tx-log t0 (filename -t0<epoch> AND header
+./firmware/e80-stm32-bench/tools/range_check.py:2:"""range_check.py — post-stop rx-log gap check + selective re-send preset.
+./firmware/e80-stm32-bench/tools/e80_bench_ctl.py:955:            # (e.g. selective re-send presets written by range_check.py)
+
+<<<naive-read ./firmware/e80-stm32-bench/tools/test_range_check.py>>>
+#!/usr/bin/env python3
+"""test_range_check.py — union test suite for the consolidated range-check.
+
+Run:  python3 -m pytest tools/test_range_check.py -v
+      (or `make range-test-host` from firmware/e80-stm32-bench/)
+
+Two lineages, both kept green by this file:
+
+v1 (main / worker-balloon/range-check) — CLI-level behavior:
+  - Per cfg i: rows with session==SESSION && config==i.
+  - counted = best pass across replicates with replicate > WARMUP_REPLICATES
+    (first 2 replicates are warmups, never counted).
+  - MISS = no counted pkts; THIN = best pass < thin_frac*n_pkts; else OK.
+  - PASS iff all OK (exit 0); GAPS exit 1 + resend preset with ONLY the
+    missing+thin cfgs (v1 renumbered form + v2 idx-preserved form).
+  - Zero STAT rows for the session = LOGGING GAP verdict (logger problem,
+    no resend file). STAT rows with rx=0 are DATA (RF death), not a gap.
+  - STAT parsing survives the per_ci_x1e6=[lo,hi] bracket-comma.
+  - load_config_preset resolves repo-root-relative CONFIGS paths.
+  - Makefile wiring: range-check target + relative T0=+NN resolution.
+
+v2 (worker-balloon/range-check2) — library-level behavior:
+  - T0-anchored cycle scheduling (compute_cycle_len / build_preset_schedule /
+    compute_late_skip): no drift, no silent late-launch re-anchoring.
+  - analyze_capture best-pass semantics + summary/render helpers.
+  - rx-log parsing (harmonized + legacy) + T0-tagged per-stop log discovery.
+  - merge_csvs best-pass harmonized merge + STAT bracket-CI parsing.
+  - Makefile wiring: T0-tagged log filenames + --skip-late-configs.
+
+Fixtures are synthetic rx-log text built with the SAME formatters the rx
+logger uses (e80_bench_ctl.format_pkt_line / format_stat_line), so the
+tests track the real on-wire format. No hardware, no serial.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import pytest
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+E80_DIR = os.path.dirname(TOOLS_DIR)
+REPO_ROOT = os.path.abspath(os.path.join(E80_DIR, "..", ".."))
+
+sys.path.insert(0, TOOLS_DIR)
+
+import e80_bench_ctl as ctl  # noqa: E402
+import merge_csvs             # noqa: E402
+import range_check            # noqa: E402
+from e80_bench_ctl import format_pkt_line, format_stat_line, load_config_preset  # noqa: E402
+
+SESSION = 2608281130
+OTHER_SESSION = 9912312359
+
+
+# -----------------------------------------------------------------------
+# Fixture builders (mirror the real rx-log format) — v1 lineage
+# -----------------------------------------------------------------------
+
+def make_preset_dict(n_cfgs=3, n_pkts=10):
+    """Small stop-like preset with the same schema as configs/per-stop/."""
+    cfgs = []
+    for i in range(n_cfgs):
+        cfgs.append({
+            "label": "CFG%d" % i,
+            "band": "868",
+            "mod": "flrc" if i % 2 == 0 else "lora",
+            "sf": None if i % 2 == 0 else 5 + i,
+            "bw": None if i % 2 == 0 else 500,
+            "br": 650 + i if i % 2 == 0 else None,
+            "pa": 22,
+            "freq": 869525000,
+            "plen": 255,
+            "gap": 1000,
+            "n_pkts": n_pkts,
+        })
+    return {"name": "stop-test", "description": "synthetic test stop", "configs": cfgs}
+
+
+def write_preset(tmp_path, preset=None, name="stop-50m.json"):
+    preset = preset or make_preset_dict()
+    per_stop = tmp_path / "configs" / "per-stop"
+    per_stop.mkdir(parents=True, exist_ok=True)
+    path = per_stop / name
+    path.write_text(json.dumps(preset, indent=2))
+    return str(path)
+
+
+def pkt_line(config, replicate, seq=1, session=SESSION):
+    return format_pkt_line({
+        "session_id": session, "config_id": config, "replicate": replicate,
+        "seq": seq, "ts_ms": 1000 + seq, "rssi_dbm": -80.5, "snr_db": 9.0,
+        "crc_ok": 1, "bit_err": 0, "bytes_bad": 0, "freq_hz": 869525000,
+        "mod": "flrc", "sf": 0, "bw_khz": 1200, "cr": 1, "power_dbm": 22,
+        "pkt_size": 255, "gps_fix": 0, "gps_lat": 0.0, "gps_lon": 0.0,
+        "gps_alt": 0.0, "gps_sats": 0, "gps_hdop": 0.0,
+    })
+
+
+def stat_line(config, replicate, rx=10, session=SESSION):
+    return format_stat_line("RX", {
+        "sent": 12, "sent_ok": 12, "recv": rx, "crc_err": 0,
+        "per_pct": 0.0, "per_ci_lo_pct": 0.0, "per_ci_hi_pct": 25.8,
+        "elapsed_s": 1.234, "kbps": 42.5, "rssi": -80.5, "snr": 9.0,
+        "drops": 0, "gap_us": 1000,
+    }, session, config, replicate)
+
+
+def write_rx_log(tmp_path, lines, name="rx-log.csv"):
+    path = tmp_path / name
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+def clean_log(n_cfgs=3, n_pkts=10, replicate=3):
+    """Every cfg fully received on replicate 3 (+ warmup rows on 1,2)."""
+    lines = ["# DISTRIBUTED_RX_MODE t0=2026-08-28T11:30:00 loop=3"]
+    for c in range(n_cfgs):
+        for rep in (1, 2):  # warmups — logged but never counted
+            for s in range(2):
+                lines.append(pkt_line(c, rep, seq=s))
+            lines.append(stat_line(c, rep, rx=2))
+        for s in range(n_pkts):
+            lines.append(pkt_line(c, replicate, seq=s))
+        lines.append(stat_line(c, replicate, rx=n_pkts))
+    return lines
+
+
+def run_tool(tmp_path, dist="50m", session=str(SESSION), rx_log=None,
+             preset=None, repo_root=None, extra=()):
+    """Run range_check.py as a subprocess; return CompletedProcess."""
+    cmd = [sys.executable, os.path.join(TOOLS_DIR, "range_check.py"),
+           "--dist", dist, "--session", session,
+           "--rx-log", rx_log or str(tmp_path / "rx-log.csv")]
+    if preset:
+        cmd += ["--configs", preset]
+    if repo_root:
+        cmd += ["--repo-root", repo_root]
+    cmd += list(extra)
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=E80_DIR)
+
+
+RESEND_NAME = "configs/resend-50m-s%d.json" % SESSION
+TX_ONE_LINER = ("make range-tx CONFIGS=%s T0=+90 "
+                "PROBE=148757200D2D1425 PORT=<from detect>" % RESEND_NAME)
+
+
+# -----------------------------------------------------------------------
+# Verdicts + exit codes — v1 lineage
+# -----------------------------------------------------------------------
+
+class TestVerdicts:
+    """PASS / GAPS(MISS|THIN) / LOGGING GAP verdicts and exit codes."""
+
+    def test_clean_pass_exit0(self, tmp_path):
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, clean_log())
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "50m s%d: PASS (3/3 clean)" % SESSION in r.stdout
+
+    def test_missing_cfg_is_miss_and_gap(self, tmp_path):
+        # drop ALL of cfg1's packets (warmups + counted pass) — a config
+        # the radio never heard. Under the conditional warmup rule a
+        # capture with <= WARMUP_REPLICATES replicates counts them, so a
+        # true MISS needs zero captured packets for the config.
+        lines = [ln for ln in clean_log(n_cfgs=3)
+                 if not (ln.startswith("PKT,") and re.match(r"PKT,\d+,1,", ln))]
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "GAPS" in r.stdout
+        assert "c1:MISS" in r.stdout
+        assert "(2/3 clean)" in r.stdout
+
+    def test_thin_cfg_reports_count(self, tmp_path):
+        lines = clean_log(n_cfgs=3)
+        thin = [pkt_line(2, 3, seq=s) for s in range(3)]  # only 3 of 10
+        lines = [ln for ln in lines
+                 if not (ln.startswith("PKT,") and ",2,3," in ln)] + thin
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "c2:THIN 3/10" in r.stdout
+
+    def test_warmup_only_is_gaps_not_logging_gap(self, tmp_path):
+        lines = ["# DISTRIBUTED_RX_MODE"]
+        for c in range(3):
+            for rep in (1, 2):  # only warmup replicates present
+                lines.append(pkt_line(c, rep, seq=0))
+                lines.append(stat_line(c, rep, rx=1))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "LOGGING GAP" not in r.stdout
+        assert "GAPS" in r.stdout
+        assert "(0/3 clean)" in r.stdout
+
+    def test_empty_log_is_logging_gap(self, tmp_path):
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, [])
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "LOGGING GAP" in r.stdout
+        assert not (tmp_path / RESEND_NAME).exists()
+
+    def test_missing_log_file_is_logging_gap(self, tmp_path):
+        preset = write_preset(tmp_path)
+        r = run_tool(tmp_path, preset=preset,
+                     rx_log=str(tmp_path / "nope.csv"), repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "LOGGING GAP" in r.stdout
+
+    def test_rx0_stat_rows_are_rf_death_not_gap(self, tmp_path):
+        lines = ["# DISTRIBUTED_RX_MODE"]
+        for c in range(3):
+            lines.append(stat_line(c, 3, rx=0))  # logger alive, radio heard nothing
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        assert "LOGGING GAP" not in r.stdout
+        assert "c0:MISS" in r.stdout  # data verdict: RF death
+
+    def test_other_session_rows_ignored(self, tmp_path):
+        lines = ["# two sessions interleaved"]
+        for c in range(3):
+            for s in range(10):
+                lines.append(pkt_line(c, 3, seq=s, session=OTHER_SESSION))
+            lines.append(stat_line(c, 3, rx=10, session=OTHER_SESSION))
+            lines.append(stat_line(c, 3, rx=0, session=SESSION))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert "LOGGING GAP" not in r.stdout
+        assert "c0:MISS" in r.stdout
+
+    def test_multi_replicate_counts_best_pass(self, tmp_path):
+        """4 pkts on rep3 + 6 pkts on rep4: best pass 6/10 >= thin_frac — OK.
+
+        (v1 summed across replicates; the harmonized merge policy counts the
+        BEST pass, matching merge_csvs — 6/10 still clears the 0.5 floor.)
+        """
+        lines = ["# 4 pkts on rep3 + 6 pkts on rep4 = full"]
+        for c in range(3):
+            for s in range(4):
+                lines.append(pkt_line(c, 3, seq=s))
+            for s in range(6):
+                lines.append(pkt_line(c, 4, seq=s))
+            lines.append(stat_line(c, 3, rx=4))
+            lines.append(stat_line(c, 4, rx=6))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def test_dist_bare_number_normalizes(self, tmp_path):
+        preset = write_preset(tmp_path, name="stop-100m.json")
+        log = write_rx_log(tmp_path, clean_log())
+        r = run_tool(tmp_path, dist="100", preset=preset, rx_log=log,
+                     repo_root=str(tmp_path))
+        assert r.returncode == 0
+        assert "100m s%d: PASS" % SESSION in r.stdout
+
+
+# -----------------------------------------------------------------------
+# Warmup exclusion vs single-cycle (loop=1) stops — sweep-day hotfix
+# -----------------------------------------------------------------------
+
+class TestLoop1WarmupRegression:
+    """loop=1 stops log replicate=1 for every packet.
+
+    e80_bench_ctl sends ``CONFIG <idx> <cycle>`` so the CSV ``replicate``
+    field IS the cycle number, and ``make range-tx`` defaults ``--loop 1``
+    → single-cycle stops produce replicate=1-only captures. The old
+    unconditional ``replicate > WARMUP_REPLICATES`` filter turned complete
+    single-cycle captures into all-MISS verdicts + bogus full resend
+    presets. The exclusion must be conditional: only drop the first
+    WARMUP_REPLICATES when MORE than WARMUP_REPLICATES distinct
+    replicates exist for the config (a multi-cycle run).
+    """
+
+    def test_loop1_full_reception_is_complete(self, tmp_path):
+        """Every packet replicate=1, reception complete → COMPLETE/OK."""
+        lines = ["# DISTRIBUTED_RX_MODE t0=2026-08-28T12:00:00 loop=1"]
+        for c in range(3):
+            for s in range(10):
+                lines.append(pkt_line(c, 1, seq=s))
+            lines.append(stat_line(c, 1, rx=10))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "50m: COMPLETE 3/3" in r.stdout
+        assert "50m s%d: PASS (3/3 clean)" % SESSION in r.stdout
+        assert "MISS" not in r.stdout
+        assert not (tmp_path / RESEND_NAME).exists()
+
+    def test_loop1_counted_gt_zero(self):
+        """Library level: replicate=1-only capture with warmup_replicates=2
+        must still count (>0) — was all-MISS before the fix."""
+        cfgs = [_cfg(0, n_pkts=10), _cfg(1, n_pkts=10)]
+        pkts = ([{"config_id": 0, "replicate": 1}] * 10 +
+                [{"config_id": 1, "replicate": 1}] * 3)
+        per = range_check.analyze_capture(
+            cfgs, pkts, warmup_replicates=range_check.WARMUP_REPLICATES)
+        assert per[0]["per_replicate"] == {1: 10}
+        assert per[0]["n_recv"] == 10
+        assert per[0]["status"] == "OK"
+        assert per[1]["per_replicate"] == {1: 3}
+        assert per[1]["n_recv"] > 0
+        assert per[1]["status"] == "THIN"
+
+    def test_replicates_1_and_2_only_fully_counted(self, tmp_path):
+        """<= WARMUP_REPLICATES distinct replicates → nothing excluded."""
+        lines = ["# DISTRIBUTED_RX_MODE t0=2026-08-28T12:00:00 loop=2"]
+        for c in range(3):
+            for rep in (1, 2):
+                for s in range(10):
+                    lines.append(pkt_line(c, rep, seq=s))
+                lines.append(stat_line(c, rep, rx=10))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "50m: COMPLETE 3/3" in r.stdout
+        assert "MISS" not in r.stdout
+
+    def test_multi_cycle_warmups_still_excluded_best_pass(self, tmp_path):
+        """replicates 1..4: warmups 1-2 excluded, best pass of 3-4 wins.
+
+        Warmups are FULL (10/10) and the counted passes are 4 and 6 pkts —
+        if warmups leaked into the count the verdict would flip to 10/10.
+        """
+        lines = ["# DISTRIBUTED_RX_MODE t0=2026-08-28T12:00:00 loop=4"]
+        for c in range(3):
+            for rep in (1, 2):
+                for s in range(10):
+                    lines.append(pkt_line(c, rep, seq=s))
+                lines.append(stat_line(c, rep, rx=10))
+            for s in range(4):
+                lines.append(pkt_line(c, 3, seq=s))
+            lines.append(stat_line(c, 3, rx=4))
+            for s in range(6):
+                lines.append(pkt_line(c, 4, seq=s))
+            lines.append(stat_line(c, 4, rx=6))
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 0, r.stdout + r.stderr  # 6/10 >= thin_frac
+        assert "6/10" in r.stdout      # best pass of reps 3-4
+        assert "10/10" not in r.stdout  # warmups 1-2 did NOT leak in
+
+    def test_multi_cycle_per_replicate_exact(self):
+        """Library level: replicates 1..4 → per_replicate {3:4, 4:6}."""
+        cfgs = [_cfg(0, n_pkts=10)]
+        pkts = ([{"config_id": 0, "replicate": 1}] * 10 +
+                [{"config_id": 0, "replicate": 2}] * 10 +
+                [{"config_id": 0, "replicate": 3}] * 4 +
+                [{"config_id": 0, "replicate": 4}] * 6)
+        per = range_check.analyze_capture(
+            cfgs, pkts, warmup_replicates=range_check.WARMUP_REPLICATES)
+        assert per[0]["per_replicate"] == {3: 4, 4: 6}
+        assert per[0]["n_recv"] == 6
+        assert per[0]["status"] == "OK"
+
+
+# -----------------------------------------------------------------------
+# Resend preset output — v1 lineage
+# -----------------------------------------------------------------------
+
+class TestResendPreset:
+    """On GAPS: write resend-<DIST>-s<SESSION>.json with ONLY gap cfgs."""
+
+    def test_resend_contains_only_gapped_cfgs(self, tmp_path):
+        lines = clean_log(n_cfgs=3)
+        # cfg0: thin (3/10); cfg1: miss (drop counted rows); cfg2: clean
+        lines = [ln for ln in lines if not (ln.startswith("PKT,") and ",0,3," in ln)]
+        lines += [pkt_line(0, 3, seq=s) for s in range(3)]
+        lines = [ln for ln in lines
+                 if not (ln.startswith("PKT,") and ",1,3," in ln)]
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        resend = tmp_path / RESEND_NAME
+        assert resend.exists()
+        data = json.loads(resend.read_text())
+        assert len(data["configs"]) == 2
+        assert [c["label"] for c in data["configs"]] == ["CFG0", "CFG1"]
+
+    def test_resend_schema_loads_via_load_config_preset(self, tmp_path):
+        lines = [ln for ln in clean_log(n_cfgs=3)
+                 if not (ln.startswith("PKT,") and ",2,3," in ln)]
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        resend = tmp_path / RESEND_NAME
+        cfgs = load_config_preset(str(resend))
+        assert len(cfgs) == 1
+        assert cfgs[0]["label"] == "CFG2"
+        assert cfgs[0]["n_pkts"] == 10
+        assert cfgs[0]["idx"] == 0  # renumbered for the new session
+
+    def test_real_stop50_resend_roundtrip(self, tmp_path):
+        """Resend of real stop-50m cfgs must stay load_config_preset-valid."""
+        lines = [ln for ln in clean_log(n_cfgs=10)
+                 if not (ln.startswith("PKT,") and ",9,3," in ln)]
+        preset = write_preset(tmp_path, preset=json.loads(
+            open(os.path.join(REPO_ROOT, "configs", "per-stop", "stop-50m.json")).read()))
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert r.returncode == 1
+        cfgs = load_config_preset(str(tmp_path / RESEND_NAME))
+        assert len(cfgs) == 1
+        assert cfgs[0]["label"] == "2G4-LoRa-SF5 BW500 LEN255"
+        assert cfgs[0]["n_pkts"] == 10
+
+    def test_tx_one_liner_printed_verbatim(self, tmp_path):
+        lines = [ln for ln in clean_log(n_cfgs=3)
+                 if not (ln.startswith("PKT,") and ",1,3," in ln)]
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, lines)
+        r = run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert TX_ONE_LINER in r.stdout
+
+    def test_no_resend_on_pass(self, tmp_path):
+        preset = write_preset(tmp_path)
+        log = write_rx_log(tmp_path, clean_log())
+        run_tool(tmp_path, preset=preset, rx_log=log, repo_root=str(tmp_path))
+        assert not (tmp_path / "configs" / ("resend-50m-s%d.json" % SESSION)).exists()
+
+
+# -----------------------------------------------------------------------
+# STAT row parsing (bracket field contains a comma) — v1 lineage
+# -----------------------------------------------------------------------
+
+class TestStatParsing:
+    def test_parse_stat_row_handles_bracket_comma(self):
+        d = range_check.parse_stat_row(
+            "STAT,role=RX,sent=12,sent_ok=12,rx=10,crc_err=0,per_x1e6=0,"
+            "per_ci_x1e6=[0,258000],elapsed_s=1.234,kbps=42.500,"
+            "rssi_avg_dbm=-80.500,snr_avg_db=9.000,session=%d,config=2,"
+            "replicate=3,drops=0,gap_us=1000" % SESSION)
+        assert d["role"] == "RX"
+        assert d["rx"] == "10"
+        assert d["session"] == str(SESSION)
+        assert d["config"] == "2"
+        assert d["replicate"] == "3"
+        assert d["per_ci_x1e6"] == "[0,258000]"
+
+    def test_parse_stat_row_rejects_non_stat(self):
+        assert range_check.parse_stat_row("# comment") is None
+        assert range_check.parse_stat_row("PKT,1,2,3") is None
+
+
+# -----------------------------------------------------------------------
+# load_config_preset: repo-root-relative CONFIGS paths (resend one-liner)
+# -----------------------------------------------------------------------
+
+class TestLoadPresetRootRelative:
+    """`CONFIGS=configs/resend-...json` from repo root must resolve even
+    though e80_bench_ctl runs with cwd=firmware/e80-stm32-bench."""
+
+    def test_configs_relative_to_repo_root(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)  # cwd without ./configs
+        cfgs = load_config_preset("configs/per-stop/stop-50m.json")
+        assert len(cfgs) == 10
+        assert cfgs[0]["label"] == "FLRC-2600 LEN511"
+
+
+# ---------------------------------------------------------------------------
+# T0-anchored cycles — v2 lineage
+# ---------------------------------------------------------------------------
+
+def _cfg(idx, n_pkts=10, freq=870e6, mod="lora", sf=7, br=None, expected_s=9.0):
+    return {
+        "idx": idx, "label": "cfg{} sf{}".format(idx, sf), "mod": mod,
+        "sf": sf, "bw": 125, "br": br, "pa": 22, "freq": freq,
+        "plen": 255, "gap": 10000, "n_pkts": n_pkts,
+        "airtime_s": 0.3, "expected_s": expected_s,
+    }
+
+
+class TestCycleAnchoring(unittest.TestCase):
+    TIMING = dict(t0_margin=30, guard=5, settle=1, rx_lead=3,
+                  swd_reset_s=2, band_swap_s=30)
+
+    def test_cycle_len_rounds_up_to_whole_minute(self):
+        cfgs = [_cfg(0), _cfg(1)]
+        cl = ctl.compute_cycle_len(cfgs, **self.TIMING)
+        self.assertGreater(cl, 0)
+        self.assertEqual(cl % 60, 0)
+
+    def test_cycle_len_identical_across_call_order(self):
+        cfgs = [_cfg(0), _cfg(1, freq=2400e6)]
+        a = ctl.compute_cycle_len(cfgs, **self.TIMING)
+        b = ctl.compute_cycle_len(list(reversed(cfgs)), **self.TIMING)
+        # reversed list is a DIFFERENT schedule; same list twice must match
+        a2 = ctl.compute_cycle_len(cfgs, **self.TIMING)
+        self.assertEqual(a, a2)
+
+    def test_cycle_len_includes_band_wrap_gap(self):
+        same_band = [_cfg(0, freq=870e6), _cfg(1, freq=870e6)]
+        wraps = [_cfg(0, freq=870e6), _cfg(1, freq=2400e6)]
+        cl_same = ctl.compute_cycle_len(same_band, **self.TIMING)
+        cl_wrap = ctl.compute_cycle_len(wraps, **self.TIMING)
+        # wrapping preset pays band_swap_s at the inter-config gap AND at
+        # the wrap back to config 0 — must be strictly longer
+        self.assertGreater(cl_wrap, cl_same)
+
+    def test_late_launch_detected_against_true_schedule(self):
+        """The regression that caused session 2608281130: a 150s-late RX
+        must be DETECTED (skip index >= 1 or None), never silently
+        re-anchored onto a fresh local schedule."""
+        cfgs = [_cfg(i) for i in range(10)]
+        t0 = 1_000_000
+        starts = ctl.build_preset_schedule(cfgs, t0, **self.TIMING)
+        idx = ctl.compute_late_skip(starts, now=t0 + 150, rx_lead=3)
+        # either some configs remain joinable (idx < len) or all passed
+        # (None) — but it must NOT return 0 (= "on time"), which is what
+        # the old local re-anchoring always claimed.
+        self.assertNotEqual(idx, 0)
+        if idx is not None:
+            self.assertGreaterEqual(idx, 1)
+
+    def test_all_cycles_anchor_to_shared_t0(self):
+        cfgs = [_cfg(0), _cfg(1)]
+        cl = ctl.compute_cycle_len(cfgs, **self.TIMING)
+        t0 = 1_000_000
+        for cycle in (1, 2, 5):
+            t0_cycle = t0 + (cycle - 1) * cl
+            starts = ctl.build_preset_schedule(cfgs, t0_cycle, **self.TIMING)
+            self.assertAlmostEqual(starts[0], t0_cycle + self.TIMING["t0_margin"],
+                                   delta=0.001)
+            # every cycle k+1 anchor must be AFTER cycle k's last capture
+            starts_k = ctl.build_preset_schedule(cfgs, t0, **self.TIMING)
+            last_end = starts_k[-1] + cfgs[-1]["expected_s"] + \
+                self.TIMING["settle"] + self.TIMING["guard"]
+            self.assertGreaterEqual(t0 + cl + self.TIMING["t0_margin"], last_end)
+
+
+# ---------------------------------------------------------------------------
+# range_check analysis — v2 lineage
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeCapture(unittest.TestCase):
+    def test_ok_thin_miss(self):
+        cfgs = [_cfg(0, n_pkts=10), _cfg(1, n_pkts=10), _cfg(2, n_pkts=10)]
+        pkts = (
+            [{"config_id": 0, "replicate": 1}] * 10 +
+            [{"config_id": 1, "replicate": 1}] * 3 +
+            [{"config_id": 7, "replicate": 1}] * 5   # foreign config
+        )
+        per = range_check.analyze_capture(cfgs, pkts)
+        self.assertEqual(per[0]["status"], "OK")
+        self.assertEqual(per[1]["status"], "THIN")
+        self.assertEqual(per[2]["status"], "MISS")
+        self.assertEqual(per[0]["n_recv"], 10)
+        self.assertEqual(per[1]["n_recv"], 3)
+
+    def test_best_pass_across_replicates(self):
+        cfgs = [_cfg(0, n_pkts=10)]
+        pkts = ([{"config_id": 0, "replicate": 1}] * 2 +
+                [{"config_id": 0, "replicate": 2}] * 9)
+        per = range_check.analyze_capture(cfgs, pkts)
+        self.assertEqual(per[0]["n_recv"], 9)
+        self.assertEqual(per[0]["status"], "OK")
+        self.assertEqual(per[0]["per_replicate"], {1: 2, 2: 9})
+
+    def test_warmup_replicates_excluded_when_requested(self):
+        """CLI path: warmup replicates never count (v1 decision procedure)."""
+        cfgs = [_cfg(0, n_pkts=10)]
+        pkts = ([{"config_id": 0, "replicate": 1}] * 2 +
+                [{"config_id": 0, "replicate": 2}] * 2 +
+                [{"config_id": 0, "replicate": 3}] * 6)
+        per = range_check.analyze_capture(cfgs, pkts,
+                                          warmup_replicates=range_check.WARMUP_REPLICATES)
+        self.assertEqual(per[0]["per_replicate"], {3: 6})
+        self.assertEqual(per[0]["n_recv"], 6)
+        self.assertEqual(per[0]["status"], "OK")  # 6/10 >= 0.5
+
+    def test_summary_lines(self):
+        per = {
+            0: {"n_pkts": 10, "n_recv": 10, "per_replicate": {1: 10}, "status": "OK"},
+            1: {"n_pkts": 10, "n_recv": 0, "per_replicate": {}, "status": "MISS"},
+            2: {"n_pkts": 10, "n_recv": 3, "per_replicate": {1: 3}, "status": "THIN"},
+        }
+        self.assertEqual(range_check.render_summary_line("872m", per),
+                         "872m: GAPS c1 MISS, c2 THIN 3/10")
+        ok = {0: {"n_pkts": 10, "n_recv": 10, "per_replicate": {1: 10}, "status": "OK"}}
+        self.assertEqual(range_check.render_summary_line("50m", ok),
+                         "50m: COMPLETE 1/1")
+
+    def test_resend_preset_gaps_only_idx_preserved(self):
+        cfgs = [_cfg(0), _cfg(1), _cfg(2)]
+        per = {
+            0: {"status": "OK"},
+            1: {"status": "MISS"},
+            2: {"status": "THIN", "n_recv": 3, "n_pkts": 10},
+        }
+        preset = range_check.build_resend_preset(cfgs, per, "872m", 2608281225)
+        self.assertIsNotNone(preset)
+        self.assertEqual([c["idx"] for c in preset["configs"]], [1, 2])
+        self.assertEqual(preset["name"], "resend-872m-2608281225")
+        self.assertIsNone(range_check.build_resend_preset(
+            cfgs, {i: {"status": "OK"} for i in range(3)}, "50m", 1))
+
+    def test_next_t0_boundary(self):
+        self.assertEqual(range_check.next_t0(300, now=1000), 1200)
+        self.assertEqual(range_check.next_t0(300, now=1200), 1500)
+
+    def test_resend_commands_format(self):
+        cmds = range_check.format_resend_commands(
+            "configs/resend/resend-872m-2608281225.json", 1787921400, "872m")
+        self.assertEqual(len(cmds), 2)
+        self.assertIn("make range-tx DIST=872m "
+                      "CONFIGS=configs/resend/resend-872m-2608281225.json "
+                      "T0=1787921400 SESSION_ID=", cmds[0])
+        self.assertIn("make range-rx", cmds[1])
+
+
+# ---------------------------------------------------------------------------
+# rx-log parsing (harmonized + legacy) — v2 lineage
+# ---------------------------------------------------------------------------
+
+def _pkt_line(sess, cfg, rep, seq, rssi=-80.0):
+    return ("PKT,{},{},{},{},123,{:.1f},10.0,1,0,0,868000000,lora,7,125,0,"
+            "22,255,0,0,0,0,0,0".format(sess, cfg, rep, seq, rssi))
+
+
+class TestParseRxLog(unittest.TestCase):
+    def test_harmonized(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+            f.write("# DISTRIBUTED_RX_MODE t0=...\n")
+            f.write(_pkt_line(2608281225, 0, 1, 4) + "\n")
+            f.write(_pkt_line(2608281225, 0, 1, 5) + "\n")
+            f.write(_pkt_line(2608280930, 3, 1, 9) + "\n")
+            path = f.name
+        try:
+            pkts, sessions = range_check.parse_rx_log(path)
+            self.assertEqual(len(pkts), 3)
+            self.assertEqual(sessions, {2608281225, 2608280930})
+            self.assertEqual(pkts[0]["config_id"], 0)
+        finally:
+            os.unlink(path)
+
+    def test_legacy(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+            f.write("session,config,pkt_idx,ts_ms,rssi_dbm,snr_db,crc_ok,"
+                    "bit_err,freq_hz,mod,sf_or_br,bw,pa_dbm,len,pcrc16,captured_ts\n")
+            f.write("2608281225,0,2,200,-78.0,10.0,1,0,868000000,flrc,650,0,10,64,0,"
+                    "2026-08-28T17:55:50\n")
+            path = f.name
+        try:
+            pkts, sessions = range_check.parse_rx_log(path)
+            self.assertEqual(len(pkts), 1)
+            self.assertEqual(sessions, {2608281225})
+        finally:
+            os.unlink(path)
+
+    def test_missing_file_is_empty(self):
+        pkts, sessions = range_check.parse_rx_log("/nonexistent/rx-log.csv")
+        self.assertEqual(pkts, [])
+        self.assertEqual(sessions, set())
+
+
+# ---------------------------------------------------------------------------
+# merge_csvs: harmonized best-pass — v2 lineage
+# ---------------------------------------------------------------------------
+
+def _tx_stat_line(sess, cfg, rep, n_pkts=10, label="cfg"):
+    st = {"sent": n_pkts + 2, "sent_ok": n_pkts, "recv": 0, "crc_err": 0,
+          "per_pct": 0.0, "elapsed_s": 9.0, "kbps": None, "rssi": None,
+          "snr": None, "drops": 0, "gap_us": 10000,
+          "label": label, "n_pkts": n_pkts, "plen": 255}
+    return ctl.format_stat_line("TX", st, sess, cfg, replicate=rep)
+
+
+class TestMergeBestPass(unittest.TestCase):
+    def test_best_pass_not_union(self):
+        """rep1 catches 4/10, rep2 catches 9/10 -> PER from rep2 (10%),
+        NOT from the union (which would claim 0% for the 5 shared-lost)."""
+        with tempfile.TemporaryDirectory() as d:
+            tx = os.path.join(d, "tx.csv")
+            rx = os.path.join(d, "rx.csv")
+            with open(tx, "w") as f:
+                f.write(_tx_stat_line(2608281225, 0, 1) + "\n")
+                f.write(_tx_stat_line(2608281225, 0, 2) + "\n")
+            with open(rx, "w") as f:
+                # rep1: seq 0-3 (4 pkts)
+                for s in range(4):
+                    f.write(_pkt_line(2608281225, 0, 1, s) + "\n")
+                # rep2: 9 of 10 pkts (seqs 0-9, misses seq 3)
+                for s in range(10):
+                    if s == 3:
+                        continue
+                    f.write(_pkt_line(2608281225, 0, 2, s) + "\n")
+                # foreign: config not in TX log
+                f.write(_pkt_line(2608281225, 9, 1, 0) + "\n")
+            combined = merge_csvs.merge_csvs(tx, rx, d)
+            received = sum(1 for r in combined if r["status"] == "received")
+            lost = [r for r in combined if r["status"] == "lost"]
+            self.assertEqual(len(combined), 10)   # denominator = n_pkts, not union
+            self.assertEqual(received, 9)
+            self.assertEqual(len(lost), 1)
+            # pkt_idx is normalized positionally per (config, replicate):
+            # rep2 captured seqs 0-2,4-8 -> normalized 0-8, so the LAST
+            # expected index is the lost one
+            self.assertEqual(lost[0]["pkt_idx"], 9)
+            self.assertEqual(lost[0]["replicate"], 2)
+            with open(os.path.join(d, "combined-range-report.md")) as f:
+                report = f.read()
+            self.assertIn("best pass", report)
+            self.assertIn("r1: 4", report)
+            self.assertIn("r2: 9", report)
+
+    def test_legacy_still_merges(self):
+        """Old-format logs keep working (regression guard)."""
+        with tempfile.TemporaryDirectory() as d:
+            tx = os.path.join(d, "tx.csv")
+            rx = os.path.join(d, "rx.csv")
+            with open(tx, "w") as f:
+                f.write("session,config_idx,n_pkts,sent_ok,label\n")
+                f.write("2608281225,0,10,10,cfg0\n")
+            with open(rx, "w") as f:
+                f.write("session,config,pkt_idx,ts_ms,rssi_dbm,snr_db,crc_ok,"
+                        "bit_err,freq_hz,mod,sf_or_br,bw,pa_dbm,len,pcrc16,captured_ts\n")
+                for i in range(10):
+                    f.write("2608281225,0,{},{},-80.0,10.0,1,0,868000000,lora,7,125,22,"
+                            "255,0,2026-08-28T18:00:00\n".format(i, i * 100))
+            combined = merge_csvs.merge_csvs(tx, rx, d)
+            self.assertEqual(len(combined), 10)
+            self.assertTrue(all(r["status"] == "received" for r in combined))
+
+    def test_stat_line_parse_with_bracket_ci(self):
+        line = _tx_stat_line(2608281225, 3, 1, n_pkts=10, label="LoRa-SF7")
+        d = merge_csvs.parse_stat_line(line)
+        self.assertIsNotNone(d)
+        self.assertEqual(d["role"], "TX")
+        self.assertEqual(d["per_ci_x1e6"], "[0,0]")
+        self.assertEqual(d["n_pkts"], "10")
+        self.assertEqual(d["label"], "LoRa-SF7")
+
+    def test_resend_preset_idx_preserved_through_reload(self):
+        """The trimmed preset must keep ORIGINAL idx values after a
+        load_config_preset round-trip (logs stay consistent with the
+        full preset's numbering across re-send passes)."""
+        cfgs = ctl.load_config_preset({
+            "configs": [
+                {"label": "a", "mod": "lora", "sf": 7, "bw": 125, "pa": 22,
+                 "freq": 870e6, "plen": 255, "gap": 10000, "n_pkts": 10, "idx": 4},
+                {"label": "b", "mod": "lora", "sf": 12, "bw": 125, "pa": 22,
+                 "freq": 870e6, "plen": 255, "gap": 10000, "n_pkts": 10, "idx": 7},
+            ]
+        })
+        self.assertEqual([c["idx"] for c in cfgs], [4, 7])
+        # no explicit idx -> positional (back-compat)
+        pos = ctl.load_config_preset({
+            "configs": [
+                {"label": "x", "mod": "lora", "sf": 7, "bw": 125, "pa": 22,
+                 "freq": 870e6, "plen": 255, "gap": 10000, "n_pkts": 10},
+            ]
+        })
+        self.assertEqual([c["idx"] for c in pos], [0])
+
+
+# ---------------------------------------------------------------------------
+# Makefile wiring: range-check target + relative T0=+NN — v1 lineage
+# ---------------------------------------------------------------------------
+
+class TestMakefileWiring:
+    def _make(self, args, cwd):
+        return subprocess.run(["make"] + args, capture_output=True,
+                              text=True, cwd=cwd)
+
+    def test_bench_range_check_target_exists(self):
+        r = self._make(["-n", "range-check", "DIST=50m", "SESSION=x"], E80_DIR)
+        assert r.returncode == 0, r.stderr
+        assert "range_check.py" in r.stdout
+        assert "--session x" in r.stdout
+
+    def test_root_range_check_proxy(self):
+        r = self._make(["-n", "range-check", "DIST=50m", "SESSION=x"], REPO_ROOT)
+        assert r.returncode == 0, r.stderr
+        assert "range_check.py" in r.stdout
+
+    def test_relative_t0_resolved_to_epoch(self):
+        r = self._make(["-n", "range-tx", "T0=+90"], E80_DIR)
+        assert r.returncode == 0, r.stderr
+        assert "--t0 +90" not in r.stdout
+        assert re.search(r"--t0 1\d{9}", r.stdout), r.stdout
+
+    def test_absolute_t0_untouched(self):
+        r = self._make(["-n", "range-tx", "T0=1790000000"], E80_DIR)
+        assert "--t0 1790000000" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Makefile wiring: T0-tagged log filenames + late-join flag — v2 lineage
+# ---------------------------------------------------------------------------
+
+class TestMakefileLogNaming(unittest.TestCase):
+    FWDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_range_tx_log_filename_includes_t0_and_session(self):
+        out = subprocess.run(
+            ["make", "-n", "range-tx", "DIST=50m",
+             "T0=1787921400", "SESSION_ID=2608281250"],
+            cwd=self.FWDIR, capture_output=True, text=True)
+        self.assertIn("--tx-log", out.stdout)
+        self.assertIn("tx-log-t01787921400-2608281250.csv", out.stdout)
+        self.assertIn("stop-50m", out.stdout)
+
+    def test_range_rx_late_join_flag(self):
+        out = subprocess.run(
+            ["make", "-n", "range-rx", "DIST=50m",
+             "T0=1787921400", "SESSION_ID=2608281250"],
+            cwd=self.FWDIR, capture_output=True, text=True)
+        self.assertIn("--skip-late-configs", out.stdout)
+        self.assertIn("rx-log-t01787921400-2608281250.csv", out.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,160 @@
+CMD: rg -i --no-heading -n -m 50 coordinated_tx_rx .
+RC: 0  ERR: 
+
+./docs/PLAN-speed-optimization.md:107:3. Run `coordinated_tx_rx_test.py` with ESP32 on TX port
+./docs/PLAN-range-tests.md:205:python3 scripts/coordinated_tx_rx_test.py
+./docs/flrc-throughput-final-conclusion-2026-07-16.md:30:- `scripts/coordinated_tx_rx_test.py` — sends RUN to RX first, then TX
+./docs/handover-range-testing-2026-07-17.md:22:- Coordinated test harness: scripts/coordinated_tx_rx_test.py
+./docs/coordination/kanban-board.md:6:- [x] Coordinated TX/RX test harness (scripts/coordinated_tx_rx_test.py)
+./docs/range-test-comprehensive-plan-2026-07-17.md:257:- `scripts/coordinated_tx_rx_test.py` — test harness
+./docs/flrc-final-summary-2026-07-16.md:38:- Reusable: `scripts/coordinated_tx_rx_test.py`
+./docs/HANDOVER-range-tests.md:68:python3 scripts/coordinated_tx_rx_test.py
+./docs/HANDOVER-range-tests.md:78:2. **Run baseline test at 1m:** `python3 scripts/coordinated_tx_rx_test.py` — confirm 0% loss
+./docs/speed-test-comprehensive-plan-2026-07-17.md:51:6. Measure throughput with `scripts/coordinated_tx_rx_test.py`
+./docs/HANDOVER-speed-tests.md:103:python3 scripts/coordinated_tx_rx_test.py
+
+<<<naive-read ./docs/HANDOVER-range-tests.md>>>
+# HANDOVER — FLRC Range Test Track
+
+> **Paste this into a new context window / Signal group as the opening prompt.**
+
+---
+
+## You Are
+
+You are an AI assistant (Hermes Agent) continuing work on the **balloon-fresh** project. Your track: **FLRC range testing**. You measure how far the radio link reaches at various bitrates, power levels, and payload sizes.
+
+**WORKTREE:** `~/worktrees/balloon-range-tests/` (branch: `range-tests`)
+**All work goes in this worktree. Do NOT touch ~/repos/balloon-fresh/ — that's the main branch, another agent owns it.**
+**Start here:** Read `docs/HANDOVER-range-tests.md` and `docs/PLAN-range-tests.md` inside the worktree.
+
+---
+
+## What the Project Is
+
+ESP32-C3 + NiceRF LR2021 (Semtech) pico balloon tracker + mesh internet transport. Solar/supercap powered. Target weight <14g. Using 2.4 GHz FLRC mode for high-speed data.
+
+Full details: `AGENTS.md` in repo root.
+
+---
+
+## Current State (2026-07-16)
+
+- **Working radio link:** RP2040 + LR2021, 2.4 GHz FLRC, 1391 kbps
+- **Verified:** 1000/1000 TX packets sent, 1018 received (0% loss), end-to-end RF functional
+- **Config:** 2440 MHz, 2600 kbps FLRC, 255-byte payload, +12 dBm, sync word 0x12AD101B
+- **Range:** Only tested at bench distance (~30 cm). No range data exists yet.
+
+---
+
+## What This Track Does
+
+Run parameter sweeps to build a complete link budget table:
+
+1. **Distance sweep** (1m → 500m) at current config
+2. **Bitrate sweep** (2600/1300/650/325 kbps) at max usable distance
+3. **Payload sweep** (255/127/64/32/12 bytes)
+4. **Environmental tests** (walls, antennas, orientation, power levels)
+
+Full details: `docs/PLAN-range-tests.md`
+
+---
+
+## Hardware Setup
+
+| Board | Serial | Role | Port |
+|-------|--------|------|------|
+| F242D | E663B035977F242D | TX | /dev/ttyACM0 |
+| 8332 | E663B035973B8332 | RX | /dev/ttyACM3 |
+
+### Flash Firmware
+```bash
+cd ~/repos/balloon-fresh/firmware/rp2040
+
+# TX board
+pio run -e rp2040-raw-tx -t upload --upload-port /dev/ttyACM0
+
+# RX board
+pio run -e rp2040-raw-rx -t upload --upload-port /dev/ttyACM3
+```
+
+### Run Test
+```bash
+cd ~/repos/balloon-fresh
+python3 scripts/coordinated_tx_rx_test.py
+```
+
+This sends RUN to RX (2s head start), then RUN to TX, captures both ports 15s.
+
+---
+
+## Quick Start — First 3 Steps
+
+1. **Flash both boards** with current firmware (commands above)
+2. **Run baseline test at 1m:** `python3 scripts/coordinated_tx_rx_test.py` — confirm 0% loss
+3. **Move TX board to 10m** (through one wall), repeat test. Record results in `data/range-test-results.csv`
+
+---
+
+## Data Collection
+
+Record every test point as a CSV row. Create `data/range-test-results.csv`:
+
+```
+date,distance_m,bitrate_kbps,tx_power_dbm,payload_bytes,preamble,freq_mhz,antenna,orientation,obstacle,tx_sent,rx_received,loss_pct,rssi_dbm,throughput_kbps,notes
+```
+
+See `PLAN-range-tests.md` Section 7 for full column descriptions.
+
+---
+
+## Firmware Changes for Parameter Sweeps
+
+All changes are compile-time constants in `flrc_raw_tx.cpp` and `flrc_raw_rx.cpp`:
+
+| Parameter | Location | Current | How to change |
+|-----------|----------|---------|---------------|
+| Bitrate | `SET_FLRC_MOD_PARAMS` byte 3 | `0x00` (2600kbps) | `0x01`=1300, `0x02`=650, `0x03`=325 |
+| Payload | `FLRC_PKT_SIZE` | 255 | Change to 127, 64, 32, 12 |
+| TX power | `SET_TX_POWER` byte 3 | `24` (+12dBm) | `TX_POWER_DBM * 2` |
+| Frequency | `FLRC_FREQ_MHZ` | 2440.0 | Change float |
+| Preamble | `SET_FLRC_PACKET_PARAMS` byte 3 | `0x0C` (8 sym) | See LR2021 datasheet |
+
+**Both boards must have matching config.** After changing, rebuild and reflash both.
+
+---
+
+## What the Other Track Is Doing
+
+**Speed optimization track** (separate Signal group) is working on:
+- Testing ESP32-C3 hardware SPI DMA to break the 1391 kbps ceiling
+- Logic analyzer waveform capture for PIO debugging
+
+**Do NOT flash boards simultaneously** if both tracks are active. Coordinate board access.
+
+If speed track produces faster firmware, they'll notify this track to re-run range tests at the higher bitrate.
+
+---
+
+## Key Documents
+
+| Document | Purpose |
+|----------|---------|
+| `docs/PLAN-range-tests.md` | **YOUR PRIMARY PLAN** — test matrix, procedure, decision criteria |
+| `docs/PLAN-speed-optimization.md` | What the other track is doing |
+| `docs/flrc-final-summary-2026-07-16.md` | Overall progress summary |
+| `docs/flrc-timing-profile-2026-07-16.md` | Timing data from profiler |
+| `AGENTS.md` | Full project context, pin maps, inventory |
+| `docs/breadboard-wiring-guide.md` | How boards are wired |
+| `docs/bootsel-flashing-guide.md` | How to flash RP2040 via BOOTSEL |
+
+---
+
+## Decision Criteria
+
+| Loss Rate | Verdict |
+|-----------|---------|
+| < 5% | Usable — deploy this config |
+| 5–15% | Marginal — needs FEC or ACK |
+| 15–30% | Poor — reduce bitrate or payload |
+| > 30% | Not usable |

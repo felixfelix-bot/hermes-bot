@@ -1,0 +1,1 @@
+firmware/e80-stm32-bench/tools/e80_bench_ctl.py

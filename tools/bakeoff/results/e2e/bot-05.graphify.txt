@@ -1,0 +1,3 @@
+The session archiver logic — deciding age-appropriateness and manifest-gating — lives entirely in `session_archiver.py`, with key nodes being `load_manifest()` (L67), `candidates_*`, `make_digest()`, `month_of()` (L157), and `main()` (L186). The query already identified this file as the answer.
+
+session_archiver.py

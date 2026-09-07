@@ -1,0 +1,233 @@
+CMD: rg -i --no-heading -n -m 50 walk_analysis .
+RC: 0  ERR: 
+
+./tools/walk_capture.sh:226:echo "  Next: analyze with scripts/walk_analysis.py"
+
+<<<naive-read ./tools/walk_capture.sh>>>
+#!/bin/bash
+# walk_capture.sh — Dual serial capture for walk tests
+#
+# Captures BOTH the USB CDC serial (/dev/ttyACM0) and the ESP32 bridge
+# serial (/dev/ttyACM1) simultaneously. The RX firmware (multi_radio_sweep_rx)
+# uses dualPrintf() which writes to Serial (USB CDC) AND Serial1 (UART→ESP32).
+# Capturing both ensures data survives even if one CDC connection drops.
+#
+# Features:
+#   - Auto-reconnect on CDC dropout (retries indefinitely until duration ends)
+#   - Kills old capture processes before starting (prevents port competition)
+#   - Sends SET_TIME sync every 60s on the USB port
+#   - Timestamped filenames: walk-buildN-DATE-tx.txt / walk-buildN-DATE-rx.txt
+#
+# Usage: ./walk_capture.sh [duration_seconds] [rx_usb_port] [rx_bridge_port]
+#   duration_seconds   Capture length (default 3600 = 1 hour)
+#   rx_usb_port        RX USB CDC serial (default /dev/ttyACM0)
+#   rx_bridge_port     RX ESP32 bridge serial (default /dev/ttyACM1)
+#
+# Output files go to data/walk-<DATE>/
+#
+# Exit 0 = capture completed for full duration
+# Exit 1 = fatal error (no ports available, etc.)
+
+set -euo pipefail
+
+DURATION="${1:-3600}"
+RX_USB="${2:-/dev/ttyACM0}"
+RX_BRIDGE="${3:-/dev/ttyACM1}"
+DATE=$(date +%Y%m%d)
+DATADIR="data/walk-$DATE"
+
+mkdir -p "$DATADIR"
+
+# ── Determine build ID from firmware ───────────────────────────────────────
+# Try to read the FW_BOOT banner to get build tag for filename
+BUILD_TAG="unk"
+configure_port() {
+    stty -F "$1" 115200 cs8 -cstopb -parenb raw -echo 2>/dev/null || true
+}
+
+if [ -e "$RX_USB" ]; then
+    configure_port "$RX_USB"
+    printf 'FW_QUERY\n' > "$RX_USB" 2>/dev/null || true
+    FW_LINE=$(timeout 3 dd if="$RX_USB" bs=256 count=10 2>/dev/null \
+              | strings | grep -m1 "FW_BOOT" || true)
+    if [ -n "$FW_LINE" ]; then
+        # Extract tag (TX0/RX0) — use it in filename
+        BUILD_TAG=$(echo "$FW_LINE" | sed -n 's/.*tag=\([A-Z0-9]*\).*/\1/p' | tr '[:upper:]' '[:lower:]')
+        [ -z "$BUILD_TAG" ] && BUILD_TAG="unk"
+        echo "Firmware: $FW_LINE"
+    fi
+fi
+
+# ── Filename template ─────────────────────────────────────────────────────
+USB_FILE="$DATADIR/walk-${BUILD_TAG}-${DATE}-usb.txt"
+BRIDGE_FILE="$DATADIR/walk-${BUILD_TAG}-${DATE}-bridge.txt"
+META_FILE="$DATADIR/walk-${BUILD_TAG}-${DATE}-meta.txt"
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  WALK CAPTURE — Dual Serial"
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Duration:     ${DURATION}s ($(echo "scale=0; $DURATION/60" | bc) min)"
+echo "  USB port:     $RX_USB  → $USB_FILE"
+echo "  Bridge port:  $RX_BRIDGE  → $BRIDGE_FILE"
+echo "  Build tag:    $BUILD_TAG"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════
+#  KILL OLD CAPTURES — prevent port competition
+# ══════════════════════════════════════════════════════════════════════════
+echo "[setup] Killing old capture processes..."
+# Kill any dd/cat processes reading our serial ports
+for port in "$RX_USB" "$RX_BRIDGE"; do
+    PIDS=$(pgrep -f "dd if=$port" 2>/dev/null || true)
+    PIDS="$PIDS $(pgrep -f "cat $port" 2>/dev/null || true)"
+    for pid in $PIDS; do
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null && echo "  Killed PID $pid (was reading $port)" || true
+    done
+done
+# Kill any previous walk_capture instances (except ourselves)
+OWN_PID=$$
+OTHER_PIDS=$(pgrep -f "walk_capture" 2>/dev/null | grep -v "^${OWN_PID}$" || true)
+for pid in $OTHER_PIDS; do
+    kill "$pid" 2>/dev/null && echo "  Killed previous walk_capture PID $pid" || true
+done
+sleep 0.5
+
+# ══════════════════════════════════════════════════════════════════════════
+#  WRITE METADATA HEADER
+# ══════════════════════════════════════════════════════════════════════════
+cat > "$META_FILE" << EOF
+# Walk test capture metadata
+date=$DATE
+duration_s=$DURATION
+rx_usb=$RX_USB
+rx_bridge=$RX_BRIDGE
+build_tag=$BUILD_TAG
+fw_boot=$FW_LINE
+started=$(date -Iseconds)
+host=$(hostname)
+EOF
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CAPTURE LOOP — each port gets its own reconnect function
+# ══════════════════════════════════════════════════════════════════════════
+
+# capture_port(): reads from a serial port with auto-reconnect.
+# Runs in background. Appends to output file with timestamps.
+# Stops when DURATION_SECONDS have elapsed.
+capture_port() {
+    local port="$1"
+    local outfile="$2"
+    local label="$3"
+    local do_timesync="$4"
+    local start_ts
+    start_ts=$(date +%s)
+    local last_sync=0
+
+    echo "[$label] Capture started → $outfile"
+
+    while :; do
+        local now elapsed
+        now=$(date +%s)
+        elapsed=$((now - start_ts))
+        if [ "$elapsed" -ge "$DURATION" ]; then
+            echo "[$label] Duration reached (${DURATION}s) — stopping"
+            break
+        fi
+
+        # Check port exists
+        if [ ! -e "$port" ]; then
+            echo "[$label] Port $port not found — retrying in 2s..."
+            sleep 2
+            continue
+        fi
+
+        # Configure port
+        configure_port "$port"
+
+        # Periodic SET_TIME resync (every 60s, USB port only)
+        if [ "$do_timesync" = "yes" ]; then
+            if [ $((now - last_sync)) -ge 60 ]; then
+                printf 'SET_TIME %s\n' "$now" > "$port" 2>/dev/null || true
+                last_sync=$now
+            fi
+        fi
+
+        # Read with 10s timeout — reconnect if no data or error
+        # dd reads up to 10×256 = 2560 bytes per chunk
+        local chunk
+        chunk=$(timeout 10 dd if="$port" bs=256 count=10 2>/dev/null || true)
+
+        if [ -n "$chunk" ]; then
+            # Write with timestamp prefix
+            local ts
+            ts=$(date +%H:%M:%S)
+            printf '[%s] %s\n' "$ts" "$chunk" >> "$outfile"
+        else
+            echo "[$label] No data for 10s — CDC may have dropped, reconnecting..."
+            sleep 1
+        fi
+    done
+
+    echo "[$label] Capture complete — $(wc -l < "$outfile" 2>/dev/null || echo '?') lines written"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LAUNCH DUAL CAPTURE
+# ══════════════════════════════════════════════════════════════════════════
+
+# Start USB capture (with SET_TIME resync) in background
+capture_port "$RX_USB" "$USB_FILE" "USB" "yes" &
+USB_PID=$!
+
+# Start bridge capture (no SET_TIME — bridge port doesn't accept commands) in background
+capture_port "$RX_BRIDGE" "$BRIDGE_FILE" "BRIDGE" "no" &
+BRIDGE_PID=$!
+
+echo ""
+echo "[main] Dual capture running:"
+echo "  USB PID:    $USB_PID  ($RX_USB → $USB_FILE)"
+echo "  Bridge PID: $BRIDGE_PID  ($RX_BRIDGE → $BRIDGE_FILE)"
+echo ""
+echo "  Press Ctrl+C to stop early."
+echo "  Files are in: $DATADIR/"
+echo ""
+
+# ── Wait for both captures to finish ───────────────────────────────────────
+# Trap Ctrl+C to clean up both children
+cleanup() {
+    echo ""
+    echo "[main] Interrupted — stopping captures..."
+    kill "$USB_PID" 2>/dev/null || true
+    kill "$BRIDGE_PID" 2>/dev/null || true
+    wait "$USB_PID" 2>/dev/null || true
+    wait "$BRIDGE_PID" 2>/dev/null || true
+    echo "[main] Captures stopped."
+    # Update metadata
+    echo "stopped=$(date -Iseconds)" >> "$META_FILE"
+    echo "usb_lines=$(wc -l < "$USB_FILE" 2>/dev/null || echo 0)" >> "$META_FILE"
+    echo "bridge_lines=$(wc -l < "$BRIDGE_FILE" 2>/dev/null || echo 0)" >> "$META_FILE"
+    echo ""
+    echo "Files:"
+    ls -lh "$USB_FILE" "$BRIDGE_FILE" "$META_FILE" 2>/dev/null || true
+    exit 0
+}
+trap cleanup INT TERM
+
+wait "$USB_PID" 2>/dev/null || true
+wait "$BRIDGE_PID" 2>/dev/null || true
+
+# ── Update metadata ────────────────────────────────────────────────────────
+echo "stopped=$(date -Iseconds)" >> "$META_FILE"
+echo "usb_lines=$(wc -l < "$USB_FILE" 2>/dev/null || echo 0)" >> "$META_FILE"
+echo "bridge_lines=$(wc -l < "$BRIDGE_FILE" 2>/dev/null || echo 0)" >> "$META_FILE"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  CAPTURE COMPLETE"
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Files:"
+ls -lh "$USB_FILE" "$BRIDGE_FILE" "$META_FILE" 2>/dev/null || true
+echo ""
+echo "  Next: analyze with scripts/walk_analysis.py"
+exit 0

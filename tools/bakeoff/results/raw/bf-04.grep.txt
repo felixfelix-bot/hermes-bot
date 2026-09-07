@@ -1,0 +1,944 @@
+CMD: rg -i --no-heading -n -m 50 check_layers .
+RC: 0  ERR: 
+
+./docs/coordination/DISCOVERIES.md:470:- **Files:** check_layers.py, find_unconnected.py, inspect_board.py (+5 more)
+
+<<<naive-read ./docs/coordination/DISCOVERIES.md>>>
+# Balloon Project — Cross-Track Discoveries
+
+This file is automatically maintained by the `balloon-discovery-sync` cron job.
+It collects cross-relevant findings from all 9 balloon track worktrees.
+
+## How It Works
+
+- Every 2 hours, the cron job scans all balloon worktree git logs for new commits
+- Commits tagged with `BREAKTHROUGH`, `TECHNIQUE`, `RESULT`, `DISCOVERY`, or touching
+  shared files (firmware/main/, firmware/components/, docs/coordination/) are extracted
+- Relevant findings are appended here with source track, timestamp, and relevance tags
+- Track sub-managers are notified via Signal when new discoveries relevant to their track appear
+
+## Relevance Tags
+
+Each discovery is tagged with relevance categories so tracks know if it applies to them:
+- `SPI` — SPI bus / radio configuration technique (relevant to: hermes, fips, range-tests, speed-tests, circuit-design)
+- `RADIO` — Radio modulation / LoRa / FLRC configuration (relevant to: hermes, fips, range-tests, speed-tests)
+- `POWER` — Power management / solar / supercap (relevant to: all tracks)
+- `FIRMWARE` — Firmware architecture / build system (relevant to: all tracks with firmware)
+- `HARDWARE` — PCB / pin assignment / component selection (relevant to: circuit-design, hermes, fips)
+- `PROTOCOL` — Communication protocol / mesh / routing (relevant to: hermes, fips, nostr, blossom)
+- `TEST` — Testing methodology / test results (relevant to: range-tests, speed-tests, hermes)
+
+## Discoveries Log
+
+<!-- New discoveries are appended below. Do not edit existing entries. -->
+
+### [balloon-hermes] feat(range): range-check cross-checks TX vs RX T0, --tx-log arg + sibling discov (2026-08-28) | tags: GENERAL
+- **Commit:** `d9abf60` by Felix
+- **Files:** firmware/e80-stm32-bench/Makefile, firmware/e80-stm32-bench/tools/range_check.py, firmware/e80-stm32-bench/tools/test_range_preflight.py
+- **Full message:** feat(range): range-check cross-checks TX vs RX T0, --tx-log arg + sibling discovery
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: LR2021 throughput optimization analysis — RF + firmware consultant finding (2026-08-24) | tags: RADIO
+- **Commit:** `106f6fd` by Felix
+- **Files:** docs/LR2021-THROUGHPUT-OPTIMIZATION-ANALYSIS.md
+- **Full message:** docs: LR2021 throughput optimization analysis — RF + firmware consultant findings
+- **Relevance:** RADIO
+
+### [balloon-hermes] feat(two-computer): first cross-machine range test passed — 50/50 0% PER (2026-08-23) | tags: FIRMWARE, TEST
+- **Commit:** `5332fcc` by Felix
+- **Files:** docs/handover-adaptive-sweep-2026-08-22.md, docs/plans/stop-verify-results.json, docs/plans/stop-verify-results.md (+9 more)
+- **Full message:** feat(two-computer): first cross-machine range test passed — 50/50 0% PER
+- **Relevance:** FIRMWARE, TEST
+
+### [balloon-hermes] fix(bench): off-by-one SWD schedule gap + STAT? resilience + hardware findings (2026-08-23) | tags: TEST
+- **Commit:** `6274fd1` by Felix
+- **Files:** firmware/e80-stm32-bench/docs/hardware-integration-findings.md, firmware/e80-stm32-bench/docs/hardware-test-data/combined-range-report.md, firmware/e80-stm32-bench/docs/hardware-test-data/rx-final.csv (+4 more)
+- **Full message:** fix(bench): off-by-one SWD schedule gap + STAT? resilience + hardware findings
+- **Relevance:** TEST
+
+### [balloon-hermes] data: full-parameter sweep results (48 configs, 46 clean) (2026-08-21) | tags: GENERAL
+- **Commit:** `e4322ce` by Felix
+- **Files:** full-sweep-pkts-20260821-162143.csv, full-sweep-report-20260821-162143.md, full-sweep-summary-20260821-162143.csv
+- **Full message:** data: full-parameter sweep results (48 configs, 46 clean)
+- **Relevance:** GENERAL
+
+### [balloon-hermes] feat: E80-to-E80 LoRa sweep results + reproducible measurement scripts (2026-08-21) | tags: RADIO, TEST
+- **Commit:** `eac73a2` by Felix
+- **Files:** firmware/e80-stm32-bench/tools/buf_smoke_t3.py, firmware/e80-stm32-bench/tools/e80_sweep.py, firmware/e80-stm32-bench/tools/e80_sweep2.py (+5 more)
+- **Full message:** feat: E80-to-E80 LoRa sweep results + reproducible measurement scripts
+- **Relevance:** RADIO, TEST
+
+### [balloon-hermes] BUF-T5a: e80_sweep.py — parse_pkt accepts 23/24 fields + binary BUF loader (2026-08-21) | tags: FIRMWARE
+- **Commit:** `8f3f63b` by Felix
+- **Files:** docs/coordination/FLASH-QUEUE.md, tools/e80_sweep.py
+- **Full message:** BUF-T5a: e80_sweep.py — parse_pkt accepts 23/24 fields + binary BUF loader
+- **Relevance:** FIRMWARE
+
+### [balloon-hermes] docs: E80-to-E80 harmonization measurement results (2026-08-20) | tags: TEST
+- **Commit:** `4af2cf6` by Felix
+- **Files:** tools/e80_harm_measurement_results.txt
+- **Full message:** docs: E80-to-E80 harmonization measurement results
+- **Relevance:** TEST
+
+### [balloon-hermes] docs: add wave4 task cards + e2e playwright plan + update flash queue (2026-08-20) | tags: FIRMWARE
+- **Commit:** `beeb38d` by Felix
+- **Files:** .hermes/plans/2026-08-20_e2e-playwright-coverage-plan.md, .hermes/plans/2026-08-20_wave4-task-cards.md, docs/coordination/FLASH-QUEUE.md
+- **Full message:** docs: add wave4 task cards + e2e playwright plan + update flash queue
+- **Relevance:** FIRMWARE
+
+### [balloon-hermes] docs: E80 next-steps execution schedule with quality gates (2026-08-20) | tags: GENERAL
+- **Commit:** `f4838ed` by Felix
+- **Files:** docs/coordination/E80-NEXT-STEPS-SCHEDULE.md
+- **Full message:** docs: E80 next-steps execution schedule with quality gates
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: E80-SWD-DIAGNOSIS-2026-08-18 — UART breakthrough + SWD theory flip (2026-08-18) | tags: GENERAL
+- **Commit:** `88d5bc9` by Felix
+- **Files:** docs/E80-SWD-DIAGNOSIS-2026-08-18.md, docs/HANDOFF-SWD-NEXT-STEPS.md
+- **Full message:** docs: E80-SWD-DIAGNOSIS-2026-08-18 — UART breakthrough + SWD theory flip
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: E80 vendor research — official manual/schematic + finding that NO USB boot (2026-08-17) | tags: FIRMWARE, HARDWARE
+- **Commit:** `5a930af` by Felix
+- **Files:** docs/e80-900mbl-02-eval/RESEARCH-FINDINGS-2026-08-17.md, docs/e80-900mbl-02-eval/cn_manual.pdf, docs/e80-900mbl-02-eval/e80_m2212s_manual.pdf (+3 more)
+- **Full message:** docs: E80 vendor research — official manual/schematic + finding that NO USB bootloader exists (SWD via U4 pads is the official path; SoftRF/Zephyr flash this board the same way)
+- **Relevance:** FIRMWARE, HARDWARE
+
+### [balloon-hermes] docs: README (build/console/bench/EU policy) + FLASHING (stock-dump-first stm32f (2026-08-15) | tags: FIRMWARE
+- **Commit:** `f7920b2` by Felix
+- **Files:** firmware/e80-stm32-bench/.gitignore, firmware/e80-stm32-bench/FLASHING.md, firmware/e80-stm32-bench/README.md
+- **Full message:** docs: README (build/console/bench/EU policy) + FLASHING (stock-dump-first stm32flash procedure, BOOT0 finding)
+- **Relevance:** FIRMWARE
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 13 — diagonal 45° routing, no weight impact, informat (2026-08-08) | tags: PROTOCOL
+- **Commit:** `350b1e3` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 13 — diagonal 45° routing, no weight impact, informational
+- **Relevance:** PROTOCOL
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 13 — diagonal 45° routing, no weight impact, informat (2026-08-08) | tags: PROTOCOL
+- **Commit:** `350b1e3` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 13 — diagonal 45° routing, no weight impact, informational
+- **Relevance:** PROTOCOL
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 12 — FreeROUTING hung, no weight impact, informationa (2026-08-08) | tags: GENERAL
+- **Commit:** `773f824` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 12 — FreeROUTING hung, no weight impact, informational
+- **Relevance:** GENERAL
+
+### [balloon-circuit-design] feat(router): diagonal 45° routing capability for PCB v7 (2026-08-08) | tags: HARDWARE, PROTOCOL
+- **Commit:** `cbdd656` by Felix
+- **Files:** tracker/hardware/route_diagonal.py
+- **Full message:** feat(router): diagonal 45° routing capability for PCB v7
+- **Relevance:** HARDWARE, PROTOCOL
+
+
+### [balloon-hermes] wip(pcb): 9/16 signal nets routed, FreeROUTING hung — need diagonal router (2026-08-08) | tags: HARDWARE
+- **Commit:** `dcb3778` by Felix
+- **Files:** tracker/hardware/output/route_v7_signals.py, tracker/hardware/output/v7_routed.dsn, tracker/hardware/output/v_c3_flight_v7_routed.kicad_pcb
+- **Full message:** wip(pcb): 9/16 signal nets routed, FreeROUTING hung — need diagonal router
+- **Relevance:** HARDWARE
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 11 — circuit-design adopts ROADMAP v5, informational (2026-08-07) | tags: GENERAL
+- **Commit:** `5e50b18` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 11 — circuit-design adopts ROADMAP v5, informational
+- **Relevance:** GENERAL
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 10 — ROADMAP v5, 30 footprints, weight questions open (2026-08-07) | tags: HARDWARE
+- **Commit:** `9925142` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 10 — ROADMAP v5, 30 footprints, weight questions open
+- **Relevance:** HARDWARE
+
+### [balloon-circuit-design] docs: adopt ROADMAP v5 two-stage architecture + critical PCB lessons from discov (2026-08-07) | tags: HARDWARE
+- **Commit:** `c296754` by Felix
+- **Files:** docs/DISCOVERY-ADOPTION-ROADMAP-V5.md
+- **Full message:** docs: adopt ROADMAP v5 two-stage architecture + critical PCB lessons from discovery sync
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] plan(pcb): worker profile architecture — kimi-k2.7-code for spatial, quality-gat (2026-08-07) | tags: HARDWARE
+- **Commit:** `4754c73` by Felix
+- **Files:** tracker/hardware/PCB-WORKER-ARCHITECTURE.md
+- **Full message:** plan(pcb): worker profile architecture — kimi-k2.7-code for spatial, quality-gated tasks
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat(pcb): Phase 1A — RF 50Ω + power + thermal vias + GND stitching (2026-08-07) | tags: HARDWARE
+- **Commit:** `4c1befe` by Felix
+- **Files:** tracker/hardware/output/phase1a_rf_power.py, tracker/hardware/output/v_c3_flight_rf_power.kicad_pcb, tracker/hardware/output/v_c3_flight_rf_power.kicad_pro
+- **Full message:** feat(pcb): Phase 1A — RF 50Ω + power + thermal vias + GND stitching
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: ROADMAP v5 restructured — two-stage blocking gates (placement→routing) (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `440a975` by Felix
+- **Files:** tracker/hardware/ROADMAP-v5-pcb.md, tracker/hardware/drc_r3.txt, tracker/hardware/drc_v5_routed.txt (+10 more)
+- **Full message:** docs: ROADMAP v5 restructured — two-stage blocking gates (placement→routing)
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] feat(pcb): Phase 0 PASS — placement verified, caps near ICs (2026-08-07) | tags: HARDWARE
+- **Commit:** `1e47714` by Felix
+- **Files:** tracker/hardware/output/fix_placement_p0_v3.py, tracker/hardware/output/v_c3_flight_p0fixed.kicad_pcb, tracker/hardware/output/v_c3_flight_p0fixed.kicad_pro (+1 more)
+- **Full message:** feat(pcb): Phase 0 PASS — placement verified, caps near ICs
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat(hardware): P2V via placement — 20 collision-aware vias, edge-to-edge cleara (2026-08-07) | tags: HARDWARE
+- **Commit:** `7e0e18b` by Felix
+- **Files:** tracker/hardware/drc_v5_vias.txt, tracker/hardware/output/v5_vias.kicad_pcb, tracker/hardware/output/v5_vias.kicad_pro (+1 more)
+- **Full message:** feat(hardware): P2V via placement — 20 collision-aware vias, edge-to-edge clearance
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat(hardware): P2Z zones added — GND on In1.Cu, 3V3 on In2.Cu (clean, no duplic (2026-08-07) | tags: HARDWARE
+- **Commit:** `6e5d29f` by Felix
+- **Files:** tracker/hardware/drc_v5_zones.txt, tracker/hardware/output/v5_zones.kicad_pcb, tracker/hardware/output/v5_zones.kicad_prl (+4 more)
+- **Full message:** feat(hardware): P2Z zones added — GND on In1.Cu, 3V3 on In2.Cu (clean, no duplicates)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat(hardware): P1 placement verified — 30 footprints, 0 pad overlaps, snapshot  (2026-08-07) | tags: HARDWARE
+- **Commit:** `f459f5d` by Felix
+- **Files:** tracker/hardware/output/v5_placed.kicad_pcb, tracker/hardware/output/v5_placed.kicad_pro
+- **Full message:** feat(hardware): P1 placement verified — 30 footprints, 0 pad overlaps, snapshot saved
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: ROADMAP v5 PCB plan with adversarial review findings (2026-08-07) | tags: HARDWARE
+- **Commit:** `1e497fd` by Felix
+- **Files:** tracker/hardware/ROADMAP-v5-pcb.md
+- **Full message:** docs: ROADMAP v5 PCB plan with adversarial review findings
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] plan(pcb): consultant-reviewed routing plan v7.1 — placement-gated, RF-aware (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `ffb67e2` by Felix
+- **Files:** tracker/hardware/PCB-ROUTING-PLAN-v7.md
+- **Full message:** plan(pcb): consultant-reviewed routing plan v7.1 — placement-gated, RF-aware
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] checkpoint: PCB routing iterations — v4/v5/v6 boards, scripts, DRC reports (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `482f480` by Felix
+- **Files:** tracker/hardware/drc_clean.txt, tracker/hardware/drc_novias.txt, tracker/hardware/hub_board_v1_routed_clean.kicad_pcb (+13 more)
+- **Full message:** checkpoint: PCB routing iterations — v4/v5/v6 boards, scripts, DRC reports
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] wip(pcb): DRC fix attempt — connected all nets but power routing too aggressive (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `960a8fa` by Felix
+- **Files:** tracker/hardware/output/fix_all_drc_v6.py, tracker/hardware/output/v_c3_flight_v6.kicad_pcb
+- **Full message:** wip(pcb): DRC fix attempt — connected all nets but power routing too aggressive
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] fix(pcb): zone keepout flags + connectivity rebuild (2026-08-07) | tags: HARDWARE
+- **Commit:** `b4e1fde` by Felix
+- **Files:** tracker/hardware/output/fix_zones_and_route.py, tracker/hardware/output/v_c3_flight_final_clean.kicad_pcb, tracker/hardware/output/v_c3_flight_v5.kicad_pcb
+- **Full message:** fix(pcb): zone keepout flags + connectivity rebuild
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] fix(hardware): grid placement — 0 pad overlaps, 30 footprints, clean slate for r (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `959be27` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, tracker/hardware/analyze_board.py, tracker/hardware/analyze_pad_bbox.py (+13 more)
+- **Full message:** fix(hardware): grid placement — 0 pad overlaps, 30 footprints, clean slate for routing
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-pre-stretching] docs: discovery sync batch 9 — 4-layer routing maturation, 80x60mm weight flag (2026-08-07) | tags: PROTOCOL
+- **Commit:** `43519e8` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 9 — 4-layer routing maturation, 80x60mm weight flag
+- **Relevance:** PROTOCOL
+
+### [balloon-circuit-design] docs: adopt 4-layer PCB stackup findings from discovery sync — V0.1 plan update (2026-08-07) | tags: HARDWARE
+- **Commit:** `c95d761` by Felix
+- **Files:** docs/DISCOVERY-ADOPTION-4LAYER.md
+- **Full message:** docs: adopt 4-layer PCB stackup findings from discovery sync — V0.1 plan update
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] feat(pcb): clean placement 80x60mm + 4-layer routing — 0 overlaps, 10 DRC violat (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `ab7e0f7` by Felix
+- **Files:** tracker/hardware/output/replace_footprints.py, tracker/hardware/output/replace_footprints_v2.py, tracker/hardware/output/route_clean.py (+2 more)
+- **Full message:** feat(pcb): clean placement 80x60mm + 4-layer routing — 0 overlaps, 10 DRC violations
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] feat(pcb): v3 router — per-segment via hopping + relaxed fallback (2026-08-07) | tags: HARDWARE
+- **Commit:** `241367b` by Felix
+- **Files:** tracker/hardware/output/route_4layer_v3.py
+- **Full message:** feat(pcb): v3 router — per-segment via hopping + relaxed fallback
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat(hardware): v2 4-layer router — 0 crossings, 0 shorts, improved via placemen (2026-08-07) | tags: GENERAL
+- **Commit:** `29f03ad` by Felix
+- **Files:** tracker/hardware/output/route_4layer_v3.py
+- **Full message:** feat(hardware): v2 4-layer router — 0 crossings, 0 shorts, improved via placement
+- **Relevance:** GENERAL
+
+### [balloon-hermes] feat(pcb): 4-layer conversion with GND/3V3 power planes + collision-aware routin (2026-08-07) | tags: HARDWARE, PROTOCOL
+- **Commit:** `2812b63` by Felix
+- **Files:** tracker/hardware/output/route_4layer.py, tracker/hardware/output/route_4layer_v2.py, tracker/hardware/output/v_c3_flight_4layer_routed.kicad_pcb
+- **Full message:** feat(pcb): 4-layer conversion with GND/3V3 power planes + collision-aware routing
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] feat(hardware): 4-layer board with In1.Cu GND plane, In2.Cu 3V3 plane, signals o (2026-08-07) | tags: HARDWARE
+- **Commit:** `fb02a9b` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, graphify-out/cache/stat-index.json, tracker/hardware/drc_4layer.txt (+7 more)
+- **Full message:** feat(hardware): 4-layer board with In1.Cu GND plane, In2.Cu 3V3 plane, signals on F.Cu/B.Cu
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] docs: auto-sync discoveries batch 9 (2026-08-06) | tags: GENERAL
+- **Commit:** `314faa7` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md
+- **Full message:** docs: auto-sync discoveries batch 9
+- **Relevance:** GENERAL
+
+
+### [balloon-pre-stretching] docs: discovery sync batch 8 — C3 PCB routing progress, no weight impact (2026-08-06) | tags: HARDWARE, PROTOCOL
+- **Commit:** `3939109` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 8 — C3 PCB routing progress, no weight impact
+- **Relevance:** HARDWARE, PROTOCOL
+
+
+### [balloon-hermes] fix: C3 flight PCB layer assignment — 8→1 shorting_items, 55→44 violations (2026-08-06) | tags: HARDWARE
+- **Commit:** `cbde266` by Felix
+- **Files:** tracker/hardware/fix_crossings.py, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Adhesive.gba, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Courtyard.gbr (+29 more)
+- **Full message:** fix: C3 flight PCB layer assignment — 8→1 shorting_items, 55→44 violations
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: C3 flight PCB routed on clean placement — 89 tracks, 55 DRC (8 shorts) (2026-08-06) | tags: HARDWARE
+- **Commit:** `69851c9` by Felix
+- **Files:** tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Adhesive.gba, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Courtyard.gbr, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Cu.gbl (+26 more)
+- **Full message:** feat: C3 flight PCB routed on clean placement — 89 tracks, 55 DRC (8 shorts)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: lessons 8-11 + current plan status — placement-first breakthrough, Kimi K2 (2026-08-06) | tags: HARDWARE
+- **Commit:** `b7225f4` by Felix
+- **Files:** docs/PCB-LESSONS-LEARNED-2026-08-05.md, tracker/hardware/PCB-TWO-STAGE-PLAN.md
+- **Full message:** docs: lessons 8-11 + current plan status — placement-first breakthrough, Kimi K2.7 local works
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB session learnings — root causes, fixes, pipeline state, quality gates (2026-08-06) | tags: HARDWARE
+- **Commit:** `208c264` by Felix
+- **Files:** docs/coordination/PCB-SESSION-LEARNINGS-20260806.md
+- **Full message:** docs: PCB session learnings — root causes, fixes, pipeline state, quality gates
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] fix: C3 flight PCB placement — 0 shorting_items, 0 solder_mask_bridge (Gate 2.5  (2026-08-06) | tags: HARDWARE
+- **Commit:** `4c713b3` by Felix
+- **Files:** tracker/hardware/fix_placement.py, tracker/hardware/fix_placement_v2.py, tracker/hardware/output/v_c3_flight_final.kicad_pcb
+- **Full message:** fix: C3 flight PCB placement — 0 shorting_items, 0 solder_mask_bridge (Gate 2.5 PASS)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: add Gate 2.5 placement overlap check — no routing until placement is clean (2026-08-06) | tags: HARDWARE, PROTOCOL
+- **Commit:** `3e1f8fa` by Felix
+- **Files:** docs/coordination/PCB-WORKER-COORDINATION.md
+- **Full message:** docs: add Gate 2.5 placement overlap check — no routing until placement is clean
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] docs: add Gate 0 placement check before routing — no component overlap allowed (2026-08-06) | tags: FIRMWARE, HARDWARE, PROTOCOL
+- **Commit:** `44cf7de` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, graphify-out/cache/stat-index.json, tracker/hardware/PCB-TWO-STAGE-PLAN.md (+23 more)
+- **Full message:** docs: add Gate 0 placement check before routing — no component overlap allowed
+- **Relevance:** FIRMWARE, HARDWARE, PROTOCOL
+
+### [balloon-pre-stretching] docs: discovery sync batch 7 — C3 flight PCB exists, weight estimates improved (2026-08-06) | tags: HARDWARE
+- **Commit:** `8681cab` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 7 — C3 flight PCB exists, weight estimates improved
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] feat: C3 flight PCB — collision-aware routing (80 tracks, 26 vias), real gerbers (2026-08-06) | tags: HARDWARE, PROTOCOL
+- **Commit:** `eacc32e` by Felix
+- **Files:** tracker/hardware/output/c3_router.py, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Adhesive.gba, tracker/hardware/output/gerbers_v_c3_final/v_c3_flight_final-B_Courtyard.gbr (+46 more)
+- **Full message:** feat: C3 flight PCB — collision-aware routing (80 tracks, 26 vias), real gerbers exported
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] docs: PCB worker coordination protocol — single worker per file, quality gates (2026-08-06) | tags: HARDWARE
+- **Commit:** `af29d3f` by Felix
+- **Files:** docs/coordination/PCB-WORKER-COORDINATION.md
+- **Full message:** docs: PCB worker coordination protocol — single worker per file, quality gates
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: C3 flight PCB — 20 footprints, 41 tracks, 4-layer, 0.6mm (DRC needs fixing (2026-08-05) | tags: HARDWARE
+- **Commit:** `c2efedd` by Felix
+- **Files:** tracker/hardware/output/v_c3_4layer.dsn, tracker/hardware/output/v_c3_4layer.kicad_pcb, tracker/hardware/output/v_c3_4layer.kicad_pro (+23 more)
+- **Full message:** feat: C3 flight PCB — 20 footprints, 41 tracks, 4-layer, 0.6mm (DRC needs fixing)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: C3 flight PCB — 20 footprints placed by K2.7, routing incomplete (timeout) (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `71a2ba4` by Felix
+- **Files:** tracker/hardware/output/v_c3_4layer.dsn, tracker/hardware/output/v_c3_4layer.kicad_pcb, tracker/hardware/output/v_c3_4layer.kicad_pro (+17 more)
+- **Full message:** wip: C3 flight PCB — 20 footprints placed by K2.7, routing incomplete (timeout)
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] fix: dedent placed symbols in C3 schematic (K2.7 found 2-tab→1-tab issue) (2026-08-05) | tags: HARDWARE
+- **Commit:** `d8ae8e4` by Felix
+- **Files:** test_sch-erc.rpt, test_trunc-erc.rpt, tracker/hardware/output/PRE-LAYOUT-C3.md (+10 more)
+- **Full message:** fix: dedent placed symbols in C3 schematic (K2.7 found 2-tab→1-tab issue)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] fix: C3 schematic now loads in kicad-cli — removed invalid hierarchical_sheet_in (2026-08-05) | tags: HARDWARE
+- **Commit:** `81a286a` by Felix
+- **Files:** tracker/hardware/schematics/v_c3_flight.kicad_sch
+- **Full message:** fix: C3 schematic now loads in kicad-cli — removed invalid hierarchical_sheet_instances field
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] consultant(v2): revised PCB plan — 3 new show-stoppers found (2026-08-05) | tags: HARDWARE
+- **Commit:** `30d80b8` by Felix
+- **Files:** docs/coordination/CONSULTANT-REVISED-PLAN-V2.md
+- **Full message:** consultant(v2): revised PCB plan — 3 new show-stoppers found
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB model selection lessons — GLM 5.2 validated for PCB design, two-stage  (2026-08-05) | tags: HARDWARE
+- **Commit:** `89a4672` by Felix
+- **Files:** docs/coordination/PCB-MODEL-LESSONS-LEARNED.md
+- **Full message:** docs: PCB model selection lessons — GLM 5.2 validated for PCB design, two-stage workflow defined
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: two-stage PCB pipeline plan — GLM 5.2 generate, Kimi K2.7 verify (2026-08-05) | tags: HARDWARE
+- **Commit:** `6e785d7` by Felix
+- **Files:** tracker/hardware/PCB-TWO-STAGE-PLAN.md
+- **Full message:** docs: two-stage PCB pipeline plan — GLM 5.2 generate, Kimi K2.7 verify
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] persist: C3 schematic + symbols + project file committed (2026-08-05) | tags: HARDWARE
+- **Commit:** `18529e6` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, tracker/hardware/run_4layer.py, tracker/hardware/schematics/v_c3_flight.kicad_pro (+8 more)
+- **Full message:** persist: C3 schematic + symbols + project file committed
+- **Relevance:** HARDWARE
+
+### [balloon-pre-stretching] docs: discovery sync batch 6 — ADR-028 three-variant PCB, weight estimates at ri (2026-08-05) | tags: HARDWARE
+- **Commit:** `ee5f1e0` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 6 — ADR-028 three-variant PCB, weight estimates at risk
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] consultant(C3-P7): REJECT sign-off — C3 flight board does not exist (2026-08-05) | tags: GENERAL
+- **Commit:** `084e580` by Felix
+- **Files:** tracker/hardware/C3-SIGNOFF.md
+- **Full message:** consultant(C3-P7): REJECT sign-off — C3 flight board does not exist
+- **Relevance:** GENERAL
+
+### [balloon-hermes] wip: commit all PCB work — 4layer scripts, routing outputs, DSN/SES files (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `14b63d0` by Felix
+- **Files:** tracker/hardware/create_4layer.py, tracker/hardware/output/v2_adc_4layer.dsn, tracker/hardware/output/v2_adc_4layer.kicad_pro (+30 more)
+- **Full message:** wip: commit all PCB work — 4layer scripts, routing outputs, DSN/SES files
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] docs: comprehensive PCB execution plan — 3 variants, quality gates, scheduling (2026-08-05) | tags: HARDWARE
+- **Commit:** `7128449` by Felix
+- **Files:** tracker/hardware/PCB-EXECUTION-PLAN.md
+- **Full message:** docs: comprehensive PCB execution plan — 3 variants, quality gates, scheduling
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs(coordination): PCB master execution plan — 3 variants, 7 phases, 6 gates (2026-08-05) | tags: HARDWARE
+- **Commit:** `30b8a94` by Felix
+- **Files:** docs/coordination/PCB-MASTER-EXECUTION-PLAN.md
+- **Full message:** docs(coordination): PCB master execution plan — 3 variants, 7 phases, 6 gates
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: schematic plan for 3 board variants (C3, S3, C3+RP2040) (2026-08-05) | tags: HARDWARE
+- **Commit:** `d6c7457` by Felix
+- **Files:** docs/coordination/SCHEMATIC-PLAN-3VARIANTS.md
+- **Full message:** docs: schematic plan for 3 board variants (C3, S3, C3+RP2040)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: schematic design plan — C3, S3, C3+RP2040 variants (2026-08-05) | tags: HARDWARE
+- **Commit:** `1a16e3e` by Felix
+- **Files:** tracker/hardware/SCHEMATIC-PLAN.md
+- **Full message:** docs: schematic design plan — C3, S3, C3+RP2040 variants
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC FreeRouting-only output — 0 violations, 22 unconnected (circuit bre (2026-08-05) | tags: HARDWARE
+- **Commit:** `27ba1af` by Felix
+- **Files:** tracker/hardware/output/v2_adc_fixed.kicad_pcb, tracker/hardware/output/v2_adc_fixed.ses, tracker/hardware/output/v2_adc_fixed_drc.json
+- **Full message:** feat: V2-ADC FreeRouting-only output — 0 violations, 22 unconnected (circuit breaker tripped)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: pre-extracted GPIO data for schematic planning task (2026-08-05) | tags: HARDWARE
+- **Commit:** `424296b` by Felix
+- **Files:** docs/coordination/schematic-task-context.md
+- **Full message:** docs: pre-extracted GPIO data for schematic planning task
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: persist kimi-k3 partial work — 8th timeout on delegate_task (300s limit) (2026-08-05) | tags: HARDWARE
+- **Commit:** `39459f2` by Felix
+- **Files:** tracker/hardware/create_4layer.py, tracker/hardware/full_pipeline.py, tracker/hardware/output/v2_adc_4layer.kicad_pcb (+6 more)
+- **Full message:** wip: persist kimi-k3 partial work — 8th timeout on delegate_task (300s limit)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] persist: kimi-k3 power routing scripts + inspection tools (2-layer power routing (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `46d8214` by Felix
+- **Files:** check_layers.py, find_unconnected.py, inspect_board.py (+5 more)
+- **Full message:** persist: kimi-k3 power routing scripts + inspection tools (2-layer power routing abandoned — needs 4-layer)
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] consultant: strategic review — 3 show-stoppers found (MCU mismatch, false 'all p (2026-08-05) | tags: GENERAL
+- **Commit:** `d7e658a` by Felix
+- **Files:** docs/coordination/CONSULTANT-STRATEGIC-REVIEW.md
+- **Full message:** consultant: strategic review — 3 show-stoppers found (MCU mismatch, false 'all power' claim, FEM not removed)
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: comprehensive project status summary for consultant review (2026-08-05) | tags: GENERAL
+- **Commit:** `c97752f` by Felix
+- **Files:** docs/coordination/PROJECT-STATUS-SUMMARY.md
+- **Full message:** docs: comprehensive project status summary for consultant review
+- **Relevance:** GENERAL
+
+### [balloon-hermes] chore: commit remaining kimi-k3 artifacts + DRC verification doc (2026-08-05) | tags: HARDWARE
+- **Commit:** `a9e91ee` by Felix
+- **Files:** tracker/hardware/output/v2_2LAYER_FINAL.kicad_prl, tracker/hardware/output/v2_adc_fixed.dsn, tracker/hardware/output/v2_adc_fixed.kicad_pcb (+6 more)
+- **Full message:** chore: commit remaining kimi-k3 artifacts + DRC verification doc
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] fix: V2-ADC 2-layer FINAL — outline+gerbers, 0 violations, 16 unconnected (power (2026-08-05) | tags: HARDWARE
+- **Commit:** `dd03b60` by Felix
+- **Files:** tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Adhesive.gba, tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Courtyard.gbr, tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Cu.gbl (+23 more)
+- **Full message:** fix: V2-ADC 2-layer FINAL — outline+gerbers, 0 violations, 16 unconnected (power nets)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] verify(inspection): V2-ADC DRC final verification — FAILS 3/4 gates, not fab-rea (2026-08-05) | tags: GENERAL
+- **Commit:** `6a11077` by Felix
+- **Files:** tracker/hardware/DRC_FINAL_VERIFICATION.md, tracker/hardware/output/v2_adc_v3_clean_VERIFY_DRC.json
+- **Full message:** verify(inspection): V2-ADC DRC final verification — FAILS 3/4 gates, not fab-ready
+- **Relevance:** GENERAL
+
+### [balloon-hermes] fix: V2-ADC 2-layer FINAL — outline+power routing+gerbers (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `0170f56` by Felix
+- **Files:** tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Adhesive.gba, tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Courtyard.gbr, tracker/hardware/output/gerbers_v2_2layer/v2_2LAYER_FINAL-B_Cu.gbl (+22 more)
+- **Full message:** fix: V2-ADC 2-layer FINAL — outline+power routing+gerbers
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] chore: add finish_2layer.py — one-shot power routing + outline + gerbers script (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `b262804` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, tracker/hardware/finish_2layer.py, tracker/hardware/output/v2_2LAYER_FINAL.kicad_pcb (+6 more)
+- **Full message:** chore: add finish_2layer.py — one-shot power routing + outline + gerbers script
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-speed-tests] docs: discovery sync batch 5 — 3 PCB findings all N/A (2-layer board, DSN, pad c (2026-08-05) | tags: HARDWARE
+- **Commit:** `35b818e` by Felix
+- **Files:** docs/STATUS-balloon-speed-tests.md
+- **Full message:** docs: discovery sync batch 5 — 3 PCB findings all N/A (2-layer board, DSN, pad collision)
+- **Relevance:** HARDWARE
+
+### [balloon-pre-stretching] docs: discovery sync batch 5 — V2-ADC not order-ready, PCB delay continues (2026-08-05) | tags: HARDWARE
+- **Commit:** `9d7097a` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 5 — V2-ADC not order-ready, PCB delay continues
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] wip: V2-ADC 2LAYER_FINISH — kimi-k3 working copy from fixed2 (2026-08-05) | tags: HARDWARE
+- **Commit:** `81e3f27` by Felix
+- **Files:** tracker/hardware/output/v2_2LAYER_FINISH.kicad_pcb
+- **Full message:** wip: V2-ADC 2LAYER_FINISH — kimi-k3 working copy from fixed2
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: 2-LAYER V2-ADC board — BEST RESULT: 0v/16uc/0s + gerbers exported (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `5080893` by Felix
+- **Files:** tracker/hardware/freerouting_pipeline.py, tracker/hardware/output/v2_adc_2layer_gerbers.zip, tracker/hardware/output/v2_adc_2layer_gerbers/v2_adc_fixed2-B_Adhesive.gba (+59 more)
+- **Full message:** feat: 2-LAYER V2-ADC board — BEST RESULT: 0v/16uc/0s + gerbers exported
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] persist: V2-ADC fixed4 DRC results + project files (2026-08-05) | tags: HARDWARE
+- **Commit:** `3dd9372` by Felix
+- **Files:** tracker/hardware/output/v2_adc_fixed4.kicad_pro, tracker/hardware/output/v2_adc_fixed4_drc.json
+- **Full message:** persist: V2-ADC fixed4 DRC results + project files
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: V2-ADC fixed4 — 0 unconnected, 1 violation (missing outline) (2026-08-05) | tags: HARDWARE
+- **Commit:** `0d4c668` by Felix
+- **Files:** tracker/hardware/freerouting_pipeline.py, tracker/hardware/output/v2_adc_fixed4.dsn, tracker/hardware/output/v2_adc_fixed4.kicad_pcb (+2 more)
+- **Full message:** wip: V2-ADC fixed4 — 0 unconnected, 1 violation (missing outline)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] chore: regenerate clean V2-ADC board + all routing scripts committed (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `7f610c0` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v2_adc_v3_clean.dsn, tracker/hardware/output/v2_adc_v3_clean.kicad_pcb (+4 more)
+- **Full message:** chore: regenerate clean V2-ADC board + all routing scripts committed
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] feat: V2-ADC v3 gerbers exported — ready for JLCPCB (22 unconnected, needs GUI f (2026-08-05) | tags: HARDWARE
+- **Commit:** `c60cb84` by Felix
+- **Files:** tracker/hardware/output/v2_adc_v3_gerbers.zip, tracker/hardware/output/v2_adc_v3_gerbers/v2_adc_v3-B_Adhesive.gba, tracker/hardware/output/v2_adc_v3_gerbers/v2_adc_v3-B_Courtyard.gbr (+24 more)
+- **Full message:** feat: V2-ADC v3 gerbers exported — ready for JLCPCB (22 unconnected, needs GUI finish)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC v3 board — kimi-k3 FreeRouting output, 0 violations, 22 unconnected (2026-08-05) | tags: HARDWARE
+- **Commit:** `eb6b72a` by Felix
+- **Files:** tracker/hardware/output/v2_adc_clean2.kicad_pcb, tracker/hardware/output/v2_adc_fixed3.kicad_pcb, tracker/hardware/output/v2_adc_fixed3.ses (+2 more)
+- **Full message:** feat: V2-ADC v3 board — kimi-k3 FreeRouting output, 0 violations, 22 unconnected
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB task pipeline — kimi-k3 owns all spatial work, consultant gates (2026-08-05) | tags: HARDWARE
+- **Commit:** `acb3369` by Felix
+- **Files:** docs/coordination/PCB-TASK-PIPELINE.md
+- **Full message:** docs: PCB task pipeline — kimi-k3 owns all spatial work, consultant gates
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] consultant: V2-ADC board review — NEEDS CHANGES (board is empty) (2026-08-05) | tags: GENERAL
+- **Commit:** `4ad6de1` by Consultant Reviewer
+- **Files:** docs/coordination/CONSULTANT-FINAL-BOARD-REVIEW.md
+- **Full message:** consultant: V2-ADC board review — NEEDS CHANGES (board is empty)
+- **Relevance:** GENERAL
+
+### [balloon-hermes] persist: remaining kimi-k3 scripts + SES files + DRC results (2026-08-05) | tags: HARDWARE
+- **Commit:** `eedf267` by Felix
+- **Files:** tracker/hardware/output/v2_adc_clean2.kicad_pcb, tracker/hardware/output/v2_adc_fixed3_drc.json, tracker/hardware/surgical_route.py
+- **Full message:** persist: remaining kimi-k3 scripts + SES files + DRC results
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC board DRC-CLEAN — 0 violations, 0 unconnected, gerbers exported (2026-08-05) | tags: HARDWARE
+- **Commit:** `ac666a6` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/gerbers_v2/v2_adc_JLCPCB_READY-B_Adhesive.gba, tracker/hardware/output/gerbers_v2/v2_adc_JLCPCB_READY-B_Courtyard.gbr (+48 more)
+- **Full message:** feat: V2-ADC board DRC-CLEAN — 0 violations, 0 unconnected, gerbers exported
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: V1 SES import (175v/26uc), V2 FIXED2 (0v/16uc) — best V2 board yet (2026-08-05) | tags: HARDWARE
+- **Commit:** `d8d9072` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/iterative_router.py, tracker/hardware/output/v1_clean_export.dsn (+17 more)
+- **Full message:** wip: V1 SES import (175v/26uc), V2 FIXED2 (0v/16uc) — best V2 board yet
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC FreeRouting output — 0 violations, 21 unconnected (85% routed) (2026-08-05) | tags: HARDWARE
+- **Commit:** `cc48f4f` by Felix
+- **Files:** tracker/hardware/output/v2_adc_fab_candidate.kicad_pcb, tracker/hardware/output/v2_adc_final_drc.json, tracker/hardware/output/v2_adc_gerbers.zip (+26 more)
+- **Full message:** feat: V2-ADC FreeRouting output — 0 violations, 21 unconnected (85% routed)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: V2-ADC routing attempts + finish_routing.py (coordinate fix in progress) (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `15ee739` by Felix
+- **Files:** tracker/hardware/finish_routing.py, tracker/hardware/output/v2_adc_clean.dsn, tracker/hardware/output/v2_adc_clean.kicad_pcb (+15 more)
+- **Full message:** wip: V2-ADC routing attempts + finish_routing.py (coordinate fix in progress)
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] wip: Freerouting DSN pipeline — 241 tracks imported, GND zone fill, coordinate i (2026-08-05) | tags: HARDWARE
+- **Commit:** `65b3f8c` by Felix
+- **Files:** tracker/hardware/import_freerouting_final.py, tracker/hardware/output/v1_clean_export.dsn, tracker/hardware/output/v1_final_drc.json (+2 more)
+- **Full message:** wip: Freerouting DSN pipeline — 241 tracks imported, GND zone fill, coordinate investigation
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] persist: FreeRouting DSN artifacts + DRC snapshots + merged board from /tmp (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `83be7ba` by Felix
+- **Files:** tracker/hardware/import_freerouting_final.py, tracker/hardware/output/drc_snapshots/v1_fast_detail.json, tracker/hardware/output/drc_snapshots/v1_fast_routed_best.json (+18 more)
+- **Full message:** persist: FreeRouting DSN artifacts + DRC snapshots + merged board from /tmp
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] review: independent DRC verification — BOTH BOARDS FAIL (circuit breaker) (2026-08-05) | tags: GENERAL
+- **Commit:** `422d1d9` by Felix
+- **Files:** tracker/hardware/DRC_VERIFICATION_REPORT.md, tracker/hardware/output/v1_fast_verify.json, tracker/hardware/output/v2_adc_verify.json
+- **Full message:** review: independent DRC verification — BOTH BOARDS FAIL (circuit breaker)
+- **Relevance:** GENERAL
+
+### [balloon-hermes] fix: ESP32-C3 GPIO5/GPIO6 pad collision — shift bottom row inboard by one pitch (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `c4f5ed7` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, docs/coordination/PCB-REMAINING-ISSUES-ANALYSIS.md, test (+49 more)
+- **Full message:** fix: ESP32-C3 GPIO5/GPIO6 pad collision — shift bottom row inboard by one pitch
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] docs: DRC consultant strategy — pad collision bug found, A* loop is deterministi (2026-08-05) | tags: HARDWARE
+- **Commit:** `a7dab62` by Felix
+- **Files:** docs/coordination/PCB-DRC-CONSULTANT-STRATEGY.md
+- **Full message:** docs: DRC consultant strategy — pad collision bug found, A* loop is deterministic no-op, FreeRouting-only recommended
+- **Relevance:** HARDWARE
+
+### [balloon-pre-stretching] docs: discovery sync batch 4 — speed-tests PCB finding N/A, acknowledged (2026-08-05) | tags: HARDWARE
+- **Commit:** `bc2d1d7` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 4 — speed-tests PCB finding N/A, acknowledged
+- **Relevance:** HARDWARE
+
+
+### [balloon-speed-tests] docs: discovery sync batch 4 — 3 findings all N/A (PCB smoke test, GPIO fix, int (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `8a0eda9` by Felix
+- **Files:** docs/STATUS-balloon-speed-tests.md
+- **Full message:** docs: discovery sync batch 4 — 3 findings all N/A (PCB smoke test, GPIO fix, integration plan)
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-pre-stretching] docs: discovery sync batch 3 — V1-FAST/V2-ADC replace V1, payload weights update (2026-08-05) | tags: GENERAL
+- **Commit:** `d65fd70` by Felix
+- **Files:** docs/PAYLOAD-WEIGHT-ESTIMATES.md, docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 3 — V1-FAST/V2-ADC replace V1, payload weights updated for single-MCU
+- **Relevance:** GENERAL
+
+
+### [balloon-hermes] feat: V1-FAST board A* routed — all nets traced (2026-08-05) | tags: HARDWARE
+- **Commit:** `17fb9f5` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v1_fast_routed.kicad_pcb
+- **Full message:** feat: V1-FAST board A* routed — all nets traced
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC board A* routed — all 18 nets traced (2026-08-05) | tags: HARDWARE
+- **Commit:** `e749005` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v1_fast_routed.kicad_pcb, tracker/hardware/output/v2_adc_routed.kicad_pcb (+2 more)
+- **Full message:** feat: V2-ADC board A* routed — all 18 nets traced
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] feat: V2-ADC board created — 18 nets, 18 components, supercap ADC (2026-08-05) | tags: POWER, FIRMWARE, HARDWARE
+- **Commit:** `bc8aa63` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v2_adc_board.kicad_pcb, tracker/hardware/output/v2_adc_board.kicad_prl (+1 more)
+- **Full message:** feat: V2-ADC board created — 18 nets, 18 components, supercap ADC
+- **Relevance:** POWER, FIRMWARE, HARDWARE
+
+### [balloon-hermes] feat: V1-FAST board created — 15 nets, 16 components, no ADC (2026-08-05) | tags: FIRMWARE, HARDWARE
+- **Commit:** `8c46d99` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v1_fast_board.kicad_pcb, tracker/hardware/output/v1_fast_board.kicad_prl (+1 more)
+- **Full message:** feat: V1-FAST board created — 15 nets, 16 components, no ADC
+- **Relevance:** FIRMWARE, HARDWARE
+
+### [balloon-hermes] test: V1-FAST board smoke test — pipeline creates board, DRC runs (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `d57e9cb` by Felix
+- **Files:** tracker/hardware/output/v1_fast_routed.kicad_pcb, tracker/hardware/output/v1_fast_smoke_drc.json
+- **Full message:** test: V1-FAST board smoke test — pipeline creates board, DRC runs
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] feat: PCB auto-route pipeline — NewBoard, A* router, DRC loop (2026-08-05) | tags: HARDWARE
+- **Commit:** `cba398f` by Felix
+- **Files:** tracker/hardware/full_pipeline.py, tracker/hardware/output/v1_fast_routed.kicad_pcb, tracker/hardware/output/v1_fast_routed.kicad_prl (+4 more)
+- **Full message:** feat: PCB auto-route pipeline — NewBoard, A* router, DRC loop
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: ESP32-C3 MINI-1 pinout verification + V2-ADC pinmap (2026-08-05) | tags: FIRMWARE, HARDWARE
+- **Commit:** `4b7203b` by Felix
+- **Files:** docs/coordination/DISCOVERIES.md, hub_board_v1-drc.rpt, tracker/firmware/dependencies.lock (+5 more)
+- **Full message:** docs: ESP32-C3 MINI-1 pinout verification + V2-ADC pinmap
+- **Relevance:** FIRMWARE, HARDWARE
+
+### [balloon-hermes] Consultant re-review V2: all 5 blockers + 11 major issues verified fixed — APPRO (2026-08-05) | tags: HARDWARE
+- **Commit:** `3e86997` by Felix
+- **Files:** docs/coordination/PCB-PLAN-CONSULTANT-REVIEW-V2.md
+- **Full message:** Consultant re-review V2: all 5 blockers + 11 major issues verified fixed — APPROVED
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB execution plan V2 — all 5 blockers + 11 major issues fixed, dual-board (2026-08-05) | tags: HARDWARE
+- **Commit:** `032716e` by Felix
+- **Files:** docs/coordination/PCB-AUTO-ROUTE-EXECUTION-PLAN-V2.md
+- **Full message:** docs: PCB execution plan V2 — all 5 blockers + 11 major issues fixed, dual-board V1+V2, quality gates in task bodies
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs(coordination): patch PCB autoroute plan with consultant V7 feedback (2026-08-05) | tags: HARDWARE
+- **Commit:** `d05f3d1` by Felix
+- **Files:** docs/coordination/PCB-AUTOROUTE-EXECUTION-PLAN.md
+- **Full message:** docs(coordination): patch PCB autoroute plan with consultant V7 feedback
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: consultant plan review V7 — APPROVE-WITH-CHANGES, ADC conflict blocker (2026-08-05) | tags: GENERAL
+- **Commit:** `126eca0` by Felix
+- **Files:** docs/coordination/CONSULTANT-PLAN-REVIEW-V7.md
+- **Full message:** docs: consultant plan review V7 — APPROVE-WITH-CHANGES, ADC conflict blocker
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: consultant review of PCB plan — 5 blockers, 11 major, verdict: NEEDS REVIS (2026-08-05) | tags: HARDWARE
+- **Commit:** `f934821` by Felix
+- **Files:** docs/coordination/PCB-PLAN-CONSULTANT-REVIEW.md
+- **Full message:** docs: consultant review of PCB plan — 5 blockers, 11 major, verdict: NEEDS REVISION
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB auto-route execution plan — 6 phases, 3.5h estimate, worker-ready (2026-08-05) | tags: HARDWARE
+- **Commit:** `c6211fe` by Felix
+- **Files:** docs/coordination/PCB-AUTOROUTE-EXECUTION-PLAN.md
+- **Full message:** docs: PCB auto-route execution plan — 6 phases, 3.5h estimate, worker-ready
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: PCB auto-route execution plan — 8 phases, worker assignments, quality gate (2026-08-05) | tags: HARDWARE
+- **Commit:** `903da45` by Felix
+- **Files:** docs/coordination/PCB-AUTO-ROUTE-EXECUTION-PLAN.md
+- **Full message:** docs: PCB auto-route execution plan — 8 phases, worker assignments, quality gates
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: clean PCB (tracks stripped) + DSN export pipeline for Freerouting (2026-08-05) | tags: HARDWARE
+- **Commit:** `1aebc5f` by Felix
+- **Files:** tracker/hardware/fix_pcb_and_route.py, tracker/hardware/hub_board_v1_clean.kicad_pcb
+- **Full message:** wip: clean PCB (tracks stripped) + DSN export pipeline for Freerouting
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] wip: Python auto-router script for V1 PCB (format fix needed) (2026-08-05) | tags: HARDWARE
+- **Commit:** `ccdb1b0` by Felix
+- **Files:** tracker/hardware/auto_route_v1.py
+- **Full message:** wip: Python auto-router script for V1 PCB (format fix needed)
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: LLM auto-routing pipeline — A* hybrid, full Python code, 2.5h to gerbers (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `c542afb` by Felix
+- **Files:** docs/coordination/LLM-AUTO-ROUTING-PIPELINE.md
+- **Full message:** docs: LLM auto-routing pipeline — A* hybrid, full Python code, 2.5h to gerbers
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] docs: auto-routing feasibility — VERIFIED, python3.14+pcbnew works, kicad-cli DR (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `ee9b6ba` by Felix
+- **Files:** docs/coordination/AUTO-ROUTING-FEASIBILITY.md
+- **Full message:** docs: auto-routing feasibility — VERIFIED, python3.14+pcbnew works, kicad-cli DRC works, pipeline feasible
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-hermes] docs: consultant unified board analysis — YES one board works, GPIO9 for LED (2026-08-05) | tags: GENERAL
+- **Commit:** `4884069` by Felix
+- **Files:** tracker/hardware/CONSULTANT-UNIFIED-BOARD-ANALYSIS.md
+- **Full message:** docs: consultant unified board analysis — YES one board works, GPIO9 for LED
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: unified PCB review — two separate boards recommended over unified (2026-08-05) | tags: HARDWARE
+- **Commit:** `0a74046` by Felix
+- **Files:** docs/coordination/UNIFIED-PCB-DESIGN-REVIEW.md
+- **Full message:** docs: unified PCB review — two separate boards recommended over unified
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: consultant V6 progress review + dual-board strategy — PCB GPIO mismatch fo (2026-08-05) | tags: HARDWARE
+- **Commit:** `1b0fe93` by Felix
+- **Files:** docs/coordination/CONSULTANT-PROGRESS-REVIEW-V6.md
+- **Full message:** docs: consultant V6 progress review + dual-board strategy — PCB GPIO mismatch found
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: dual-board strategy — single-MCU V2 for first flight, dual-MCU V1-fix for  (2026-08-05) | tags: PROTOCOL
+- **Commit:** `22dcdc0` by Felix
+- **Files:** tracker/hardware/DUAL-BOARD-STRATEGY.md
+- **Full message:** docs: dual-board strategy — single-MCU V2 for first flight, dual-MCU V1-fix for mesh V2
+- **Relevance:** PROTOCOL
+
+### [balloon-hermes] docs: consultant review V6 — architecture mismatch, single-MCU PCB redesign reco (2026-08-05) | tags: HARDWARE
+- **Commit:** `7309f57` by Felix
+- **Files:** docs/coordination/CONSULTANT-PLAN-REVIEW-V6.md
+- **Full message:** docs: consultant review V6 — architecture mismatch, single-MCU PCB redesign recommended, 2-worker limit
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: progress report V6 for consultant — 39 commits, PCB architecture mismatch  (2026-08-05) | tags: HARDWARE
+- **Commit:** `f506d33` by Felix
+- **Files:** docs/coordination/PROGRESS-REPORT-V6.md
+- **Full message:** docs: progress report V6 for consultant — 39 commits, PCB architecture mismatch critical
+- **Relevance:** HARDWARE
+
+### [balloon-range-tests] docs: discovery sync batch 3 — 5 findings, V1 PCB GPIO fix adopted, 3 CLI inform (2026-08-05) | tags: HARDWARE
+- **Commit:** `655d094` by Felix
+- **Files:** docs/STATUS-balloon-range-tests.md
+- **Full message:** docs: discovery sync batch 3 — 5 findings, V1 PCB GPIO fix adopted, 3 CLI informational
+- **Relevance:** HARDWARE
+
+### [balloon-range-tests] fix(pcb): V1 GPIO fix — remove STATUS_LED from GPIO10, add FEM_TX net + test poi (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `c06cef5` by Felix
+- **Files:** tracker/hardware/V1-PCB-GPIO-FIX.md, tracker/hardware/gerbers_v1_fixed/hub_board_v1-B_Adhesive.gba, tracker/hardware/gerbers_v1_fixed/hub_board_v1-B_Courtyard.gbr (+23 more)
+- **Full message:** fix(pcb): V1 GPIO fix — remove STATUS_LED from GPIO10, add FEM_TX net + test points
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-range-tests] docs: integration test plan + PCB GPIO fix plan — Phases 2-4 and V1 PCB prep (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `bd46945` by Felix
+- **Files:** docs/coordination/INTEGRATION-TEST-PLAN.md, docs/pcb/V1-PCB-GPIO-FIX.md
+- **Full message:** docs: integration test plan + PCB GPIO fix plan — Phases 2-4 and V1 PCB prep
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-speed-tests] docs: discovery sync batch 3 — 5 findings all N/A (PCB, tollgate, nostr CLI) (2026-08-05) | tags: HARDWARE, PROTOCOL
+- **Commit:** `3c08869` by Felix
+- **Files:** docs/STATUS-balloon-speed-tests.md
+- **Full message:** docs: discovery sync batch 3 — 5 findings all N/A (PCB, tollgate, nostr CLI)
+- **Relevance:** HARDWARE, PROTOCOL
+
+### [balloon-pre-stretching] docs: discovery sync batch 2 — PCB architecture mismatch found, escalating to or (2026-08-05) | tags: HARDWARE
+- **Commit:** `e6a14f5` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync batch 2 — PCB architecture mismatch found, escalating to orchestrator
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] fix(pcb): V1 GPIO fix — remove STATUS_LED from GPIO10, add FEM_TX net + test poi (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `698a039` by Felix
+- **Files:** tracker/hardware/V1-PCB-GPIO-FIX.md, tracker/hardware/gerbers_v1_fixed/hub_board_v1-B_Adhesive.gba, tracker/hardware/gerbers_v1_fixed/hub_board_v1-B_Courtyard.gbr (+23 more)
+- **Full message:** fix(pcb): V1 GPIO fix — remove STATUS_LED from GPIO10, add FEM_TX net + test points
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] feat: create tollgate_payment_proto.h + implement tollgate_send_pay CLI (t_99952 (2026-08-05) | tags: FIRMWARE, PROTOCOL, TEST
+- **Commit:** `65a46fd` by Felix
+- **Files:** docs/coordination/CLI-COMMAND-AUDIT.md, tracker/firmware/main/CMakeLists.txt, tracker/firmware/main/test/test_relay_pipeline.c (+4 more)
+- **Full message:** feat: create tollgate_payment_proto.h + implement tollgate_send_pay CLI (t_999528b6)
+- **Relevance:** FIRMWARE, PROTOCOL, TEST
+
+### [balloon-hermes] feat: implement relay_send_nostr CLI command (t_9b570899) (2026-08-05) | tags: PROTOCOL, TEST
+- **Commit:** `108c2b9` by Felix
+- **Files:** docs/coordination/CLI-COMMAND-AUDIT.md, tracker/firmware/main/app_main.cpp, tracker/firmware/main/test/test_relay_send_nostr.c
+- **Full message:** feat: implement relay_send_nostr CLI command (t_9b570899)
+- **Relevance:** PROTOCOL, TEST
+
+### [balloon-hermes] Implement nostr_dump CLI command (t_c27101f0) (2026-08-05) | tags: TEST
+- **Commit:** `b093ac8` by Felix
+- **Files:** docs/coordination/CLI-COMMAND-AUDIT.md, tracker/firmware/main/app_main.cpp, tracker/firmware/main/app_task.cpp (+1 more)
+- **Full message:** Implement nostr_dump CLI command (t_c27101f0)
+- **Relevance:** TEST
+
+### [balloon-hermes] docs: consultant review V5 — tollgate proto found, merge conflict warning, resou (2026-08-05) | tags: GENERAL
+- **Commit:** `1e26813` by Felix
+- **Files:** docs/coordination/CONSULTANT-PLAN-REVIEW-V5.md
+- **Full message:** docs: consultant review V5 — tollgate proto found, merge conflict warning, resource guidance
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: worker status report + CLI audit findings for consultant review (2026-08-05) | tags: GENERAL
+- **Commit:** `aca3f36` by Felix
+- **Files:** docs/coordination/WORKER-STATUS-CONSULTANT-REPORT.md
+- **Full message:** docs: worker status report + CLI audit findings for consultant review
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: CLI command audit — 2/5 exist, 3 missing (relay_send_nostr, nostr_dump, to (2026-08-05) | tags: PROTOCOL
+- **Commit:** `9b79760` by Felix
+- **Files:** docs/coordination/CLI-COMMAND-AUDIT.md
+- **Full message:** docs: CLI command audit — 2/5 exist, 3 missing (relay_send_nostr, nostr_dump, tollgate_send_pay)
+- **Relevance:** PROTOCOL
+
+### [balloon-hermes] docs: integration plan V3 — PCB first, FIPS second, CLI audit, rollback plan (2026-08-05) | tags: HARDWARE
+- **Commit:** `f156ef7` by Felix
+- **Files:** docs/coordination/INTEGRATION-PLAN-V3.md
+- **Full message:** docs: integration plan V3 — PCB first, FIPS second, CLI audit, rollback plan
+- **Relevance:** HARDWARE
+
+### [balloon-hermes] docs: consultant review V4 — 3 plans assessed, PCB priority first (2026-08-05) | tags: HARDWARE
+- **Commit:** `6684c26` by Felix
+- **Files:** docs/coordination/CONSULTANT-PLAN-REVIEW-V4.md
+- **Full message:** docs: consultant review V4 — 3 plans assessed, PCB priority first
+- **Relevance:** HARDWARE
+
+### [balloon-range-tests] docs: discovery sync batch 2 — 6 findings, integration plan actionable, radio_ta (2026-08-05) | tags: GENERAL
+- **Commit:** `301f414` by Felix
+- **Files:** docs/STATUS-balloon-range-tests.md
+- **Full message:** docs: discovery sync batch 2 — 6 findings, integration plan actionable, radio_task N/A
+- **Relevance:** GENERAL
+
+### [balloon-speed-tests] docs: discovery sync batch 2 — Phase 6 LA comparison is speed-tests scope, CONTI (2026-08-05) | tags: GENERAL
+- **Commit:** `ab7c6f0` by Felix
+- **Files:** docs/STATUS-balloon-speed-tests.md
+- **Full message:** docs: discovery sync batch 2 — Phase 6 LA comparison is speed-tests scope, CONTINUOUS_TX ready
+- **Relevance:** GENERAL
+
+### [balloon-pre-stretching] docs: discovery sync — integration test plan + PCB GPIO fix assessed, both infor (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `1238273` by Felix
+- **Files:** docs/STATUS-balloon-pre-stretching.md
+- **Full message:** docs: discovery sync — integration test plan + PCB GPIO fix assessed, both informational
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-circuit-design] docs: consultant PCB review — V1/F33 DRC analysis, GPIO fix assessment, architec (2026-08-05) | tags: HARDWARE
+- **Commit:** `502d33f` by Felix
+- **Files:** docs/CONSULTANT-PCB-REVIEW.md, tracker/hardware/drc_f33_fresh.txt, tracker/hardware/drc_v1_fresh.txt
+- **Full message:** docs: consultant PCB review — V1/F33 DRC analysis, GPIO fix assessment, architecture mismatch found
+- **Relevance:** HARDWARE
+
+
+### [balloon-hermes] docs: integration test plan + PCB GPIO fix plan — Phases 2-4 and V1 PCB prep (2026-08-05) | tags: HARDWARE, TEST
+- **Commit:** `2cbf7cd` by Felix
+- **Files:** docs/coordination/INTEGRATION-TEST-PLAN.md, docs/pcb/V1-PCB-GPIO-FIX.md
+- **Full message:** docs: integration test plan + PCB GPIO fix plan — Phases 2-4 and V1 PCB prep
+- **Relevance:** HARDWARE, TEST
+
+### [balloon-hermes] fix: radio_task non-blocking loop — short recv timeout + tx_queue poll (2026-08-05) | tags: RADIO, FIRMWARE
+- **Commit:** `4e7722c` by Felix
+- **Files:** tracker/firmware/components/lr2021_transport/include/lr2021_transport.h, tracker/firmware/components/lr2021_transport/src/lr2021_transport.cpp, tracker/firmware/main/radio_task.cpp
+- **Full message:** fix: radio_task non-blocking loop — short recv timeout + tx_queue poll
+- **Relevance:** RADIO, FIRMWARE
+
+### [balloon-hermes] fix: inverted nostr_event_deserialize return check — events were never stored (2026-08-05) | tags: GENERAL
+- **Commit:** `f11ddd6` by Felix
+- **Files:** tracker/firmware/main/app_task.cpp
+- **Full message:** fix: inverted nostr_event_deserialize return check — events were never stored
+- **Relevance:** GENERAL
+
+### [balloon-hermes] docs: consultant review V3 — 5 bugs found, 3 fixed, no-hardware work identified (2026-08-05) | tags: GENERAL
+- **Commit:** `c351b26` by Felix
+- **Files:** docs/coordination/CONSULTANT-PLAN-REVIEW-V3.md
+- **Full message:** docs: consultant review V3 — 5 bugs found, 3 fixed, no-hardware work i

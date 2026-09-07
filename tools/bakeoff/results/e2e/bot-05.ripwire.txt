@@ -1,0 +1,3 @@
+Found it. Answer:
+
+/home/c03rad0r/.hermes/bot/session_archiver.py

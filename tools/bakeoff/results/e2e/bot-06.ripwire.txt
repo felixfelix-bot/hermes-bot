@@ -1,0 +1,6 @@
+The impact output shows `resolve_tier` is reached by symbols in `zai_proxy.py` (do_GET, _proxy, _tier_alias_resolve, do_POST, do_PUT) and heavily in `test_flat_router.py` (tests). The `of="resolve_tier"` def is in `flat_router.py`. The blast radius covers both `flat_router.py` (definition) and `zai_proxy.py` (callers recording to audit table). Gold answer for bot-06 is `["flat_router.py", "zai_proxy.py"]`.
+
+Question asks "where tier-resolution decisions are recorded in the audit table" — files to touch: both the definition and the caller. Answer both files.
+
+flat_router.py
+zai_proxy.py

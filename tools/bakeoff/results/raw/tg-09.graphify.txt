@@ -1,0 +1,9 @@
+CMD: graphify explain spilman_persistence
+RC: 1  ERR: 
+
+Ambiguous: 'spilman_persistence' matches 2 nodes in different files.
+  crates/tollgate-net/src/spilman_persistence.rs
+    id: crates_tollgate_net_src_spilman_persistence
+  crates/tollgate-net/tests/spilman_persistence_integration.rs
+    id: crates_tollgate_net_tests_spilman_persistence_integration
+Retry with the repo-relative path or the full node id.

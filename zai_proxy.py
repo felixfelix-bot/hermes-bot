@@ -1170,6 +1170,37 @@ def _log_anomaly(severity: str, category: str, title: str,
         pass
 
 
+def _garbage_check(provider, model, resp_bytes, request_body=None,
+                   prompt_tokens: int = 0, completion_tokens: int = 0,
+                   duration_ms=None) -> None:
+    """Content-quality garbage check on a DELIVERED successful response.
+
+    Detects degenerate outputs (repetition, mojibake, empty-on-200, bad JSON,
+    gibberish, oversized) via garbage_detector, records a strike for
+    market-based routing backoff (flat router price multiplier) + a ledger
+    entry for visibility — INCLUDING manager↔worker traffic the operator
+    never sees. Pass-through: never alters delivery, never raises.
+    Alert-once per window via _log_anomaly (MODEL_GARBAGE)."""
+    try:
+        import garbage_detector
+        info = garbage_detector.report_success_response(
+            provider=provider, model=model, resp_bytes=resp_bytes,
+            request_body=request_body, prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens, duration_ms=duration_ms)
+        if info and info.get("first_in_window"):
+            _log_anomaly(
+                "WARN", "MODEL_GARBAGE",
+                f"Garbage output from {info.get('provider')}/{info.get('model')}",
+                f"reason={info.get('reason')} "
+                f"strikes={info.get('strikes_in_window')} "
+                f"mult={'inf' if info.get('price_mult') == float('inf') else info.get('price_mult')} "
+                f"completion_tokens={info.get('completion_tokens')} "
+                f"snippet={info.get('snippet', '')[:200]}",
+                key_name=str(info.get("provider")))
+    except Exception:
+        pass
+
+
 def _is_key_healthy(name: str) -> bool:
     """Check if a z.ai key has quota remaining.
 
@@ -5237,8 +5268,16 @@ class Handler(BaseHTTPRequestHandler):
                     return False
 
                 if is_empty:
-                    # Key produced nothing — don't mark exhausted, just failover
+                    # Key produced nothing — don't mark key exhausted, just failover
                     return False
+
+                # Garbage-output check (pass-through, fail-open): content-
+                # quality strike for market-based backoff + ledger visibility.
+                # Runs BEFORE delivery; delivery proceeds regardless.
+                # (usage/completion tokens are parsed inside the detector.)
+                _garbage_check(key_name, model, bytes(full_body),
+                               request_body=body,
+                               duration_ms=int((time.time() - t0) * 1000))
 
                 # Non-empty response — send to client
                 _mark_key_healthy(key_name)
@@ -5708,6 +5747,13 @@ class Handler(BaseHTTPRequestHandler):
                                   actual_cost=ext_cost,
                                   prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
                                   completion_tokens=int(ext_usage.get("completion_tokens") or 0))
+                    # Garbage-output check on the streamed buffer (pass-through,
+                    # fail-open): strike + ledger for market-based backoff.
+                    _garbage_check(provider_name, model, bytes(response_buffer),
+                                   request_body=body,
+                                   prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                                   completion_tokens=int(ext_usage.get("completion_tokens") or 0),
+                                   duration_ms=int((time.time() - t0) * 1000))
                     if _LIVE_ROUTER is not None:
                         try:
                             _LIVE_ROUTER.record_request(provider=provider_name, tokens=ext_tokens)
@@ -5912,6 +5958,14 @@ class Handler(BaseHTTPRequestHandler):
                                       actual_cost=ext_cost_usd,
                                       prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
                                       completion_tokens=int(ext_usage.get("completion_tokens") or 0))
+                        # Garbage-output check on the streamed buffer
+                        # (pass-through, fail-open): strike + ledger for
+                        # market-based backoff.
+                        _garbage_check(provider_name, ext_model, bytes(response_buffer),
+                                       request_body=body,
+                                       prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
+                                       completion_tokens=int(ext_usage.get("completion_tokens") or 0),
+                                       duration_ms=int((time.time() - t0) * 1000))
                         if _LIVE_ROUTER is not None:
                             try:
                                 _LIVE_ROUTER.record_request(provider=provider_name, tokens=ext_tokens)
@@ -6741,6 +6795,12 @@ class Handler(BaseHTTPRequestHandler):
                             if self._try_external_failover(body, model, response_buffer, t0):
                                 return
                             continue  # try next key
+
+                        # Garbage-output check (pass-through, fail-open):
+                        # strike + ledger for market-based backoff.
+                        _garbage_check(name, model, bytes(full_body),
+                                       request_body=body,
+                                       duration_ms=int((time.time() - t0) * 1000))
 
                         # Non-empty response — send to client
                         _mark_key_healthy(name)

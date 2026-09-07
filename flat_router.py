@@ -883,6 +883,25 @@ def _apply_exhaust_weight(name: str, cost: float) -> float:
         return cost  # never raise into routing
 
 
+# ── Garbage-output price penalty (PLAN-garbage-output-detection, 2026-09-07) ─
+# Content-quality garbage on a delivered (provider, model) lane raises its
+# effective price via a decaying strike multiplier. SOFT only — never removes
+# a lane; if the offender is the ONLY lane for a model, traffic still flows.
+# Strikes decay out of garbage_detector's window, so the penalty is temporary.
+# Degrades to ×1.0 (no effect) on any error or missing module.
+
+def _garbage_mult_or_one(name: str, model: str | None) -> float:
+    """Escalating garbage multiplier for (provider, model); 1.0 when clean,
+    disabled, or on any error. Never raises."""
+    try:
+        import garbage_detector
+        mult = garbage_detector.garbage_price_mult(name, model)
+        return mult if (isinstance(mult, (int, float))
+                        and mult >= 1.0) else 1.0
+    except Exception:
+        return 1.0
+
+
 # ── _dispatch_to_provider() — maps provider name to dispatch method ─────────
 
 def _make_dispatch_fn(name: str) -> Callable | None:
@@ -1057,13 +1076,25 @@ def select_provider(
             # pressure FSM. Degrades to ×1.0 (no effect) on any DB failure.
             cost = _apply_exhaust_weight(name, cost)
 
+            # 3c. Garbage-output price penalty — content-quality strikes on
+            # this (provider, model) lane inflate its effective cost so the
+            # market routes elsewhere while the penalty decays. SOFT only;
+            # ×1.0 when clean or disabled. The lookup uses the SAME translated
+            # model string the dispatch will record strikes under.
+            _gmult = _garbage_mult_or_one(name, _resolve_model_for_provider(name, model_id))
+            if _gmult > 1.0:
+                cost = cost * _gmult if math.isfinite(cost) else cost
+
             # 4. Build dispatch function
             dispatch_fn = _make_dispatch_fn(name)
 
             # 5. Determine the model name to send to this provider
             provider_model = _resolve_model_for_provider(name, model_id)
 
-            reason = f"effective ${cost:.6f}/M (model={provider_model})"
+            reason = f"effective ${cost:.6f}/M (model={provider_model}"
+            if _gmult > 1.0:
+                reason += f", garbage×{_gmult:.1f}"
+            reason += ")"
             candidates.append(ProviderCandidate(
                 name=name,
                 model=provider_model,

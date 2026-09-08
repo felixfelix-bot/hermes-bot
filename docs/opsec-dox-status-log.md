@@ -16,7 +16,7 @@
 | `ollama_cloud_4` | **YES** (`...@embedsmart.de`) | UNKNOWN | **EXCLUDED** (doxed) | zai_proxy.py L716 (ollama4@embedsmart.de), .env:568 |
 | `openrouter` (re-enabled 2026-09-06) | **YES** (`felix@embedsmart.de`) | **YES** (`felixfelix-bot`) | **EXCLUDED** (doxed + ToS-resale-banned) | zai-proxy-management/references/telnyx-openrouter-api-details.md:81 |
 | `telnyx` | **YES** (`telnyx@embedsmart.de`) | UNKNOWN | **EXCLUDED** (operator, 2026-09-08 — account-doxed to embedsmart per audit) | telnyx-inference-provider.md:128, telnyx-openrouter-api-details.md:15; operator-directed |
-| `deepinfra` | No (audit) | No | **CLEAN — WIRE-IN** (audit confirms NOT doxed; operator's "doxed" belief CORRECTED — pending operator final confirm) | audit deleg_3653c5e6 |
+| `deepinfra` | No (audit) | No (audit) | **EXCLUDED** (operator override — believes doxed despite audit CLEAN; operator decision is authoritative) | audit deleg_3653c5e6 (CLEAN); operator override 2026-09-08 |
 | `deepseek` | No | No | **CLEAN — WIRE-IN** (operator: "no need to exclude deepseek") | audit; operator 2026-09-08 |
 | `chutes` | UNKNOWN (alias solar_pearl_672) | UNKNOWN (embedsmart signup provenance unverified) | **LOW-RISK** — WIRE-IN | .env:563; audit flags provenance |
 | `neuralwatt` | No | No | **CLEAN — WIRE-IN** | audit |
@@ -35,7 +35,7 @@
 
 | Endpoint | @embedsmart.de? | GitHub? | Status |
 |---|---|---|---|
-| api.deepinfra.com/v1/openai | no | no | WIRE-IN unless key is doxed |
+| api.deepinfra.com/v1/openai | no | no | EXCLUDED (operator override) |
 | api.deepseek.com | no | no | WIRE-IN |
 | api.neuralwatt.com/v1 | no | no | WIRE-IN |
 | api.ppq.ai/v1 | no | no | WIRE-IN |

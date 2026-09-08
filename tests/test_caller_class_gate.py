@@ -112,6 +112,37 @@ class TestSoldGateRetryAfter:
         preds = [{"will_exhaust": True, "exhausts_in_hours": 0.5}]
         assert sold_gate_retry_after(preds, sold_safety_hours=0) is None
 
+    def test_non_dict_prediction_entries_never_raise(self):
+        """Non-dict entries in the predictions list cannot block and never
+        raise (cold-review finding 3 — keeps the 'never raises' contract)."""
+        preds = [None, "window", 42,
+                 {"will_exhaust": True, "exhausts_in_hours": 0.5}]
+        ra = sold_gate_retry_after(preds)
+        assert ra is not None and ra > 0  # dict entry still drives the gate
+
+    def test_all_non_dict_entries_serve(self):
+        """A predictions list of only non-dict entries degrades to serve."""
+        assert sold_gate_retry_after([None, [], "junk", 3.14]) is None
+
+
+class TestSoldSafetyHoursEnvParse:
+    def test_malformed_env_degrades_to_default(self, monkeypatch):
+        """A malformed SOLD_SAFETY_HOURS env value must NOT raise at import
+        (cold-review finding 2): it degrades to the 2.0 default so the flat
+        router and the sold gate survive a config typo."""
+        import flat_router as _fr
+        monkeypatch.setenv("SOLD_SAFETY_HOURS", "2h")  # not a float
+        assert _fr._sold_safety_hours_default() == 2.0
+        monkeypatch.setenv("SOLD_SAFETY_HOURS", "not-a-number")
+        assert _fr._sold_safety_hours_default() == 2.0
+
+    def test_valid_env_value_honored(self, monkeypatch):
+        import flat_router as _fr
+        monkeypatch.setenv("SOLD_SAFETY_HOURS", "3.5")
+        assert _fr._sold_safety_hours_default() == 3.5
+        monkeypatch.delenv("SOLD_SAFETY_HOURS", raising=False)
+        assert _fr._sold_safety_hours_default() == 2.0
+
 
 # ── select_provider wiring ──────────────────────────────────────────────────
 

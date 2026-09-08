@@ -899,7 +899,23 @@ def _apply_exhaust_weight(name: str, cost: float) -> float:
 #: Hours of predicted-quota headroom below which SOLD traffic is rejected.
 #: Env-overridable; default 2h (PLAN-routstr-serving-lane T-A "(default 2)";
 #: canonical reference impl merchant-routing-engine @5af467f pins 2.0).
-SOLD_SAFETY_HOURS = float(os.environ.get("SOLD_SAFETY_HOURS", "2"))
+def _sold_safety_hours_default() -> float:
+    """Parse SOLD_SAFETY_HOURS from the env, defaulting to 2.0 on any error.
+
+    The module-level parse MUST never raise: an import-time ValueError (e.g.
+    a malformed ``SOLD_SAFETY_HOURS=2h``) would drop the whole flat router to
+    the legacy path at every zai_proxy import site (cold-review finding 2) —
+    losing market routing AND the sold gate on a config typo. Degrade to the
+    2.0 default instead (fail-open; the pure gate still honors an explicit
+    ``0`` / negative value as "gate disabled").
+    """
+    try:
+        return float(os.environ.get("SOLD_SAFETY_HOURS", "2"))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+SOLD_SAFETY_HOURS = _sold_safety_hours_default()
 
 #: TTL for the sold-gate prediction memo. predict_exhaustion() performs a
 #: self-HTTP GET to /quota plus a burn-history DB read per provider, so the
@@ -967,6 +983,8 @@ def sold_gate_retry_after(
 
     exhaust_near_h: float | None = None
     for p in predictions or []:
+        if not isinstance(p, dict):
+            continue  # non-dict entry can never block (cold-review finding 3)
         if not bool(p.get("will_exhaust")):
             continue
         in_h = p.get("exhausts_in_hours")

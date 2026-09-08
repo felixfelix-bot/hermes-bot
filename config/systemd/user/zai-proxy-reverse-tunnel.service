@@ -1,0 +1,38 @@
+# Canonical copy of the LIVE unit at ~/.config/systemd/user/zai-proxy-reverse-tunnel.service
+# Deploy: cp config/systemd/user/zai-proxy-reverse-tunnel.service ~/.config/systemd/user/ \
+#         && systemctl --user daemon-reload && systemctl --user restart zai-proxy-reverse-tunnel.service
+# P0-8 (2026-09-08): hardened from bare `ssh -N -R` (SPOF, restart counter 85) to autossh-managed.
+# See docs/TUNNEL-HARDENING-AUTOSSH.md for design + verification.
+
+[Unit]
+Description=autossh reverse SSH tunnel T470→VPS2 (zai_proxy buyer attribution) — no SPOF
+After=network-online.target tag-sidecar.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# AUTOSSH_GATETIME=0: disable autossh's 30s "starting gate". Without this, if ssh dies
+# within the first 30s (e.g. right after T470 reboot before network is up, or while the
+# stale remote sshd-session still holds 0.0.0.0:9099), autossh gives up instead of
+# restarting. With 0 it restarts forever — required for reboot survival.
+Environment=AUTOSSH_GATETIME=0
+Environment=HOME=%h
+# -M 0: no separate autossh monitor port. Detection is delegated to ssh's own
+#   ServerAliveInterval/ServerAliveCountMax (ssh exits when keepalives fail, autossh
+#   sees the exit and respawns immediately — no systemd RestartSec delay).
+# -N: no remote command. -R 0.0.0.0:9099:127.0.0.1:9097: remote (VPS2) port 9099 →
+#   local tag-sidecar 9097. GatewayPorts=clientspecified on VPS2 honors 0.0.0.0.
+# -o ExitOnForwardFailure=yes: if VPS2 still holds 9099 from a stale session, ssh exits
+#   at once (no hang); autossh retries until the server reaps the stale session.
+ExecStart=/usr/bin/autossh -M 0 -N -R 0.0.0.0:9099:127.0.0.1:9097 \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=20 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=accept-new \
+  root@23.182.128.51
+# systemd-level backstop for autossh itself dying. ssh respawns are autossh's job.
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

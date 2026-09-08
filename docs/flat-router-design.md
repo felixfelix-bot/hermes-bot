@@ -459,7 +459,7 @@ Caller iterates the list:
 | **Cost model** | Included (free with $100/mo Ollama subscription) |
 | **Effective $/M** | $0 marginal. Shadow seed: $0.40/M (subscription-equivalent). |
 | **Models available** | glm-5.2, kimi-k3:cloud, kimi-k2.7-code, gpt-oss:120b, gemma4:31b, qwen3.5:397b, and all Ollama Cloud models |
-| **Quota tracking** | `ollama_quota_tracker` — session limit 500M tokens, weekly limit. `_get_ollama_quota_status("ollama_cloud")`. 403 paywall flag: `.ollama_exhausted_until` (resets Monday UTC). |
+| **Quota tracking** | `ollama_quota_tracker` — session limit 500M tokens, weekly limit 3.5B, monthly limit 3.5B (ollama_cloud_3 monthly-budget plans). `_get_ollama_quota_status("ollama_cloud")`. 403 paywall flag: `.ollama_exhausted_until` (resets Monday UTC). **Import note (t_52763d41):** the proxy loads the BOT's own `src/ollama_quota_tracker.py` by absolute path (registered in `sys.modules`) so `DEFAULT_MONTHLY_LIMIT` resolves even though the path bootstrap puts `~/merchant-routing-engine` at `sys.path[0]` (whose copy lacks the symbol). |
 | **Health tracking** | `_zai_key_health["ollama_cloud"]` + paywall flag. `_ollama_paywall_active("ollama_cloud")`. |
 | **Kalman filter** | **Shadow only.** `PriceKalman` seeded at 0.40, `ConsumptionKalman` tracking. Never updated live. |
 | **Cost multiplier** | 1.0 |

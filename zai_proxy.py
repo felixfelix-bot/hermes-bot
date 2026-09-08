@@ -79,6 +79,27 @@ except Exception as _dge:
 # Falls back to "included" (no penalty) on any failure — never breaks routing.
 _ollama_quota_status = None
 try:
+    # ── PYTHONPATH shadowing guard (t_52763d41) ─────────────────────────
+    # The proxy's path bootstrap inserts ~/merchant-routing-engine at
+    # sys.path[0] (above), so a bare `from src.ollama_quota_tracker import ...`
+    # would resolve to the merchant-routing-engine copy, which LACKS
+    # DEFAULT_MONTHLY_LIMIT -> "[ollama_quota] DISABLED". Load the BOT's own
+    # copy by absolute path and register it under the `src.ollama_quota_tracker`
+    # name so the imports below resolve to the bot's copy regardless of
+    # sys.path ordering. Other src.* modules (shadow_hook, pricing_exposure,
+    # real_price_tracker) are intentionally left to the existing sys.path
+    # resolution — some exist only in the MRE repo.
+    import importlib.util as _oqt_ilu
+    _BOT_OQT = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "src", "ollama_quota_tracker.py"
+    )
+    if os.path.exists(_BOT_OQT):
+        _oqt_spec = _oqt_ilu.spec_from_file_location(
+            "src.ollama_quota_tracker", _BOT_OQT
+        )
+        _oqt_mod = _oqt_ilu.module_from_spec(_oqt_spec)
+        sys.modules["src.ollama_quota_tracker"] = _oqt_mod
+        _oqt_spec.loader.exec_module(_oqt_mod)
     from src.ollama_quota_tracker import get_quota_status as _get_quota_status
     from src.ollama_quota_tracker import DEFAULT_SESSION_LIMIT as _OC_SESSION_LIMIT
     from src.ollama_quota_tracker import DEFAULT_MONTHLY_LIMIT as _OC_MONTHLY_LIMIT

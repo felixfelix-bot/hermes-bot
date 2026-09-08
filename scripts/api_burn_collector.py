@@ -23,6 +23,7 @@ Env vars (all optional — missing providers are silently skipped):
   ROUTSTR_URL              Routstr base URL (e.g. http://localhost:3338)
   ROUTSTR_ADMIN_TOKEN      Routstr admin API bearer token
   ROUTSTR_MINT_URL         Cashu mint URL for balance query
+  DEEPSEEK_API_KEY         DeepSeek Direct bearer token
   API_BURN_DB_PATH         override DB path (default ~/.hermes/bot/api_burn.db)
 """
 
@@ -42,7 +43,7 @@ DB_PATH = os.path.expanduser(
 
 REQUEST_TIMEOUT = 15
 
-PROVIDERS = ["ppq", "openrouter", "routstr"]
+PROVIDERS = ["ppq", "openrouter", "routstr", "deepseek"]
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -285,10 +286,43 @@ def fetch_routstr():
     return {"provider": "routstr", "error": "no balance endpoint found"}
 
 
+def fetch_deepseek():
+    """Poll DeepSeek Direct balance.
+
+    GET /user/balance → {is_available, balance_infos: [{currency, total_balance,
+    granted_balance, topped_up_balance}]}.
+    """
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return {"provider": "deepseek", "skipped": "no DEEPSEEK_API_KEY"}
+
+    try:
+        data = _http_get_json(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        infos = data.get("balance_infos", [])
+        balance = 0.0
+        for bi in infos:
+            if bi.get("currency") == "USD":
+                balance = float(bi.get("total_balance", 0))
+                break
+        return {
+            "provider": "deepseek",
+            "balance_usd": round(balance, 6),
+            "total_credits": None,
+            "total_usage": None,
+            "raw": json.dumps(data)[:500],
+        }
+    except Exception as e:
+        return {"provider": "deepseek", "error": str(e)[:200]}
+
+
 FETCHERS = {
     "ppq": fetch_ppq,
     "openrouter": fetch_openrouter,
     "routstr": fetch_routstr,
+    "deepseek": fetch_deepseek,
 }
 
 

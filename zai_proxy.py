@@ -4189,6 +4189,22 @@ def _extract_cost(provider: str | None, response_buffer: bytes | bytearray,
                     model_name = _obj.get("model")
             except Exception:
                 pass
+            # SSE-aware fallback: streaming responses are multiple
+            # "data: {...}" lines, not a single JSON. Scan for model.
+            if not model_name:
+                try:
+                    _text = bytes(response_buffer).decode("utf-8", errors="replace")
+                    for _line in _text.split("\n"):
+                        if _line.startswith("data: "):
+                            try:
+                                _chunk = json.loads(_line[6:])
+                                if _chunk.get("model"):
+                                    model_name = _chunk["model"]
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
             rates = DEEPSEEK_RATES.get(model_name or "")
             if rates:
                 in_r = rates.get("input", 0.22)
@@ -5779,9 +5795,15 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     self._spend_recorded = True
+                    _log_model = ext_model
+                    try:
+                        from flat_router import canonicalize_model as _canon
+                        _log_model = _canon(ext_model) or ext_model
+                    except Exception:
+                        pass
                     _log_api_call(
                         key_name=provider_name, key_suffix=prov["key"][-4:],
-                        model=actual_model,
+                        model=_log_model,  # canonical — real_price_tracker queries this form
                         prompt_tokens=int(ext_usage.get("prompt_tokens") or 0),
                         completion_tokens=int(ext_usage.get("completion_tokens") or 0),
                         total_tokens=ext_tokens,
@@ -6333,7 +6355,7 @@ class Handler(BaseHTTPRequestHandler):
                                 _log_api_call(
                                     key_name=_cand.name,
                                     key_suffix=_suffix,
-                                    model=_cand.model or original_model,
+                                    model=original_model,  # canonical — real_price_tracker queries this form
                                     prompt_tokens=int(_usage.get("prompt_tokens") or 0) if '_usage' in dir() else 0,
                                     completion_tokens=int(_usage.get("completion_tokens") or 0) if '_usage' in dir() else 0,
                                     total_tokens=_total_tokens if '_total_tokens' in dir() else 0,

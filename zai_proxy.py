@@ -1044,6 +1044,15 @@ def _mark_funded(name: str) -> None:
 # Manual override: drop a flag file ~/.hermes/bot/.key_disabled_<name> to
 # force a key to be treated as unhealthy (e.g. a cancelled subscription).
 # Re-enable with: rm ~/.hermes/bot/.key_disabled_<name>
+#
+# OPERATOR TOUCH PATH (P1, self-healing disable policy): when placing a flag
+# by hand, also write the companion sidecar so auto-clear logic can tell a
+# deliberate operator disable from an auto-placed one:
+#   touch ~/.hermes/bot/.key_disabled_<name>
+#   python3 -c "import zai_proxy as z; z._write_disable_meta('<name>', 'operator', 'manual')"
+# The sidecar is NEVER the gate — .key_disabled_<name> remains authoritative.
+# A flag with no sidecar is treated as operator (legacy/unclassified) and is
+# never auto-cleared.
 
 # Exponential backoff ramp for QUOTA-EXHAUSTION failures (429 / empty response).
 # Spec: 2s→4s→8s→16s→32s→60s (capped). A single 429 blocks a key for only 2s so
@@ -1077,6 +1086,74 @@ _zai_key_health: dict[str, dict] = {}
 def _disabled_flag_path(name: str) -> Path:
     """Filesystem flag path used to manually disable key *name*."""
     return Path.home() / ".hermes" / "bot" / f".key_disabled_{name}"
+
+
+def _disabled_meta_path(name: str) -> Path:
+    """Companion sidecar path for a disable flag: ``.key_disabled_<name>.meta``.
+
+    The sidecar records *who* placed the flag (``auto`` vs ``operator``) so
+    auto-clear logic can refuse to touch a deliberate operator disable. It is
+    NEVER the authoritative gate — ``.key_disabled_<name>`` remains that. A
+    missing sidecar means the flag predates the marker (legacy/unclassified).
+    """
+    return Path(str(_disabled_flag_path(name)) + ".meta")
+
+
+def _write_disable_meta(name: str, placed_by: str, reason: str,
+                        expiry: float | None = None) -> None:
+    """Write the ``.key_disabled_<name>.meta`` sidecar for key *name*.
+
+    ``placed_by`` is ``"auto"`` (placed by exhaustion/backoff/auto-kill logic)
+    or ``"operator"`` (deliberate manual disable). ``expiry`` is an optional
+    epoch-seconds time bound for auto-placed flags (mirrors the ollama paywall
+    window). Never raises — a sidecar write failure must not break routing.
+    """
+    try:
+        meta = {
+            "placed_by": placed_by,
+            "placed_at": time.time(),
+            "reason": reason,
+            "expiry": expiry,
+        }
+        p = _disabled_meta_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(meta))
+    except Exception:
+        pass
+
+
+def _read_disable_meta(name: str) -> dict | None:
+    """Read the ``.key_disabled_<name>.meta`` sidecar, or None if absent/invalid.
+
+    Returns a dict with keys ``placed_by``, ``placed_at``, ``reason``,
+    ``expiry``. A missing or corrupt sidecar returns None (legacy flag →
+    treated as operator for auto-clear safety). Never raises.
+    """
+    try:
+        p = _disabled_meta_path(name)
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _disable_placed_by(name: str) -> str | None:
+    """Classify how a disable flag for *name* was placed.
+
+    Returns ``"auto"``, ``"operator"``, ``"unclassified"`` (flag exists but no
+    sidecar — legacy, treated as operator for safety but surfaced as suspect),
+    or ``None`` when no flag exists. Never raises.
+    """
+    if not _is_manually_disabled(name):
+        return None
+    meta = _read_disable_meta(name)
+    if meta is None:
+        return "unclassified"
+    return meta.get("placed_by", "unclassified")
 
 
 # ── Ollama Cloud paywall flag (G1/G2) ───────────────────────────────────────

@@ -179,7 +179,8 @@ If it has special requirements (like ollama_cloud's paywall or opencode_go's nat
    - If it's the cheapest, the request routes to it.
    - After the request, the PriceKalman and ConsumptionKalman are updated.
    - The `api_calls` table logs the provider name and cost.
-3. **Failover test:** Disable the provider (`.key_disabled_newprovider`). Verify it's excluded from candidates. Re-enable and verify it returns.
+3. **Failover test:** Disable the provider (`.key_disabled_newprovider`). Verify it's excluded from candidates. Re-enable and verify it returns. When disabling, also write the companion sidecar so auto-clear logic knows it was operator-placed:
+   `python3 -c "import zai_proxy as z; z._write_disable_meta('newprovider', 'operator', 'manual')"`
 
 ### Step 11: Add health tracking
 

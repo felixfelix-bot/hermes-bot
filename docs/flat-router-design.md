@@ -306,7 +306,7 @@ For model name translation (e.g., `glm-5.2` → `deepseek-ai/DeepSeek-V4-Pro` on
 
 Before cost comparison, unhealthy providers are excluded:
 
-1. **Manual disable:** `~/.hermes/bot/.key_disabled_<name>` file exists → excluded
+1. **Manual disable:** `~/.hermes/bot/.key_disabled_<name>` file exists → excluded. A companion sidecar `.key_disabled_<name>.meta` (JSON: `placed_by` = `auto`|`operator`, `placed_at`, `reason`, `expiry`) records who placed the flag so auto-clear never touches a deliberate operator disable. A flag with no sidecar is treated as `operator` (legacy/unclassified) for safety.
 2. **Ollama paywall:** `_ollama_paywall_active()` → excluded
 3. **Circuit breaker:** `consecutive_failures > 10` or breaker tripped → excluded
 4. **Backoff active:** `time.time() < retry_after` → excluded (temporary)
@@ -831,7 +831,7 @@ else:
 | `.enable_live_routing` | Enable LiveRouter for failover | **Deprecated** — flat router is always live. Remove in Phase 4. |
 | `.optimizer_advisor_mode` | Enable RoutingAdvisor | **Deprecated** — advisor IS the router. Remove in Phase 4. |
 | `.disable_flat_router` | Does not exist | **New** — emergency rollback to `best_key()`. Created in Phase 2. |
-| `.key_disabled_<name>` | Disable individual key | **Unchanged** — still works in flat router (health gate). |
+| `.key_disabled_<name>` | Disable individual key | **Unchanged** — still works in flat router (health gate). Companion `.key_disabled_<name>.meta` sidecar records `placed_by` (auto/operator) so auto-clear never touches a deliberate operator disable. |
 
 ---
 

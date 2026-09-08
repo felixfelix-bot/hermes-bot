@@ -814,6 +814,15 @@ _PROVIDER_MODEL_NAMES = {
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
     },
+    # DeepSeek Direct — expects BARE native names (deepseek-v4-flash/-pro),
+    # NOT the slashed canonical form. Without this block, the flat router
+    # forwards "deepseek/deepseek-v4-flash" verbatim → DeepSeek 400 →
+    # dispatch_fail (734 failures observed 2026-09-08 → provider backoff,
+    # zero traffic on a funded $24.55-key). Same fix class as opencode_go.
+    "deepseek": {
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
+    },
     "neuralwatt": {
         "glm-5.2":                    "glm-5.2",
         "kimi-k3":                    "kimi-k3",

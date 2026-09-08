@@ -727,12 +727,14 @@ OLLAMA_CLOUD_KEY_4 = _EXTERNAL_KEYS.get("ollama_cloud_4", "")
 # exhaustion). Key #4 rides the remaining-quota order (fullest first) — a fresh
 # pool enters rotation at the head until it draws down. Empty keys are dropped
 # below.
-_OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = [
-    ("ollama_cloud", OLLAMA_CLOUD_KEY),
-    ("ollama_cloud_2", OLLAMA_CLOUD_KEY_2),
-    ("ollama_cloud_3", OLLAMA_CLOUD_KEY_3),
-    ("ollama_cloud_4", OLLAMA_CLOUD_KEY_4),
-]
+#
+# P0-1 RUGPULL-RESILIENCE (2026-09-08): ALL FOUR ollama cloud keys are excluded
+# from the active routing pool. Operator hard-exclusion (no ollama key #1, no
+# key with an @embedsmart.de email) + UNKNOWN-email keys excluded to be safe.
+# The .key_disabled_* flags gate the flat-router lanes; this list is emptied so
+# the ollama-any dispatcher never fires. Re-enable by rm-ing the flags AND
+# restoring the 4 entries below (reversible).
+_OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = []
 _OLLAMA_CLOUD_KEYS = [(n, k) for n, k in _OLLAMA_CLOUD_KEYS if k]  # drop empty
 
 # DeepInfra — preferred external failover (prompt caching reduces effective cost)

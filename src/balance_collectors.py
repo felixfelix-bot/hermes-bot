@@ -1582,7 +1582,7 @@ NEURALWATT_USAGE_SUMMARY_URL  = NEURALWATT_API_BASE + "/usage/summary"
 NEURALWATT_DEFAULT_TIMEOUT    = 5.0          # seconds — collector must be fast
 NEURALWATT_KEY_ENV            = "NEURALWATT_API_KEY"
 NEURALWATT_STARTING_ENV       = "NEURALWATT_STARTING_BALANCE"   # legacy compat
-NEURALWATT_DEFAULT_DAILY_CAP   = 10.0          # USD/day — runaway-burn guardrail
+NEURALWATT_DEFAULT_DAILY_CAP   = 0.0           # USD/day — DISABLED 2026-09-08 (operator override: remove ALL daily caps; markets + Kalman handle it via price, never disable keys)
 NEURALWATT_DAILY_CAP_ENV      = "NEURALWATT_DAILY_CAP"
 NEURALWATT_DEFAULT_STARTING_BALANCE = 100.0   # legacy compat, unused by collect
 
@@ -1590,7 +1590,12 @@ NEURALWATT_DEFAULT_STARTING_BALANCE = 100.0   # legacy compat, unused by collect
 # ── NeuralWatt env resolution (mirrors PPQ pattern) ──────────────────────────
 
 def _resolve_neuralwatt_daily_cap(explicit: Optional[float]) -> float:
-    """Resolve daily cap: explicit arg → NEURALWATT_DAILY_CAP env → 10."""
+    """Resolve daily cap: explicit arg → NEURALWATT_DAILY_CAP env → 0 (disabled).
+
+    The default is 0.0 (DISABLED) since 2026-09-08 (operator override: remove
+    ALL daily caps; markets + Kalman handle it via price, never disable keys).
+    A cap of 0.0 means is_daily_cap_exceeded is always False.
+    """
     if explicit is not None:
         return float(explicit)
     raw = os.environ.get(NEURALWATT_DAILY_CAP_ENV)
@@ -1630,8 +1635,10 @@ class NeuralWattBalance:
     is_exhausted         True when kwh_remaining <= 0 or in_overage
     daily_spent_usd      real USD spent today (from /v1/usage/summary).
                          0.0 if the summary fetch failed (deterministic).
-    daily_cap_usd        configured daily cap (NEURALWATT_DAILY_CAP env, default 10)
+    daily_cap_usd        configured daily cap (NEURALWATT_DAILY_CAP env,
+                         default 0 = DISABLED since 2026-09-08)
     is_daily_cap_exceeded    True when daily_spent_usd > daily_cap_usd
+                         (always False when cap is 0/disabled)
     collected_at         time.time() when collected
     error                short human string on failure, None on success
     raw                  the full JSON dict from /v1/quota (for forensics/logging)
@@ -1798,9 +1805,10 @@ def collect_neuralwatt_balance(
         all numeric fields None when no key is configured.
     daily_cap
         Daily spend cap in USD. If None, resolves from ``NEURALWATT_DAILY_CAP``
-        env (default $10/day). When today's real spend from /v1/usage/summary
-        exceeds this, ``is_daily_cap_exceeded`` becomes True — the routing
-        layer should remove NeuralWatt from rotation until UTC midnight.
+        env (default 0 = DISABLED since 2026-09-08). When today's real spend
+        from /v1/usage/summary exceeds this, ``is_daily_cap_exceeded`` becomes
+        True. A cap of 0 disables the guardrail entirely (is_daily_cap_exceeded
+        always False).
     timeout
         Per-request HTTP timeout in seconds (default 5.0).
     quota_endpoint

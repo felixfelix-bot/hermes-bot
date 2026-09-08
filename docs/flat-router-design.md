@@ -508,12 +508,12 @@ Caller iterates the list:
 | **Cost model** | Per-token. deepseek-v4-flash $0.14/M, prompt caching at $0.03/M. Blended ~$2.21/M (with glm-5.2). |
 | **Effective $/M** | ~$2.21/M blended (shadow seed). Real cost varies by model + caching. |
 | **Models available** | glm-5.2, deepseek-v4-flash, and NeuralWatt catalog models. Strips non-OpenAI fields (rejects reasoning/task_type/tier_hint). |
-| **Quota tracking** | NeuralWatt balance bridge (`_neuralwatt_quota_entry_fn`). Real `/v1/quota` for energy allowance + lifetime cost. Daily cap guardrail: $10/day default. |
-| **Health tracking** | `_is_key_healthy("neuralwatt")` + daily-cap check via `_snapshot_health()`. When `is_daily_cap_exceeded` → marked unhealthy until UTC midnight. |
+| **Quota tracking** | NeuralWatt balance bridge (`_neuralwatt_quota_entry_fn`). Real `/v1/quota` for energy allowance + lifetime cost. Daily cap DISABLED (default 0) since 2026-09-08. |
+| **Health tracking** | `_is_key_healthy("neuralwatt")` only (backoff, manual disable, 401/403). No daily-spend delist — the NEURALWATT_DAILY_CAP hard block was REMOVED 2026-09-08 (operator override: markets + Kalman handle it via price, never disable keys). |
 | **Kalman filter** | **Shadow only.** Seeded at 2.21. `ConsumptionKalman` with quota_remaining=inf. |
 | **Cost multiplier** | 1.0 |
 | **Peak hours** | None |
-| **Incident history** | $258 spend in one day (2026-08-22) — daily cap guardrail added as response. |
+| **Incident history** | $258 spend in one day (2026-08-22) — daily cap guardrail added as response, then REMOVED 2026-09-08 (operator override: markets + Kalman handle it via price). |
 
 ### 3.7 deepinfra
 

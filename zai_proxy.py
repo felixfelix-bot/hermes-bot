@@ -483,16 +483,17 @@ except Exception as _rqe:
 # 5× discount, so our per-token cost estimate OVERCOUNTS by ~5.7×. The bridge
 # imports `neuralwatt_quota_entry` from src.balance_collectors — which calls
 # /v1/quota for real kWh remaining and /v1/usage/summary for today's real USD
-# spend — exposes a NEURALWATT_DAILY_CAP guardrail (default $10/day), and a
-# `get_neuralwatt_cost_correction_factor()` helper used by
+# spend — and a `get_neuralwatt_cost_correction_factor()` helper used by
 # `_estimate_cost_usd()` to scale our over-estimated per-token cost down to
 # the real spend ratio.
 #
-# When daily spend exceeds the cap (real number from the API), the entry
-# surfaces is_daily_cap_exceeded=True and we mark the key unhealthy so the
-# router drops neuralwatt from rotation until UTC midnight. Revert-safe: any
-# failure → the old optimistic {used_pct:0.0, remaining:inf} so routing
-# never breaks.
+# The NEURALWATT_DAILY_CAP hard block was REMOVED 2026-09-08 (operator
+# override): neuralwatt stays healthy/price-eligible regardless of daily
+# spend. The market (Kalman + scarcity) makes it un-competitive via price
+# when it should be, never by hard-disabling the key for the day. The
+# cost-escalation cron still reports NW spend (alert kept, hard block
+# dropped). Revert-safe: any failure → the old optimistic
+# {used_pct:0.0, remaining:inf} so routing never breaks.
 # REVERT: delete this block + restore the one-line hardcode
 # `snap["neuralwatt"] = {"used_pct": 0.0, "remaining": float("inf")}` in
 # _snapshot_quota(), and `h["neuralwatt"] = True` in _snapshot_health().
@@ -504,9 +505,6 @@ try:
 except Exception as _nwe:
     print(f"[neuralwatt] balance bridge DISABLED — {_nwe}", flush=True)
     _neuralwatt_quota_entry_fn = None
-
-# Optional: mirror key_health gate so the daily-cap call can flag exhaustion.
-_NEURALWATT_DAILY_CAP_DEFAULT = 10.0  # USD/day — synced with balance_collectors
 
 # Cost-correction factor (cached) — applied in _estimate_cost_usd() so the
 # per-token cost estimate is brought in-line with the real NeuralWatt bill.
@@ -1855,18 +1853,16 @@ def _neuralwatt_quota_snapshot() -> dict:
     The collector itself calls GET https://api.neuralwatt.com/v1/quota for the
     real kWh allowance (kwh_used / kwh_included) and GET
     https://api.neuralwatt.com/v1/usage/summary for today's real USD spend
-    via /v1/usage/summary.time_series[today].cost_usd. The shared daily-cap
-    guardrail is NEURALWATT_DAILY_CAP (default $10/day). When
-    ``is_daily_cap_exceeded`` is True on the returned entry, we bump
-    ``used_pct`` to 100.0 so the routing layer treats neuralwatt as
-    exhausted for the rest of the UTC calendar day. is_exhausted
-    (kwh_remaining <= 0 or in_overage) is preserved as-is.
+    via /v1/usage/summary.time_series[today].cost_usd. The NEURALWATT_DAILY_CAP
+    hard clamp was REMOVED 2026-09-08 (operator override): used_pct reflects
+    the REAL quota fraction (kWh or credit fraction), never a cap-clamped 100.
+    is_exhausted (kwh_remaining <= 0 or in_overage) is preserved as-is.
 
     Cold-start contract (matches the proxy's current hardcoded fallback):
       * bridge import disabled, OR no fresh row →
         ``{used_pct:0.0, remaining:inf}`` (current optimistic behavior).
-      * fresh row → forwards the collector's dict, but if the daily cap is
-        exceeded we override used_pct=100 so routing drops neuralwatt today.
+      * fresh row → forwards the collector's dict unchanged (no daily-cap
+        override).
 
     Credit-mode override (NW-API 2026-09-02, B1): the kWh subscription
     allowance can be EXHAUSTED while a pay-as-you-go CREDIT balance remains
@@ -1901,12 +1897,12 @@ def _neuralwatt_quota_snapshot() -> dict:
             entry["used_pct"] = round(used_frac * 100.0, 2)
             entry["remaining"] = remaining_credits
             entry["total"] = total_credits
-        # Daily-cap enforcement: when today's spend exceeds the cap, signal
-        # exhaustion to the router by clamping used_pct to 100.0. This is the
-        # primary runaway-burn guardrail (prevents another $258-in-one-day).
-        if entry.get("is_daily_cap_exceeded"):
-            entry["used_pct"] = 100.0
-            entry["regime"] = "daily-capped"
+        # Daily-cap enforcement REMOVED 2026-09-08 (operator override): the
+        # NEURALWATT_DAILY_CAP hard clamp (used_pct=100 / regime="daily-capped")
+        # is gone. used_pct now reflects the REAL quota fraction (kWh or credit
+        # fraction) so the market (Kalman + scarcity) raises the effective
+        # $/M as the budget depletes — making neuralwatt un-competitive via
+        # price when it should be, never by hard-disabling the key for the day.
         return entry
     except Exception:
         return {"used_pct": 0.0, "remaining": float("inf")}
@@ -2052,25 +2048,14 @@ def _snapshot_health() -> dict:
         h["ollama_cloud_3"] = _is_key_healthy("ollama_cloud_3")
         h["ollama_cloud_4"] = _is_key_healthy("ollama_cloud_4")
         h["opencode_go"] = _is_key_healthy("opencode_go")
-        # NW-API: daily-cap guardrail (real /v1/usage/summary).
-        # When today's REAL spend from /v1/usage/summary exceeds
-        # NEURALWATT_DAILY_CAP (default $10/day) we mark the key unhealthy
-        # so the router drops neuralwatt until UTC midnight. The previous
-        # guardrail summed cost_usd from zai_usage.db which overcounts by
-        # ~5.7× (NeuralWatt uses ENERGY-based pricing with 94% prompt-cache
-        # hits — $258 in the DB vs $45 in real spend on 2026-08-22-to-23).
-        # The real-API bridge eliminates that overcount entirely.
-        if _neuralwatt_quota_entry_fn is not None:
-            try:
-                nw_entry = _neuralwatt_quota_entry_fn()
-                h["neuralwatt"] = not bool(
-                    isinstance(nw_entry, dict)
-                    and nw_entry.get("is_daily_cap_exceeded")
-                )
-            except Exception:
-                h["neuralwatt"] = True  # bridge hiccup → don't kill routing
-        else:
-            h["neuralwatt"] = True  # bridge disabled → per-token, always healthy unless 401/403
+        # NW-API: health is driven purely by _is_key_healthy (backoff, manual
+        # disable, 401/403), NOT by daily spend. The NEURALWATT_DAILY_CAP hard
+        # delist was REMOVED 2026-09-08 (operator override): neuralwatt stays
+        # healthy/price-eligible regardless of daily spend — the market
+        # (Kalman + scarcity) makes it un-competitive via price when it should
+        # be, never by hard-disabling the key for the day. The cost-escalation
+        # cron still reports NW spend (alert kept, hard block dropped).
+        h["neuralwatt"] = _is_key_healthy("neuralwatt")
         h["ppq"] = _is_key_healthy("ppq")
         h["openrouter"] = True
         h["telnyx"] = _is_key_healthy("telnyx")

@@ -23,10 +23,30 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# PYTHONPATH shadowing guard (same class as t_52763d41): other test modules
+# (test_flat_router.py, test_ollama_quota_shadowing.py) insert
+# ~/merchant-routing-engine into sys.path, which would make `import
+# src.balance_collectors` resolve to the MRE copy (stale NEURALWATT_DAILY_CAP
+# default) and cache it in sys.modules. Load the bot's own copy by absolute
+# path and register it in sys.modules BEFORE the import block so this module
+# always sees the bot's copy regardless of sys.path pollution.
+import importlib.util as _ilu
+import sys as _sys
+_bot_bc = Path(__file__).resolve().parent / "src" / "balance_collectors.py"
+_spec = _ilu.spec_from_file_location("src.balance_collectors", _bot_bc)
+_bc_mod = _ilu.module_from_spec(_spec)
+_sys.modules["src.balance_collectors"] = _bc_mod
+_spec.loader.exec_module(_bc_mod)
+
 import src.balance_collectors as bc  # noqa: E402
+
+# Proxy-level tests (daily-cap removal) import zai_proxy lazily inside the
+# test class so the collector-only suite stays fast and side-effect free.
+# Import is safe: server/threads start only under __main__.
 
 # Use the canonical /v1/quota sample captured on 2026-08-23T16:55Z as the gold
 # reference. The per-test code can mutate copies of it for edge cases.
@@ -376,11 +396,14 @@ class TestDailyCapEnforcement(NeuralWattFixture):
                                   "total_tokens": 1_000_000}]
         return fake
 
-    def test_default_daily_cap_is_10_when_env_unset(self):
+    def test_default_daily_cap_is_disabled_when_env_unset(self):
+        """Default daily cap is 0 (DISABLED) since 2026-09-08 — the operator
+        override removed ALL daily caps; markets + Kalman handle it via price,
+        never by hard-disabling the key."""
         self.assertNotIn(bc.NEURALWATT_DAILY_CAP_ENV, os.environ)
         bal = self.collect()
-        self.assertAlmostEqual(bal.daily_cap_usd,
-                               bc.NEURALWATT_DEFAULT_DAILY_CAP)
+        self.assertEqual(bal.daily_cap_usd, 0.0)
+        self.assertFalse(bal.is_daily_cap_exceeded)
 
     def test_daily_cap_exceeded_when_today_exceeds_cap(self):
         """$45 today vs $10 cap → is_daily_cap_exceeded True."""
@@ -1039,6 +1062,82 @@ class TestDefaultUsageDbPath(unittest.TestCase):
         path = bc.default_usage_db_path()
         self.assertTrue(path.endswith("zai_usage.db"))
         self.assertIn(".hermes", path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Proxy-level daily-cap removal (operator override 2026-09-08)
+# ═══════════════════════════════════════════════════════════════════════════
+# The NEURALWATT_DAILY_CAP hard block is REMOVED. neuralwatt stays
+# healthy/price-eligible regardless of daily spend; the market (Kalman +
+# scarcity) makes it un-competitive via price when it should be, never by
+# hard-disabling the key for the day. used_pct reflects the real quota
+# (kWh/credit fraction), NOT a cap-clamped 100.
+
+class TestNeuralWattDailyCapRemoved(unittest.TestCase):
+    """Proxy-level regression tests for the daily-cap removal.
+
+    Mirrors the routstrd daily-cap removal (commit 035b52e): the health
+    snapshot must not delist neuralwatt on daily spend, and the quota
+    snapshot must not clamp used_pct to 100 when the cap is exceeded.
+    """
+
+    def _import_proxy(self):
+        import zai_proxy
+        return zai_proxy
+
+    def test_health_stays_true_when_daily_cap_exceeded(self):
+        """Even when is_daily_cap_exceeded is True, neuralwatt stays healthy."""
+        z = self._import_proxy()
+        with mock.patch.object(z, "_neuralwatt_quota_entry_fn",
+                               return_value={"is_daily_cap_exceeded": True,
+                                             "is_exhausted": False}):
+            health = z._snapshot_health()
+        self.assertTrue(health["neuralwatt"])
+
+    def test_health_stays_true_when_bridge_disabled(self):
+        """Bridge disabled → neuralwatt healthy (per-token, unless 401/403)."""
+        z = self._import_proxy()
+        with mock.patch.object(z, "_neuralwatt_quota_entry_fn", None):
+            health = z._snapshot_health()
+        self.assertTrue(health["neuralwatt"])
+
+    def test_health_driven_by_key_health_not_spend(self):
+        """neuralwatt health is driven purely by _is_key_healthy, not spend.
+        A genuinely unhealthy key (manual disable / backoff) still reports
+        unhealthy; daily spend never delists it."""
+        z = self._import_proxy()
+        with mock.patch.object(z, "_is_key_healthy", return_value=False), \
+             mock.patch.object(z, "_neuralwatt_quota_entry_fn",
+                               return_value={"is_daily_cap_exceeded": True,
+                                             "is_exhausted": False}):
+            health = z._snapshot_health()
+        self.assertFalse(health["neuralwatt"])
+
+    def test_quota_used_pct_not_clamped_by_daily_cap(self):
+        """used_pct reflects the real quota fraction, not a cap-clamped 100."""
+        z = self._import_proxy()
+        with mock.patch.object(z, "_neuralwatt_quota_entry_fn",
+                               return_value={"used_pct": 49.3,
+                                             "remaining": 6.76,
+                                             "total": 13.33,
+                                             "is_daily_cap_exceeded": True,
+                                             "is_exhausted": False}):
+            snap = z._neuralwatt_quota_snapshot()
+        self.assertAlmostEqual(snap["used_pct"], 49.3)
+        self.assertNotEqual(snap["used_pct"], 100.0)
+        self.assertNotEqual(snap.get("regime"), "daily-capped")
+
+    def test_quota_used_pct_reflects_real_quota_when_under_cap(self):
+        """Under-cap spend still surfaces the real used_pct."""
+        z = self._import_proxy()
+        with mock.patch.object(z, "_neuralwatt_quota_entry_fn",
+                               return_value={"used_pct": 12.5,
+                                             "remaining": 11.66,
+                                             "total": 13.33,
+                                             "is_daily_cap_exceeded": False,
+                                             "is_exhausted": False}):
+            snap = z._neuralwatt_quota_snapshot()
+        self.assertAlmostEqual(snap["used_pct"], 12.5)
 
 
 if __name__ == "__main__":

@@ -208,30 +208,37 @@ spend logger matches the real bill within ~5%.
 
 ---
 
-## Daily Spend Cap Enforcement
+## Daily Spend Cap Enforcement — REMOVED 2026-09-08 (operator override)
 
-The daily cap is a **runaway-burn guardrail** that prevents another
-$258-in-one-day incident. It works with the real API spend, not the
-overcounted DB value.
+The `NEURALWATT_DAILY_CAP` hard block was **REMOVED** (operator override:
+remove ALL daily caps, including any backstop). NeuralWatt stays
+healthy/price-eligible regardless of daily spend. The market (Kalman +
+scarcity) makes it un-competitive via price when it should be, never by
+hard-disabling the key for the day.
 
-### How it works
+### What changed
 
-1. `collect_neuralwatt_balance()` fetches today's real spend from
-   `/v1/usage/summary.time_series[today].cost_usd`
-2. If `daily_spent_usd > daily_cap_usd` (and cap > 0), then
-   `is_daily_cap_exceeded = True`
-3. In `zai_proxy.py` → `_neuralwatt_quota_snapshot()`, when the cap is
-   exceeded, `used_pct` is overridden to `100.0` and `regime` =
-   `"daily-capped"`. This causes the routing layer to treat NeuralWatt
-   as exhausted and drop it from rotation until UTC midnight.
-4. In `_snapshot_health()`, `h["neuralwatt"]` is set to `False` when
-   the daily cap is exceeded, marking the key unhealthy.
+1. `collect_neuralwatt_balance()` still fetches today's real spend from
+   `/v1/usage/summary.time_series[today].cost_usd` and still computes
+   `is_daily_cap_exceeded` (used by the cost-escalation cron alert).
+2. `NEURALWATT_DEFAULT_DAILY_CAP` is now `0.0` (DISABLED). A cap of `0`
+   means `is_daily_cap_exceeded` is always `False` unless an explicit
+   cap is passed or `NEURALWATT_DAILY_CAP` env is set to a positive value.
+3. In `zai_proxy.py` → `_neuralwatt_quota_snapshot()`, the `used_pct=100`
+   clamp and `regime="daily-capped"` override are **gone**. `used_pct`
+   now reflects the REAL quota fraction (kWh or credit fraction), so as
+   the budget depletes the scarcity factor raises the effective $/M and
+   NeuralWatt becomes un-competitive vs cheaper healthy lanes — price is
+   the only signal, never a kill switch.
+4. In `_snapshot_health()`, `h["neuralwatt"]` is now driven purely by
+   `_is_key_healthy("neuralwatt")` (backoff, manual disable, 401/403) —
+   daily spend never delists it.
 
 ### Configuration
 
 | Setting | Env Var | Default | Description |
 |---|---|---|---|
-| Daily cap | `NEURALWATT_DAILY_CAP` | `10.0` (USD/day) | Set to `0` to disable |
+| Daily cap | `NEURALWATT_DAILY_CAP` | `0.0` (DISABLED) | Set to a positive value to re-enable the guardrail |
 | API key | `NEURALWATT_API_KEY` | — | Required for API calls |
 | Cost correction override | `NEURALWATT_COST_CORRECTION` | — | Pin a factor in `[0, 1]` |
 
@@ -263,14 +270,16 @@ returns:
     "is_exhausted": False,      # kwh_remaining <= 0 or in_overage
     "is_daily_cap_exceeded": False,
     "daily_spent_usd": 45.60,
-    "daily_cap_usd": 10.0,
+    "daily_cap_usd": 0.0,       # DISABLED since 2026-09-08
     "collected_at": 1724434728.0,
     # ... dashboard fields
 }
 ```
 
-When the daily cap is exceeded, `used_pct` is forced to `100.0` and
-`regime = "daily-capped"`.
+`used_pct` reflects the REAL quota fraction (kWh or credit fraction) —
+it is **never** clamped to `100.0` by the daily cap (the clamp was
+removed 2026-09-08). `is_daily_cap_exceeded` is still surfaced for the
+cost-escalation cron alert.
 
 **Cold-start fallback:** If the bridge is disabled or no fresh row
 exists, the snapshot returns `{used_pct: 0.0, remaining: inf}` — the
@@ -278,9 +287,10 @@ pre-bridge optimistic behavior — so routing never breaks.
 
 ### `h["neuralwatt"]` in `_snapshot_health()`
 
-When the daily cap is exceeded, the key is marked **unhealthy** so the
-router drops NeuralWatt until UTC midnight (when the time_series
-resets).
+`h["neuralwatt"]` is driven purely by `_is_key_healthy("neuralwatt")`
+(backoff, manual disable, 401/403). Daily spend **never** delists it —
+the market (Kalman + scarcity) makes NeuralWatt un-competitive via price
+when it should be, never by hard-disabling the key for the day.
 
 ---
 
@@ -312,7 +322,11 @@ import json; print(json.dumps(neuralwatt_quota_entry(), indent=2, default=str))
 "
 ```
 
-### Change the daily spend cap
+### Daily spend cap (DISABLED by default since 2026-09-08)
+
+The daily cap is **disabled by default** (operator override: remove ALL
+daily caps; markets + Kalman handle it via price, never disable keys).
+To re-enable it temporarily:
 
 ```bash
 # Temporary (this session only)
@@ -321,7 +335,7 @@ export NEURALWATT_DAILY_CAP=5.0
 # Permanent — add to manager .env
 echo 'NEURALWATT_DAILY_CAP=5.0' >> ~/.hermes/profiles/manager/.env
 
-# Disable cap entirely
+# Disable cap entirely (default)
 export NEURALWATT_DAILY_CAP=0
 ```
 

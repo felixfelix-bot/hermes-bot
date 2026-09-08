@@ -20,7 +20,11 @@ from unittest.mock import patch
 import pytest
 
 # ── Path setup ──────────────────────────────────────────────────────────────
-BOT = os.environ.get("HERMES_BOT_DIR", os.path.expanduser("~/.hermes/bot"))
+# Default BOT to the directory containing this test file (the worktree root,
+# which holds the G2/G3 fixes under test) so the suite is green out-of-the-box
+# with no env vars. HERMES_BOT_DIR overrides when pointing at a deployed tree.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BOT = os.environ.get("HERMES_BOT_DIR", _HERE)
 MRE = os.environ.get("HERMES_MRE_DIR", os.path.expanduser("~/merchant-routing-engine"))
 for p in [BOT, MRE, os.path.join(MRE, "src")]:
     if p not in sys.path:

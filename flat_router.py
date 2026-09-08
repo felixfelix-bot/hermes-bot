@@ -286,11 +286,15 @@ _SEED_RATES: dict[str, float] = {
     # Chutes — transient lane (ADR-014): $0.096/M eff on DS-V4-Flash
     # (in 0.44 / out 1.32 / cached 0.044 $/M); Kalman refines from live data.
     "chutes":        0.096,
-    # DeepSeek Direct — per-token seed from published off-peak rates.
-    # Flash: in 0.22 / cache-hit 0.007 / out 0.66 → ~0.22 blended (75:25
-    # in:out) at zero cache-hit; Kalman refines toward the real cache-hit mix.
-    # PAE-6/7 warm-context should raise the cache-hit ratio → lower effective.
-    "deepseek":     0.30,
+    # DeepSeek Direct — per-token seed set BELOW market to win traffic and
+    # let Kalman measure real blended cost. Theoretical off-peak blended
+    # (in 0.22 / cache-hit 0.007 / out 0.66 $/M) is ~$0.22 uncached, but
+    # operator's real platform data shows $0.05/M blended (heavy cache hits
+    # from warm-context worker loops). Seed 0.30 was 6× too high → never
+    # won against chutes (0.096) → zero traffic → no Kalman data. Felix
+    # OK'd lowering to collect real measurements; Kalman auto-corrects up
+    # if actual cost exceeds chutes.
+    "deepseek":     0.05,
 }
 
 # Map proxy provider names to shadow optimizer names

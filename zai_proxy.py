@@ -734,6 +734,13 @@ TELNYX_STARTING_BALANCE = float(_EXTERNAL_KEYS.get("telnyx_balance", "10.0") or 
 # DeepSeek uses its own peak hours (UTC 01:00-04:00 + 06:00-10:00 Mon-Fri).
 DEEPSEEK_KEY = _EXTERNAL_KEYS.get("deepseek", "")
 DEEPSEEK_BASE = "https://api.deepseek.com"
+# Per-model rates for DeepSeek Direct (cash-outs / cost logging / routing).
+# Authoritative values from ~/.hermes/profiles/manager/.env (operator-provided):
+# flash $0.14/M input, $0.03/M cached, $0.28/M output. Same tier as NeuralWatt.
+DEEPSEEK_RATES: dict[str, dict[str, float]] = {
+    "deepseek-v4-flash": {"input": 0.14, "cached_input": 0.03, "output": 0.28},
+    "deepseek-v4-pro":   {"input": 1.00, "cached_input": 0.10, "output": 3.00},
+}
 
 # OpenCode Go — $10/month flat-rate subscription (GLM-5.2/5.3, Kimi, DeepSeek)
 OPENCODE_GO_KEY = _EXTERNAL_KEYS.get("opencode_go", "")
@@ -3098,12 +3105,15 @@ _MODEL_ID_TO_PROVIDER_ID: dict[str, dict[str, str]] = {
         "openrouter": "deepseek/deepseek-v4-flash",
         "ppq": "deepseek/deepseek-v4-flash",
         "neuralwatt": "deepseek-v4-flash",
+        "deepseek": "deepseek-v4-flash",
     },
     "deepseek-v4-flash": {
         "neuralwatt": "deepseek-v4-flash",
+        "deepseek": "deepseek-v4-flash",
     },
     "deepseek-v4-pro": {
         "neuralwatt": "deepseek-v4-pro",
+        "deepseek": "deepseek-v4-pro",
     },
     "gemma-4-31b": {
         "neuralwatt": "gemma-4-31b",

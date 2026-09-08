@@ -20,8 +20,8 @@ from unittest.mock import patch
 import pytest
 
 # ── Path setup ──────────────────────────────────────────────────────────────
-BOT = os.path.expanduser("~/.hermes/bot")
-MRE = os.path.expanduser("~/merchant-routing-engine")
+BOT = os.environ.get("HERMES_BOT_DIR", os.path.expanduser("~/.hermes/bot"))
+MRE = os.environ.get("HERMES_MRE_DIR", os.path.expanduser("~/merchant-routing-engine"))
 for p in [BOT, MRE, os.path.join(MRE, "src")]:
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -421,6 +421,46 @@ class TestRouterIntegration:
     def test_garbage_mult_helper_fail_open(self):
         gd.reset_state()
         assert _garbage_mult_or_one("neuralwatt", "glm-5.2") == 1.0
+
+
+# ── G3: Keying-consistency test ──────────────────────────────────────────────
+# Flat router's price lookup uses _resolve_model_for_provider(name, model) for
+# the garbage multiplier key. But _garbage_check records strikes under the raw
+# model string. If those diverge (e.g. "deepseek/deepseek-v4-flash" on the
+# strike side vs "deepseek-v4-flash" on the price side), the price bump
+# computes a mult for a key NO strike exists on = silent no-op.
+# The fix: _garbage_check must resolve the model via the same helper.
+
+class TestKeyingConsistency:
+    """G3: A strike recorded by _garbage_check must land on the SAME
+    (provider, model) key that flat_router's price lookup uses."""
+
+    def test_strike_key_matches_price_lookup_key(self):
+        from flat_router import _resolve_model_for_provider, PROVIDER_MODELS
+        from zai_proxy import _garbage_check
+        gd.reset_state()
+
+        # Garbage that triggers repetition detection
+        test_body = b'{"choices":[{"message":{"content":"' + b'test ' * 200 + b'"}}],"usage":{"completion_tokens":500}}'
+
+        failures = []
+        for provider, models in PROVIDER_MODELS.items():
+            for m in sorted(models):
+                resolved = _resolve_model_for_provider(provider, m)
+                key_model = resolved if resolved else m
+                # Record a strike via _garbage_check — it should use
+                # the SAME resolved key as the price lookup.
+                _garbage_check(provider, m, test_body)
+                if gd.strikes_in_window(provider, key_model) < 1:
+                    raw_hits = gd.strikes_in_window(provider, m)
+                    failures.append(
+                        f"  {provider}/{m}: strike on raw='{m}' (hits={raw_hits}) "
+                        f"but price-lookup key='{key_model}' has 0 hits")
+                gd.reset_state()
+
+        assert not failures, (
+            "Keying divergence — price-lookup key differs from strike-recording key "
+            "for these (provider, model):\n" + "\n".join(failures[:5]))
 
 
 if __name__ == "__main__":

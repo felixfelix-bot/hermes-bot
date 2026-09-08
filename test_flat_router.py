@@ -25,8 +25,8 @@ from dataclasses import dataclass
 import pytest
 
 # ── Path setup ──────────────────────────────────────────────────────────────
-BOT = os.path.expanduser("~/.hermes/bot")
-MRE = os.path.expanduser("~/merchant-routing-engine")
+BOT = os.environ.get("HERMES_BOT_DIR", os.path.expanduser("~/.hermes/bot"))
+MRE = os.environ.get("HERMES_MRE_DIR", os.path.expanduser("~/merchant-routing-engine"))
 for p in [BOT, MRE, os.path.join(MRE, "src")]:
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -364,6 +364,34 @@ class TestDispatchMapping:
             telnyx_candidates = [c for c in candidates if c.name == "telnyx"]
             for c in telnyx_candidates:
                 assert c.dispatch_fn is not None, "dispatch_fn for telnyx should not be None"
+
+
+# ── G2: Garbage-check coverage on 3 flat-rate lanes ─────────────────────────
+
+class TestGarbageCheckCoverage:
+    """G2: _try_ollama_cloud, _try_telnyx, _try_opencode_go MUST call
+    _garbage_check on their success path so garbage on these flat-rate
+    lanes is detected and leads to market-based routing around them."""
+
+    def test_try_ollama_cloud_calls_garbage_check(self):
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        # _try_ollama_cloud's success path must call _garbage_check
+        # just before return True with the translated model and buffer.
+        assert "_garbage_check(key_name, ollama_model, bytes(response_buffer)" in source, \
+            "_try_ollama_cloud must call _garbage_check on success"
+
+    def test_try_opencode_go_calls_garbage_check(self):
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_garbage_check(\"opencode_go\", og_model, bytes(response_buffer)" in source, \
+            "_try_opencode_go must call _garbage_check on success"
+
+    def test_try_telnyx_calls_garbage_check(self):
+        import zai_proxy
+        source = open(zai_proxy.__file__).read()
+        assert "_garbage_check(\"telnyx\", telnyx_model, bytes(response_buffer)" in source, \
+            "_try_telnyx must call _garbage_check on success"
 
 
 # ── Phase 3 tests: full cutover, rollback flag, Kalman live updates ──────────

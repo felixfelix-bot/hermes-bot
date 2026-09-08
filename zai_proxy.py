@@ -1196,11 +1196,20 @@ def _garbage_check(provider, model, resp_bytes, request_body=None,
     market-based routing backoff (flat router price multiplier) + a ledger
     entry for visibility — INCLUDING manager↔worker traffic the operator
     never sees. Pass-through: never alters delivery, never raises.
-    Alert-once per window via _log_anomaly (MODEL_GARBAGE)."""
+    Alert-once per window via _log_anomaly (MODEL_GARBAGE).
+
+    Unifies the strike key with the price-lookup key (G3): resolves the model
+    through flat_router._resolve_model_for_provider so the strike always lands
+    on the same (provider, model) pair the price bump is computed for.
+    Otherwise a strike on the raw model ("deepseek/deepseek-v4-flash") and a
+    price lookup on the translated model ("deepseek-v4-flash") would diverge
+    = silent no-op price bump."""
     try:
         import garbage_detector
+        from flat_router import _resolve_model_for_provider
+        key_model = _resolve_model_for_provider(provider, model)
         info = garbage_detector.report_success_response(
-            provider=provider, model=model, resp_bytes=resp_bytes,
+            provider=provider, model=key_model, resp_bytes=resp_bytes,
             request_body=request_body, prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens, duration_ms=duration_ms)
         if info and info.get("first_in_window"):
@@ -5194,6 +5203,13 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key=key_name,
                     reason=reason or ("peak_hour_ollama_primary" if _is_peak_hour() else "zai_both_keys_exhausted_ollama_fallback"),
                 )
+                # Garbage-output check (pass-through, fail-open): content-
+                # quality strike for market-based backoff + ledger visibility.
+                # RUNS BEFORE delivery (delivery already streamed), strikes
+                # feed flat_router's price multiplier on subsequent dispatches.
+                _garbage_check(key_name, ollama_model, bytes(response_buffer),
+                               request_body=body,
+                               duration_ms=int((time.time() - t0) * 1000))
                 return True
 
         except urllib.error.HTTPError as he:
@@ -5511,6 +5527,11 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key="opencode_go",
                     reason=reason or "opencode_go_flat_rate_primary",
                 )
+                # Garbage-output check (pass-through, fail-open): content-
+                # quality strike for market-based backoff + ledger visibility.
+                _garbage_check("opencode_go", og_model, bytes(response_buffer),
+                               request_body=body,
+                               duration_ms=int((time.time() - t0) * 1000))
                 return True
 
         except urllib.error.HTTPError as he:
@@ -5701,6 +5722,11 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_key="telnyx",
                     reason="telnyx_direct" if model in _TELNYX_DIRECT_MODELS else "ollama_cloud_failed_telnyx_fallback",
                 )
+                # Garbage-output check (pass-through, fail-open): content-
+                # quality strike for market-based backoff + ledger visibility.
+                _garbage_check("telnyx", telnyx_model, bytes(response_buffer),
+                               request_body=body,
+                               duration_ms=int((time.time() - t0) * 1000))
                 return True
 
         except urllib.error.HTTPError as he:

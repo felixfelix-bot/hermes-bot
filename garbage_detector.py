@@ -29,6 +29,17 @@ Env knobs (read once at import; fail-open everywhere):
 
 Kill-switch (no restart; 30s cache):  touch ~/.hermes/bot/.disable_garbage_pricing
 Re-enable:                             rm  ~/.hermes/bot/.disable_garbage_pricing
+
+Phase A (2026-09-08): Garbage hardening on 3 flat-rate lanes + keying-consistency fix.
+  * _garbage_check now fires from _try_ollama_cloud, _try_telnyx, AND
+    _try_opencode_go — closing the coverage hole (G2) where flat-rate lanes
+    were never garbage-scored.
+  * Strikes are recorded via _resolve_model_for_provider(provider, model) so
+    the strike key and the price-lookup key are always the same (G3).
+  * All call sites go through the one _garbage_check helper which resolves
+    the key before recording.
+  * Tested via TDD: source-inspection for the call sites + PROVIDER_MODELS-
+    spanning keying-consistency assertion.
 """
 
 from __future__ import annotations

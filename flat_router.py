@@ -887,6 +887,123 @@ def _apply_exhaust_weight(name: str, cost: float) -> float:
         return cost  # never raise into routing
 
 
+# ── Sold-traffic gate (ADR-007 Gate 2 / PLAN P0-3 rugpull-resilience) ───────
+# Caller-class separation: "internal" traffic (Hermes agents, kanban workers,
+# crons) is ALWAYS served; "sold" traffic (routstr public sell lane) is served
+# only while the pool is predicted to retain > SOLD_SAFETY_HOURS of quota.
+# When a sold request would exhaust the pool sooner, select_provider() attaches
+# ``_sold_retry_after`` (seconds) to the returned candidate list and the HTTP
+# layer emits 429 + Retry-After. Fail-open: absent/stale predictions never
+# block — a broken predictor must not starve sold traffic into an infinite 429.
+
+#: Hours of predicted-quota headroom below which SOLD traffic is rejected.
+#: Env-overridable; default 2h (PLAN-routstr-serving-lane T-A "(default 2)";
+#: canonical reference impl merchant-routing-engine @5af467f pins 2.0).
+SOLD_SAFETY_HOURS = float(os.environ.get("SOLD_SAFETY_HOURS", "2"))
+
+#: TTL for the sold-gate prediction memo. predict_exhaustion() performs a
+#: self-HTTP GET to /quota plus a burn-history DB read per provider, so the
+#: request path must NOT call it per candidate per request (zai_proxy's own
+#: _get_predictions wrapper exists for exactly this reason). 60s mirrors
+#: _PROACTIVE_PREDICTION_TTL in zai_proxy.
+_SOLD_PRED_TTL = 60.0
+_sold_pred_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _sold_predictions_cached(name: str) -> list[dict]:
+    """predict_exhaustion(name) with a short TTL memo (fail-open to []).
+
+    Errors are NOT memoized: a transient predictor failure is re-attempted on
+    every call so the gate heals as soon as the predictor recovers — it must
+    never block sold traffic on a stale error, and never serve on one longer
+    than necessary.
+    """
+    now = time.time()
+    try:
+        hit = _sold_pred_cache.get(name)
+        if hit and (now - hit[0]) < _SOLD_PRED_TTL:
+            return hit[1]
+    except Exception:
+        pass
+    try:
+        from burn_predictor import predict_exhaustion
+        preds = list(predict_exhaustion(name) or [])
+    except Exception:
+        return []  # broken predictor must never gate (fail-open, no memo)
+    try:
+        _sold_pred_cache[name] = (now, preds)
+    except Exception:
+        pass
+    return preds
+
+
+def sold_gate_retry_after(
+    predictions: list[dict],
+    sold_safety_hours: float | None = None,
+) -> int | None:
+    """Pure sold-traffic gate decision (ADR-007 Gate 2 / PLAN P0-3).
+
+    Given ``burn_predictor.predict_exhaustion()`` per-window prediction dicts,
+    return the ``Retry-After`` SECONDS a SOLD request should wait when the pool
+    is predicted to exhaust within ``sold_safety_hours``; ``None`` when the
+    traffic may be served.
+
+    Rule: blocked iff the most-urgent predicted exhaustion (min
+    ``exhausts_in_hours`` across windows with ``will_exhaust`` true) is
+    STRICTLY LESS than the horizon. Retry-After = that remaining headroom
+    converted to seconds (ceil(hours * 3600), min 1s) — a 2h headroom yields
+    Retry-After: 7200, NOT 2 (hours ≠ seconds; a 2-second retry would be a
+    retry storm against a still-gated pool). Degrades to None (serve) when no
+    window predicts exhaustion or no numeric projection exists. Pure +
+    deterministic; never raises.
+    """
+    try:
+        horizon = float(sold_safety_hours if sold_safety_hours is not None
+                        else SOLD_SAFETY_HOURS)
+    except (TypeError, ValueError):
+        horizon = SOLD_SAFETY_HOURS
+    if horizon <= 0:
+        return None
+
+    exhaust_near_h: float | None = None
+    for p in predictions or []:
+        if not bool(p.get("will_exhaust")):
+            continue
+        in_h = p.get("exhausts_in_hours")
+        if in_h is None:
+            continue  # will_exhaust without a numeric projection cannot block
+        try:
+            in_h = float(in_h)
+        except (TypeError, ValueError):
+            continue
+        if in_h < 0:
+            in_h = 0.0
+        if exhaust_near_h is None or in_h < exhaust_near_h:
+            exhaust_near_h = in_h
+
+    if exhaust_near_h is None or exhaust_near_h >= horizon:
+        return None
+    return max(1, math.ceil(exhaust_near_h * 3600.0))
+
+
+def _sold_pool_predictions(candidates: list) -> list[dict]:
+    """Gather ``predict_exhaustion()`` per-window predictions for the provider
+    lanes a request would route to (non-fallback candidates only).
+
+    Returns a flat list of per-window prediction dicts. Any failure (missing
+    predictor, quota-DB / prediction error) yields ``[]`` so the sold gate
+    degrades to *serve* (never block sold traffic on a broken predictor).
+    Predictions are memoized 60s per provider (see _sold_predictions_cached).
+    """
+    out: list[dict] = []
+    for cand in candidates or []:
+        name = getattr(cand, "name", None)
+        if name in ("fallback", None):
+            continue
+        out.extend(_sold_predictions_cached(name))
+    return out
+
+
 # ── Garbage-output price penalty (PLAN-garbage-output-detection, 2026-09-07) ─
 # Content-quality garbage on a delivered (provider, model) lane raises its
 # effective price via a decaying strike multiplier. SOFT only — never removes
@@ -1024,6 +1141,7 @@ def select_provider(
     task_type: str = "coding",
     estimated_tokens: int = 10000,
     difficulty: str = "medium",
+    caller_class: str = "internal",
 ) -> list[ProviderCandidate]:
     """Flat-hierarchy provider selection.
 
@@ -1121,6 +1239,26 @@ def select_provider(
                 dispatch_fn=None,
                 reason="no viable provider found",
             ))
+
+        # Sold-traffic gate (ADR-007 Gate 2 / PLAN P0-3): when this request is
+        # classified "sold", reject with 429+Retry-After if the pool is
+        # predicted to exhaust within SOLD_SAFETY_HOURS. Internal requests are
+        # ALWAYS served (caller_class="internal" skips the gate entirely). The
+        # decision rides on the FIRST ProviderCandidate as ``_sold_retry_after``
+        # (a plain @dataclass without __slots__ accepts the transient attribute)
+        # so the HTTP layer emits 429 + Retry-After without re-reading
+        # predictions; degrades to None (serve) on any prediction failure. The
+        # list is never empty (a fallback candidate is always appended above),
+        # so candidates[0] always exists.
+        if caller_class == "sold":
+            try:
+                candidates[0]._sold_retry_after = sold_gate_retry_after(
+                    _sold_pool_predictions(candidates))
+            except Exception:
+                try:
+                    candidates[0]._sold_retry_after = None
+                except Exception:
+                    pass  # never raise into routing
 
         return candidates
     except Exception:

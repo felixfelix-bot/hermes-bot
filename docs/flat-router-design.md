@@ -423,6 +423,47 @@ Caller iterates the list:
 
 ---
 
+### 2.11 Caller-Class Capture: sold vs internal routing (ADR-007 Gate 2 / PLAN P0-3)
+
+**Motivation.** The routstr SALE (an advertised, Cashu-metered endpoint) will
+sell inference to external customers, while our own Hermes fleet uses the same
+proxy internally. Under quota pressure these two populations have different
+SLOs: internal traffic (Hermes agents, kanban workers, crons) must NEVER be
+blocked by our own routing decisions, whereas a sold customer's request may be
+throttled (HTTP 429 + Retry-After) to protect the pool our own workload needs.
+
+**Traffic classification.** `caller_class` (`"internal"` | `"sold"`) is derived
+once at request entry in `zai_proxy.py` (`_resolve_caller_class`, from the
+`X-Priority` header — the loopback-trusted tag the routstr canary / sell lane
+sets on forwarded requests):
+
+- `"sold"` — request carries `X-Priority: sold` (the routstr public sell lane).
+- `"internal"` — every other / missing / unknown value (defensive default:
+  a request is NEVER classified sold unless it explicitly says so).
+
+The class is threaded into `select_provider(..., caller_class=...)`
+(`flat_router.py`). It carries **no cost or ordering weight** — ranking stays
+purely market-based. The ONE decision it drives is the sold-pressure gate.
+
+**The sold 429 gate (the only routing-decision change in P0-3).**
+`flat_router.sold_gate_retry_after(predictions, sold_safety_hours=None)` returns
+`None` (serve) or the `Retry-After` SECONDS a sold request should wait. It
+blocks iff the most-urgent `predict_exhaustion()` window (any non-fallback
+candidate lane the request could route to) has `will_exhaust` true AND
+`exhausts_in_hours < SOLD_SAFETY_HOURS` (default 2, env-overridable
+`SOLD_SAFETY_HOURS`). Retry-After = the remaining headroom converted to seconds
+(`ceil(exhausts_in_hours × 3600)`), so a ~2h headroom yields `Retry-After:
+7200`, never a 2-second retry storm. The decision rides on the returned
+candidate list (`_sold_retry_after` on the first candidate); `zai_proxy._proxy()`
+emits HTTP 429 + `Retry-After` + `X-Provider: sold-gate` and returns WITHOUT
+entering the candidate loop. Internal requests are NEVER gated (no attribute is
+attached), and the gate fails OPEN — a missing/broken predictor degrades to
+serve, never to an infinite 429. Predictions are memoized 60s per provider
+(`_sold_predictions_cached`) so the sold path does not self-HTTP `/quota` per
+candidate per request.
+
+---
+
 ## 3. Provider Inventory
 
 ### 3.1 z.ai ours

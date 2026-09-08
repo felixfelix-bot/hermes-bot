@@ -2675,6 +2675,27 @@ def _resolve_task_type(headers, body: bytes):
     return _extract_task_type(body)
 
 
+def _resolve_caller_class(headers) -> str:
+    """Resolve the P0-3 caller class for a request from the X-Priority header.
+
+    Returns ``"internal"`` (default) or ``"sold"``. Internal requests are
+    ALWAYS served; sold requests are gated on pool exhaustion risk (PLAN
+    P0-3 rugpull-resilience / ADR-007 Gate 2). The header is loopback-trusted
+    (same boundary as X-Hermes-Session / X-Model-Tier — the proxy is
+    localhost-only). Unknown/missing/empty values fall back to
+    ``"internal"`` — a request is NEVER classified sold unless it explicitly
+    says so (defensive default protects own workload).
+    """
+    try:
+        val = (headers.get("X-Priority", "") or "") if headers is not None else ""
+        cc = val.strip().lower()
+        if cc in ("internal", "sold"):
+            return cc
+    except Exception:
+        pass  # headers object misbehaving — fall back to internal
+    return "internal"
+
+
 def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   prompt_tokens=0, completion_tokens=0, total_tokens=0,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
@@ -6151,6 +6172,16 @@ class Handler(BaseHTTPRequestHandler):
         # respect to the body — the forwarded request is untouched.
         self._task_type = _resolve_task_type(self.headers, body)
 
+        # P0-3 caller-class attribution (ADR-007 Gate 2 / PLAN P0-3): the
+        # caller classifies this request as internal vs sold via the
+        # X-Priority header (internal default | sold). Internal requests are
+        # ALWAYS served; sold requests are served only while the pool is
+        # predicted to retain > SOLD_SAFETY_HOURS. Read-only w.r.t. the body /
+        # forwarded request. Threaded into select_provider() below so sold
+        # requests observe the SAME gate the flat router applies (the HTTP
+        # layer emits the actual 429 + Retry-After).
+        self._caller_class = _resolve_caller_class(self.headers)
+
         # Early bail: model-only probe (no messages field) — return 400
         # immediately. These are health-check/model-availability probes that
         # every provider rejects with 422. Don't waste time cycling providers.
@@ -6284,7 +6315,10 @@ class Handler(BaseHTTPRequestHandler):
                 # the legacy cascade (the flag check already passed, so the old
                 # path is not a valid fallback here).
                 try:
-                    _candidates = _flat_select_provider(model=original_model)
+                    _candidates = _flat_select_provider(
+                        model=original_model,
+                        caller_class=getattr(self, "_caller_class", "internal"),
+                    )
                 except Exception as _fr_err:
                     import traceback as _tb
                     print("[flat-router] select_provider raised "
@@ -6301,6 +6335,46 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("X-Provider", "none")
                     self.end_headers()
                     self.wfile.write(_err)
+                    return
+
+                # ── SOLD-TRAFFIC GATE (ADR-007 Gate 2 / PLAN P0-3) ─────
+                # select_provider() attaches _sold_retry_after (on the first
+                # ProviderCandidate) when the request is caller_class="sold"
+                # AND the pool is predicted to exhaust within
+                # SOLD_SAFETY_HOURS. Emit 429 + Retry-After so sold traffic
+                # degrades gracefully while internal requests (no attribute)
+                # are always served. Degrades to serving the request when the
+                # gate is absent/None (fail-open).
+                try:
+                    _sold_retry = getattr(
+                        _candidates[0], "_sold_retry_after", None)
+                except Exception:
+                    _sold_retry = None
+                if _sold_retry is not None:
+                    try:
+                        _sold_retry = int(_sold_retry)
+                    except (TypeError, ValueError):
+                        _sold_retry = None
+                if _sold_retry is not None and _sold_retry > 0:
+                    _err = json.dumps({
+                        "error": "quota pressure — sold traffic paused until "
+                                 "pool exhaustion risk clears",
+                        "model": original_model,
+                        "retry_after_seconds": _sold_retry,
+                        "hint": "internal requests are never gated; retry "
+                                "after the Retry-After window",
+                    }).encode()
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(_err)))
+                    self.send_header("Retry-After", str(_sold_retry))
+                    self.send_header("X-Provider", "sold-gate")
+                    self.end_headers()
+                    self.wfile.write(_err)
+                    print(
+                        f"[sold-gate] 429 caller_class=sold model="
+                        f"{original_model} retry_after={_sold_retry}s",
+                        flush=True)
                     return
 
                 # Shadow log: record what the flat router chose

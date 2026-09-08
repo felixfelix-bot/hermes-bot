@@ -19,7 +19,7 @@ The old path (best_key + failover cascade) is retained as a rollback safety net 
 
 2. **Keep the old path as dead code** (only reached when `.disable_flat_router` exists). It serves as a rollback safety net and contains model tier routing + compression selection not yet ported.
 
-3. **Keep the pressure FSM enforce hook** and **global spend cap** as circuit breakers before the flat router — these are not routing bypasses.
+3. **Keep the pressure FSM enforce hook** as a circuit breaker before the flat router — it is not a routing bypass. (The **global spend cap** that previously sat alongside it was DEACTIVATED 2026-09-08: the market — Kalman + scarcity pricing — handles spend via price, never a hard kill switch.)
 
 4. **Move the `messages` presence guard** (422 storm fix) to the top of `_proxy`, before any routing. Model-only probe requests return 400 immediately.
 

@@ -65,8 +65,9 @@ rerouted to ollama_cloud glm-5.2 (flat-rate; protects the friend key).
 Interactive, friend-path, last-resort and non-5.3 decisions are never
 touched. If ollama_cloud refuses/fails, the request falls through to the
 normal cascade (bg_last_resort semantics) — enforcement can redirect
-pressure traffic, never block it. The hook sits AFTER the global spend
-cap, so it cannot bypass the runaway-loop circuit breaker.
+pressure traffic, never block it. (The global spend cap that previously
+preceded this hook is DEACTIVATED 2026-09-08 — the market handles spend
+via price, never a kill switch.)
 
 Enabling / disabling (both hot — no proxy restart needed, the policy
 cache re-reads on mtime change). Always use the tuner's merge writer —

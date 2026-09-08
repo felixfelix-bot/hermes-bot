@@ -314,6 +314,16 @@ Before cost comparison, unhealthy providers are excluded:
 6. **NeuralWatt daily cap:** `is_daily_cap_exceeded` → excluded until UTC midnight
 7. **Routstrd wallet exhausted:** `used_pct >= 100` → excluded
 
+> **Global spend cap REMOVED (2026-09-08, operator override).** The global
+> metered-spend circuit breaker (`_check_global_spend_cap`, `SPEND_CAP_METERED`,
+> default $25/day) is DEACTIVATED — it no longer hard-503s metered providers
+> (neuralwatt, routstr, routstrd, deepinfra, telnyx, ppq, openrouter) when daily
+> metered spend exceeds the cap. The market (Kalman + scarcity pricing) makes
+> un-competitive providers lose traffic via price, never by hard-disabling
+> keys. `_METERED_SPEND_TIERS` is kept for accounting/alerting (the
+> cost-escalation cron still reports metered spend); only the hard block is
+> dropped.
+
 The existing `_is_key_healthy()` and `_is_provider_funded()` functions already handle most of these. The flat router unifies them into a single gate:
 
 ```python

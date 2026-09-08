@@ -1207,6 +1207,99 @@ class TestPhase0Hardening:
             "active_key must not be the fallback sentinel"
 
 
+# ── Global SPEND_CAP_METERED removal (operator override 2026-09-08) ─────────
+# The global metered-spend circuit breaker is REMOVED. NO provider is hard-503'd
+# by daily spend. The market (Kalman + scarcity pricing) makes un-competitive
+# providers lose traffic via price, never by hard-disabling keys. _METERED_SPEND_TIERS
+# is KEPT for accounting/alerting but must not gate routing.
+
+class TestGlobalSpendCapRemoved:
+    """Proxy-level regression tests for the global SPEND_CAP_METERED removal.
+
+    Mirrors the neuralwatt (8d7bca7) and routstrd (38ee85d) daily-cap removals:
+    metered providers stay healthy/price-eligible regardless of global metered
+    spend. The cost-escalation cron alert still reports metered spend; only the
+    hard 503 block is dropped.
+    """
+
+    def _make_handler(self):
+        import zai_proxy
+        h = _ProxyStubHandler()
+        _body = json.dumps({"model": "glm-5.2",
+                            "messages": [{"role": "user", "content": "hi"}]}).encode()
+        h.rfile = io.BytesIO(_body)
+        h.headers = {"Content-Length": str(len(_body))}
+        return h
+
+    def test_global_spend_cap_always_allows(self):
+        """_check_global_spend_cap() must never hard-block metered providers.
+
+        Even when today's metered spend exceeds the old $25 default, the check
+        returns allowed=True (cap effectively inf). The market handles it via
+        price, never a kill switch.
+        """
+        import zai_proxy
+        allowed, current_spend, cap = zai_proxy._check_global_spend_cap()
+        assert allowed is True, \
+            f"global spend cap must always allow, got allowed={allowed}"
+        assert cap == float("inf"), \
+            f"cap must be inf (disabled), got {cap}"
+
+    def test_proxy_does_not_503_on_high_metered_spend(self):
+        """_proxy() must NOT hard-503 metered providers when global metered
+        spend exceeds the old $25 cap — it proceeds to routing instead.
+
+        We simulate the old cap being exceeded by patching the (now-disabled)
+        check to return allowed=False; the caller must ignore it and continue
+        to the flat router (select_provider is consulted) rather than emit the
+        spend-cap 503.
+        """
+        import zai_proxy
+        h = self._make_handler()
+        select_called = {"v": False}
+
+        def _spy_select(*a, **k):
+            select_called["v"] = True
+            return []
+
+        with patch.object(zai_proxy, "_check_global_spend_cap",
+                          return_value=(False, 99.0, 25.0)), \
+             patch.object(zai_proxy, "_pressure_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy, "_tier_resolution_shadow",
+                          return_value=None), \
+             patch.object(zai_proxy.Handler, "_pressure_enforce",
+                          return_value=False), \
+             patch("flat_router.select_provider", side_effect=_spy_select):
+            zai_proxy.Handler._proxy(h)
+        # The old behavior hard-503'd BEFORE consulting the router. Now the
+        # proxy must fall through to the flat router (select_provider called).
+        assert select_called["v"] is True, \
+            "proxy must proceed to routing, not hard-503 on metered spend"
+        # And it must NOT have emitted the spend-cap 503 error body.
+        assert b"daily METERED spend cap exceeded" not in h.wfile.getvalue(), \
+            "the spend-cap 503 body must not be emitted"
+
+    def test_metered_tiers_kept_for_accounting(self):
+        """_METERED_SPEND_TIERS is KEPT (accounting/alerting) but must not
+        gate routing — the set still lists the metered providers."""
+        import zai_proxy
+        tiers = zai_proxy._METERED_SPEND_TIERS
+        for t in ("neuralwatt", "routstr", "routstrd", "deepinfra",
+                  "telnyx", "ppq", "openrouter"):
+            assert t in tiers, f"{t} missing from _METERED_SPEND_TIERS"
+
+    def test_proxy_source_no_longer_contains_503_spend_block(self):
+        """The hard 503 block in _proxy() that gated on global metered spend
+        is gone — the source must not reference the old circuit-breaker
+        error body."""
+        import inspect
+        import zai_proxy
+        src = inspect.getsource(zai_proxy.Handler._proxy)
+        assert "daily METERED spend cap exceeded" not in src, \
+            "the hard 503 spend-cap block must be removed from _proxy()"
+
+
 # ── Chutes transient lane (ADR-014, onboarded 2026-09-06) ───────────────────
 # Fast-path onboarding: PROVIDER_MODELS + _SEED_RATES + _extract_cost branch.
 # These tests pin the lane into the candidate set for both of its models and

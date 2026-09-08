@@ -327,19 +327,18 @@ class TestEnforceHook(unittest.TestCase):
 
 
 class TestEnforceWiring(unittest.TestCase):
-    """_proxy must call the enforce hook AFTER the spend cap and BEFORE
-    the Ollama-only short-circuit; _try_ollama_cloud keeps back-compat
-    default reasons when called without reason=."""
+    """_proxy must call the enforce hook BEFORE the Ollama-only short-circuit;
+    _try_ollama_cloud keeps back-compat default reasons when called without
+    reason=. (The global spend cap that previously preceded the enforce hook
+    is DEACTIVATED 2026-09-08.)"""
 
     def test_proxy_calls_enforce_hook_in_order(self):
         import inspect
         src = inspect.getsource(z.Handler._proxy)
         i_shadow = src.index("_pressure_shadow(")
-        i_cap = src.index("_check_global_spend_cap()")
         i_enforce = src.index("self._pressure_enforce(")
         i_ollama_only = src.index("_OLLAMA_ONLY_MODELS")
         self.assertLess(i_shadow, i_enforce)
-        self.assertLess(i_cap, i_enforce)
         self.assertLess(i_enforce, i_ollama_only)
 
     def test_try_ollama_cloud_reason_param_defaults_to_legacy(self):

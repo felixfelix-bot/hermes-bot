@@ -3072,7 +3072,10 @@ _SPEND_CAP_WORKER  = float(os.environ.get("SPEND_CAP_WORKER", "inf"))
 
 # D6 (2026-09-02): metered-only cash breaker tiers. These are the providers
 # where a request spends NEW money (pay-per-token / credits). Subscription
-# lanes are deliberately absent — see _check_global_spend_cap docstring.
+# lanes are deliberately absent. KEPT for accounting/alerting (cost-escalation
+# cron reads daily_spend) but NO LONGER gates routing — the global spend cap
+# is DEACTIVATED 2026-09-08 (operator override: markets + Kalman handle it
+# via price, never a kill switch). See _check_global_spend_cap docstring.
 _METERED_SPEND_TIERS = frozenset({
     "neuralwatt", "routstr", "routstrd", "deepinfra",
     "telnyx", "ppq", "openrouter",
@@ -4304,33 +4307,21 @@ def _check_spend_cap(key_name: str | None) -> tuple[bool, float, float]:
 
 
 def _check_global_spend_cap() -> tuple[bool, float, float]:
-    """Check today's METERED spend (real cash) against SPEND_CAP_METERED.
+    """Global metered-spend circuit breaker — DEACTIVATED (always allows).
 
-    Reactivated 2026-09-02 (D6, burn-reduction plan), scoped to METERED
-    providers only (neuralwatt, routstr, routstrd, deepinfra, telnyx, ppq,
-    openrouter) — the tiers where a request spends NEW money. Subscription
-    lanes (ours/friend/ollama_cloud*/opencode_go) are excluded: their
-    daily_spend rows are opportunity-cost accounting against already-paid
-    quotas, and blocking them would 503 sessions while real quota remains
-    (the failure mode that made the original 2026-08-20 hard caps harmful).
+    DEACTIVATED (2026-09-08, operator override): always allows. The market
+    (Kalman + scarcity pricing) makes un-competitive providers lose traffic
+    via price, never by hard-disabling keys. The cost-escalation cron alert
+    still reports metered spend (reads daily_spend directly); only the hard
+    503 block is dropped. _METERED_SPEND_TIERS is kept for accounting/alerting
+    but no longer gates routing.
 
-    env SPEND_CAP_METERED (USD/day, default 25.0). The market-based pricing
-    (pressure FSM, depletion penalties, neuralwatt daily cap) remains the
-    primary mechanism — this is the last-resort cash circuit breaker.
+    env SPEND_CAP_METERED (USD/day, default 25.0) is IGNORED — the cap is
+    disabled (inf). Previously (2026-09-02 D6 burn-reduction plan) this was
+    the last-resort cash circuit breaker scoped to METERED providers only
+    (neuralwatt, routstr, routstrd, deepinfra, telnyx, ppq, openrouter).
     """
-    cap = float(os.environ.get("SPEND_CAP_METERED", "25.0"))
-    try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        rows = _usage_db().execute(
-            "SELECT tier, spend_usd FROM daily_spend WHERE date=?",
-            (today,)).fetchall()
-    except Exception:
-        return (True, 0.0, cap)
-    metered = 0.0
-    for tier, spend in rows or []:
-        if tier in _METERED_SPEND_TIERS and spend:
-            metered += float(spend)
-    return (metered < cap, round(metered, 4), cap)
+    return (True, 0.0, float('inf'))
 
 
 def _init_spend_table() -> None:
@@ -6206,32 +6197,19 @@ class Handler(BaseHTTPRequestHandler):
         self._pressure_decision = _pressure_shadow(
             original_model, self._session_id)
 
-        # Step 1b: Global spend cap — circuit breaker for runaway loops
-        # Use global sum across ALL tiers (not just "unknown") to prevent a
-        # single paid tier from blocking free/cheap providers.
-        allowed, current_spend, cap = _check_global_spend_cap()
-        if not allowed:
-            err = json.dumps({
-                "error": f"daily METERED spend cap exceeded (neuralwatt/routstr/routstrd/deepinfra/telnyx/ppq/openrouter)",
-                "spend_usd": round(current_spend, 4),
-                "cap_usd": cap,
-                "hint": "subscription lanes (ours/friend/ollama_cloud*) are NOT blocked — retry with a sub-served model or wait for the metered market pricing to recover",
-                "reset_at": "midnight UTC"
-            }).encode()
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(err)))
-            self.end_headers()
-            self.wfile.write(err)
-            return
+        # Step 1b: Global spend cap — DEACTIVATED (2026-09-08, operator
+        # override). The market (Kalman + scarcity pricing) makes un-competitive
+        # providers lose traffic via price, never by hard-disabling keys. The
+        # cost-escalation cron alert still reports metered spend; only the hard
+        # 503 block is dropped. _check_global_spend_cap() always allows.
 
         # ── Pressure FSM enforce hook (S2c, t_b82e5665) ────────────────
         # Apply the S2b decision when the tracker runs mode=enforce:
         # AMBER/RED background glm-5.3 → ollama_cloud glm-5.2 (flat-rate,
         # friend-key protection). Shadow mode, non-Ollama decisions and
         # Ollama failures all fall through to the normal cascade below.
-        # Ordered AFTER the global spend cap so enforcement can never
-        # bypass the runaway-loop circuit breaker.
+        # (The global spend cap that previously preceded this hook is
+        # DEACTIVATED 2026-09-08 — the market handles spend via price.)
         if self._pressure_enforce(self._pressure_decision, body, t0):
             return
 

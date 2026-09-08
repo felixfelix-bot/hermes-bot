@@ -7853,7 +7853,11 @@ def _build_kalman_pricing_json() -> dict:
 
     return {
         "timestamp": int(time.time()),
-        "source": "T470",
+        # Source node identity. Default stays "T470" for backward compatibility
+        # (historical consumers keyed on that literal). Set ZAI_NODE_SOURCE in
+        # the systemd unit on other hosts (e.g. DQ05) so telemetry attributes
+        # correctly to the serving node.
+        "source": os.environ.get("ZAI_NODE_SOURCE", "T470"),
         "providers": zai_providers,
         "zai_effective_price_usd_per_m": round(zai_eff_price, 6) if zai_eff_price else None,
         "zai_available": zai_available,

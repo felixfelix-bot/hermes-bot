@@ -2076,38 +2076,10 @@ def _snapshot_health() -> dict:
         h["telnyx"] = _is_key_healthy("telnyx")
         h["routstr"] = _is_key_healthy("routstr")
         h["deepseek"] = _is_key_healthy("deepseek")
-        # DAILY SUB-CAP for routstrd (2026-09-02, plan B3): routstrd is the
-        # cheapest METERED provider ($0.53/M measured), so during ollama
-        # burst-flaps it became the default overflow catch-basin — $47.67 of
-        # real Cashu over 7 days (2026-08-26→09-02). This doesn't distort the
-        # cost ordering (routstrd stays cheapest-metered when healthy); it just
-        # self-demotes the key for the rest of the UTC day once it has burned
-        # ROUTSTRD_DAILY_CAP of real cash, mirroring the neuralwatt daily-cap
-        # guardrail pattern. The ollama pool rebalance (B1) upstream makes
-        # hitting this cap rare.
-        h["routstrd"] = _is_key_healthy("routstrd") and not _routstrd_daily_cap_tripped()
+        h["routstrd"] = _is_key_healthy("routstrd")
     except Exception:
         pass
     return h
-
-
-def _routstrd_daily_cap_tripped(cap: float | None = None) -> bool:
-    """True when today's routstrd metered spend exceeded its sub-cap.
-
-    env ROUTSTRD_DAILY_CAP (USD/day, default 10.0). Reads the daily_spend
-    tier row (UTC day). Never raises — on any DB error returns False so
-    routing is never broken by the guard.
-    """
-    try:
-        _cap = float(cap if cap is not None
-                     else os.environ.get("ROUTSTRD_DAILY_CAP", "10.0"))
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        row = _usage_db().execute(
-            "SELECT spend_usd FROM daily_spend WHERE date=? AND tier='routstrd'",
-            (today,)).fetchone()
-        return bool(row and row[0] and float(row[0]) >= _cap)
-    except Exception:
-        return False
 
 
 def _snapshot_failures() -> dict[str, int]:

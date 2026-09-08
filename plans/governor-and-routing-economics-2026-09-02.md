@@ -142,10 +142,15 @@ to crontab/systemd greps:
   quota DESC, 120s TTL, static fallback on error, paywall keys sink). LIVE
   PROOF: post-restart smokes all routed via `ollama_cloud_2` (most remaining:
   467.7M) instead of burning oc first.
-- **B3 routstrd sub-cap**: `_routstrd_daily_cap_tripped()` (env
+- **B3 routstrd sub-cap**: ~~`_routstrd_daily_cap_tripped()` (env
   ROUTSTRD_DAILY_CAP=10.0/day) wired into `_snapshot_health` — self-demotes
   the metered overflow catch-basin after runaway real-cash burn; ollama pool
-  rebalance upstream makes tripping rare.
+  rebalance upstream makes tripping rare.~~ **REMOVED 2026-09-08 (operator
+  override):** the routstrd daily cap removed. routstrd stays
+  healthy/price-eligible regardless of daily spend; the market (Kalman +
+  scarcity) makes it un-competitive via price when it should be, never by
+  hard-disabling the key for the day. The cost-escalation cron still reports
+  routstrd spend (alert kept, hard block dropped).
 - **C1 price-aware compaction**: realized $/M from api_calls (6h window) —
   bounded log nudge (±0.10) in compute_threshold; measured 0.0137 $/M live.
 - **Tests**: target suites 64+17+8 new + full bot run 454 passed / 12 failed —
@@ -162,3 +167,5 @@ to crontab/systemd greps:
   0.15 is the only deliberate exemption); (2) B3 implemented as spend sub-cap
   (price-order-neutral) instead of tier demotion — demoting routstrd ($0.53/M,
   cheapest metered) would push overflow to MORE expensive metered lanes.
+  (3) B3 sub-cap subsequently REMOVED 2026-09-08 (operator override: remove
+  ALL daily caps; markets + Kalman handle it via price, never disable keys).

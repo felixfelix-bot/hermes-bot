@@ -5,9 +5,13 @@ B1: _ollama_cloud_key_order() must order ollama keys by remaining quota
     (most remaining first) instead of the static registration order that
     drained key #1 at 2.3× its weekly pool while oc2/oc3 sat idle.
 
-B3: _routstrd_daily_cap_tripped() must self-demote routstrd once its real
+B3: ~~_routstrd_daily_cap_tripped() must self-demote routstrd once its real
     metered spend for the UTC day exceeds ROUTSTRD_DAILY_CAP — runaway
-    overflow catch-basin guard ($47.67 burned in 7 days during ollama flaps).
+    overflow catch-basin guard ($47.67 burned in 7 days during ollama flaps).~~
+    REMOVED 2026-09-08 (operator override): routstrd stays healthy/price-
+    eligible regardless of daily spend; the market (Kalman + scarcity) makes
+    it un-competitive via price when it should be, never by hard-disabling
+    the key for the day.
 
 Run:  python3 -m pytest tests/test_ollama_pool_and_routstrd_cap.py -v
 """
@@ -129,34 +133,30 @@ class TestOllamaPoolOrder(unittest.TestCase):
         self.assertEqual(len(calls), first_count)
 
 
-class TestRoutstrdDailyCap(unittest.TestCase):
-    """Metered-overflow sub-cap for routstrd (plan B3)."""
+class TestRoutstrdStaysPriceEligible(unittest.TestCase):
+    """Operator override (2026-09-08): remove the ROUTSTRD_DAILY_CAP hard
+    self-demotion. routstrd stays healthy/price-eligible regardless of daily
+    spend — the market (Kalman + scarcity) makes it un-competitive via price
+    when it should be, never by hard-disabling the key for the day."""
 
-    class _FakeDB:
-        def __init__(self, row):
-            self._row = row
+    def test_routstrd_stays_healthy_when_spend_exceeds_old_cap(self):
+        """Even when today's routstrd spend exceeds the old $10 cap, the key
+        must remain healthy/price-eligible in the health snapshot."""
+        with patch.object(z, "_is_key_healthy", return_value=True):
+            health = z._snapshot_health()
+        self.assertTrue(health["routstrd"])
 
-        def execute(self, *a, **k):
-            return self
+    def test_routstrd_healthy_when_key_healthy(self):
+        """routstrd health is driven purely by _is_key_healthy, not spend."""
+        with patch.object(z, "_is_key_healthy", return_value=True):
+            health = z._snapshot_health()
+        self.assertTrue(health["routstrd"])
 
-        def fetchone(self):
-            return self._row
-
-    def test_under_cap_not_tripped(self):
-        with patch.object(z, "_usage_db", return_value=self._FakeDB((2.50,))):
-            self.assertFalse(z._routstrd_daily_cap_tripped(cap=10.0))
-
-    def test_over_cap_tripped(self):
-        with patch.object(z, "_usage_db", return_value=self._FakeDB((12.30,))):
-            self.assertTrue(z._routstrd_daily_cap_tripped(cap=10.0))
-
-    def test_no_row_not_tripped(self):
-        with patch.object(z, "_usage_db", return_value=self._FakeDB(None)):
-            self.assertFalse(z._routstrd_daily_cap_tripped(cap=10.0))
-
-    def test_db_error_not_tripped(self):
-        with patch.object(z, "_usage_db", side_effect=RuntimeError("db")):
-            self.assertFalse(z._routstrd_daily_cap_tripped(cap=10.0))
+    def test_routstrd_unhealthy_when_key_unhealthy(self):
+        """A genuinely unhealthy routstrd key still reports unhealthy."""
+        with patch.object(z, "_is_key_healthy", return_value=False):
+            health = z._snapshot_health()
+        self.assertFalse(health["routstrd"])
 
 
 if __name__ == "__main__":

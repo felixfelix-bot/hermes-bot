@@ -609,7 +609,7 @@ Caller iterates the list:
 | **Effective $/M** | From measured rates or network catalog. |
 | **Models available** | Same model IDs as the proxy (network catalog) |
 | **Quota tracking** | `_routstrd_balance_snapshot()` — 420s cache + last-known-good. Wallet sats balance. |
-| **Health tracking** | `_is_key_healthy("routstrd")` + endpoint liveness probe + balance gate (`used_pct >= 100` → skip). |
+| **Health tracking** | `_is_key_healthy("routstrd")` + endpoint liveness probe + balance gate (`used_pct >= 100` → skip). No daily-spend cap — the ROUTSTRD_DAILY_CAP hard self-demotion was REMOVED 2026-09-08 (operator override: markets + Kalman handle it via price, never disable keys). |
 | **Kalman filter** | **None.** Not in shadow optimizer. |
 | **Cost multiplier** | Not in `_KEY_COST_MULTIPLIER`. Uses `_get_provider_cost()` with measured/catalog rates. |
 | **Peak hours** | None |

@@ -63,6 +63,12 @@ def _proxy_copies() -> list:
 
     Walked LIVE at fixture setup and teardown: copies get registered or
     replaced in sys.modules mid-suite, so a snapshot list goes stale.
+
+    IMPORTANT (kimi cold-review 2.5b minor 1): the walk sees copies loaded
+    at MODULE IMPORT time only. A copy spec-loaded INSIDE a test function
+    body appears after setup and silently bypasses both layers — load your
+    zai_proxy copies at module import (see test_opencode_quota_truth.py /
+    test_conftest_db_hermeticity.py for the pattern).
     """
     return [m for m in list(sys.modules.values())
             if m is not None and hasattr(m, "_OPENCODE_GO_BENCH_FLAG")]
@@ -103,6 +109,11 @@ def _hermetic_proxy_state_files(tmp_path, monkeypatch):
             # module's own _usage_db() create the connection + schema,
             # run the real upsert against it, then swap back. Reads that
             # happen outside this call keep the live DB.
+            # NOTE (kimi cold-review 2.5b minor 2): the USAGE_DB/_usage_db_conn
+            # swap is intentionally UNLOCKED — safe because each pytest test
+            # runs single-threaded and the live proxy holds its own module
+            # object in a separate process; revisit only under xdist-with-
+            # shared-fixture or proxy-singleton reuse.
             saved_db, saved_conn = (getattr(_mod, "USAGE_DB", None),
                                     getattr(_mod, "_usage_db_conn", None))
             _mod.USAGE_DB = _path
@@ -122,3 +133,11 @@ def _hermetic_proxy_state_files(tmp_path, monkeypatch):
             conn.close()
         except Exception:
             pass
+    # NOTE (kimi cold-review 2.5b minor 3): the marker _HERMETIC_KEY_HEALTH_DB
+    # is deliberately NOT reset at teardown. Resetting it breaks the guard
+    # test test_no_live_db_write_handle_during_test, which asserts the marker
+    # is present at test START — proving the redirect wrapper is installed on
+    # this copy during the test — for tests that fire no write of their own.
+    # The marker is only meaningful while the wrap is installed, and
+    # monkeypatch.setattr teardown removes the wrapped _log_key_health right
+    # after this loop, closing the validity window that way.

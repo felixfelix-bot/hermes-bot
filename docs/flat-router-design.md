@@ -84,7 +84,14 @@ z.ai keys get preferential treatment in every routing decision. External provide
   `_hermetic_proxy_state_files` redirects BOTH the bench flag AND the
   `_log_key_health` DB-mirror write funnel to per-test tmp paths — mocked-200
   test paths can no longer unlink the live flag or flip the live key_health
-  mirror (observed 3x on 2026-09-09, runs 79-81).
+  mirror (observed 3x on 2026-09-09, runs 79-81). Kimi cold-review 2.5b
+  (2026-09-10, t_5f82cd0f): APPROVED_WITH_FINDINGS 0.85 — funnel closure
+  verified non-vacuous (guard asserts absence from live DB AND presence in
+  tmp DB); fixture contract documented in-code: copies must be loaded at
+  module import (the sys.modules walk runs at fixture setup only), the
+  DB swap is single-thread-safe by design, and the
+  `_HERMETIC_KEY_HEALTH_DB` marker is NOT reset at teardown (the guard
+  test reads it at test start; monkeypatch teardown closes the window).
 
 #### `_try_telnyx()` (line 4250) — Telnyx Kimi Handler
 - Kimi-model-only failover. Maps model names via `_PROVIDER_MODEL_NAMES["telnyx"]`.

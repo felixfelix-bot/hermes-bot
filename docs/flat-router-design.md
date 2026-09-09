@@ -302,6 +302,34 @@ The router filters: `candidates = [p for p in all_providers if model in PROVIDER
 
 For model name translation (e.g., `glm-5.2` → `deepseek-ai/DeepSeek-V4-Pro` on DeepInfra), the existing `_PROVIDER_MODEL_NAMES` dict is used when dispatching to the provider.
 
+### 2.6.1 Capability surfaces (3 core + intake overlay)
+
+A model's *capability to be served* is spread across **three static surfaces**
+that the drift checker (`src/catalog_drift_check.py`) reconciles against the live
+catalogs every run:
+
+| # | Surface | Backed by | Purpose |
+|---|---|---|---|
+| 1 | **Routing candidates** | `flat_router.PROVIDER_MODELS` | `select_provider()` only considers a provider if `model in PROVIDER_MODELS[provider]` |
+| 2 | **Dispatch translation** | `zai_proxy._PROVIDER_MODEL_NAMES` | maps a canonical model → provider-native ID at dispatch time |
+| 3 | **Context registry** | `model_context_registry.json` | context-window lengths for truncation/routing decisions |
+
+These are the "capabilities are curated" surfaces from ADR-0009. Since intake
+(ADR-0014), an **overlay surface** is layered on top at import/runtime:
+
+**4. Intake overlay (`model_intake.json`, `status=promoted_routing`)** — loaded by
+`flat_router._apply_intake_overlay()` at import and by `refresh_intake_overlay()`
+at runtime. Promoted entries are merged into `PROVIDER_MODELS` (canonical added to
+each probe-verified provider's set) and their provider-native names are registered
+in `_PROVIDER_MODEL_NAMES` from the same probe evidence (non-identity mappings
+carry dated `# SUBST` comments). The overlay is skipped when the kill-switch file
+`.disable_intake_overlay` exists; it never edits the static registry at runtime.
+
+The `/v1/models` advertisement surface (what the public price list exposes) is
+**separate**: `zai_proxy` overlays only `promoted_routing` entries whose `advertised`
+flag is true — set only when ≥1 healthy non-z.ai provider exists AND a measured
+price is present (tier wall: z.ai-backed models are never public). See ADR-0014.
+
 ### 2.7 Health Gating
 
 Before cost comparison, unhealthy providers are excluded:

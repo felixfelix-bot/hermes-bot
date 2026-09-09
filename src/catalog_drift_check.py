@@ -485,6 +485,173 @@ def refresh_advertised_flags(store: dict, healthy_providers: set,
     return store
 
 
+# ── INTAKE-4: removal grace + PROMOTION BATCH/REMOVALS digest ──────────────
+# A model absent from ALL live provider catalogs is put in a 7-day grace
+# window (missing_since set, status=grace). A grace alert line is raised in
+# the drift report. After >7 days the entry is DROPPED from the store — UNLESS
+# it is a promoted_routing entry, which is always KEPT and instead listed in
+# the human digest (REMOVALS section) for MANUAL registry removal. Routing
+# entries are NEVER auto-removed (removing one would silently break dispatch
+# for a routable model). A model that reappears during grace has its
+# pre-grace status restored automatically.
+GRACE_DAYS = 7
+
+
+def _present_in_any_ok_catalog(live: dict, mid: str) -> bool:
+    """True if `mid` appears in any OK-probed provider catalog.
+
+    Providers whose probe failed/skipped (probe_status != 'ok') are ignored —
+    a failed probe does NOT prove absence. If no provider produced an OK
+    catalog at all, absence cannot be established, so the model is treated as
+    present (never enters grace from an all-dead run).
+    """
+    ok_seen = False
+    for entry in live.values():
+        if entry.get("probe_status") != "ok":
+            continue
+        ok_seen = True
+        if mid in (entry.get("canonical") or []):
+            return True
+    return not ok_seen  # no OK catalog -> cannot prove absence
+
+
+def _iso_days_elapsed(older: str | None, newer: str) -> float:
+    """Days between two ISO timestamps (0.0 if either is unparseable)."""
+    try:
+        a = datetime.fromisoformat(older)
+        b = datetime.fromisoformat(newer)
+        return (b - a).total_seconds() / 86400.0
+    except Exception:
+        return 0.0
+
+
+def apply_removal_grace(store: dict, live: dict, now_iso: str | None = None) -> tuple[dict, list]:
+    """Mark/evict absent models via a 7-day removal grace window.
+
+    For every store entry:
+      - absent from ALL OK-probed catalogs  -> enter grace (missing_since set,
+        status=grace, prior status saved in pre_grace_status).
+      - present in >=1 OK catalog during grace -> grace cleared, pre-grace
+        status restored (a transient blip must not kill a promoted model).
+      - grace elapsed > GRACE_DAYS:
+          * non-promoted (pre_grace_status != promoted_routing) -> entry
+            dropped from the store.
+          * promoted_routing -> entry KEPT and canonical added to the returned
+            `manual_removals` list (human digest surface). NEVER auto-removed.
+
+    Returns (updated_store, manual_removals). The store is also persisted.
+    """
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    manual_removals: list[str] = []
+    for mid in list(store.keys()):
+        rec = store[mid]
+        if _present_in_any_ok_catalog(live, mid):
+            if rec.get("status") == "grace":
+                # transient disappearance — restore the real (pre-grace) status
+                rec["status"] = rec.pop("pre_grace_status", None) or "staged"
+                rec["missing_since"] = None
+            continue
+        # absent from all live catalogs
+        if rec.get("status") != "grace":
+            rec["pre_grace_status"] = rec.get("status")
+            if not rec.get("missing_since"):
+                rec["missing_since"] = now_iso
+            rec["status"] = "grace"
+        # eviction after the grace window elapsed
+        if _iso_days_elapsed(rec.get("missing_since"), now_iso) > GRACE_DAYS:
+            if rec.get("pre_grace_status") == "promoted_routing":
+                # never auto-remove a routing entry — flag for human digest
+                manual_removals.append(mid)
+            else:
+                del store[mid]
+    INTAKE_FILE.write_text(json.dumps(store, indent=2))
+    return store, manual_removals
+
+
+def format_digest(store: dict, measured_models: set, manual_removals: list) -> str:
+    """Build the drift-cron digest stdout ('PROMOTION BATCH:' + 'REMOVALS:').
+
+    'PROMOTION BATCH:' lists eligible chat models with provider breadth and
+    measured-price status (y/n). 'REMOVALS:' lists promoted_routing models past
+    their grace window that need MANUAL registry removal. Each section is
+    OMITTED when empty, and the whole digest is "" when both are empty — so the
+    drift cron keeps its empty-stdout-when-clean contract.
+    """
+    lines: list[str] = []
+    eligible = sorted(
+        m for m, r in store.items()
+        if r.get("status") == "eligible" and r.get("modality") == "chat")
+    if eligible:
+        lines.append("PROMOTION BATCH:")
+        for mid in eligible:
+            rec = store[mid]
+            breadth = len(rec.get("raw_ids", {}) or {})
+            price = "y" if mid in measured_models else "no"
+            lines.append(f"  {mid}  providers={breadth}  measured={price}")
+    if manual_removals:
+        lines.append("REMOVALS:")
+        for mid in sorted(set(manual_removals)):
+            lines.append(f"  {mid}  (promoted_routing past grace window — "
+                         f"MANUAL registry removal required, never auto-removed)")
+    return "\n".join(lines)
+
+
+def format_grace_alert(graced_ids: list) -> str:
+    """Grace alert line for the drift report (list of canonicals now in grace)."""
+    if not graced_ids:
+        return ""
+    return (f"⚠️ intake GRACE ({GRACE_DAYS}d removal timer) — absent from all catalogs: "
+            f"{', '.join(sorted(graced_ids))}")
+
+
+def measured_models() -> set:
+    """Best-effort set of models with a measured price (real_price_tracker data).
+
+    Mirrors scripts/model_promote.py._measured_models(). Flattens the nested
+    ``{provider: {model: $/M, '_default': $/M}}`` shape and returns the model
+    names (dropping ``_default``). Never raises — an empty set on any failure
+    (which makes every eligible model 'unmeasured' for the digest, and no
+    promoted model becomes advertised).
+    """
+    measured: set = set()
+    try:
+        sys.path.insert(0, str(BOT))
+        import real_price_tracker as rpt  # type: ignore
+        got = rpt.get_all_trailing_rates_per_model()
+        if isinstance(got, dict):
+            for prov in (got or {}).values():
+                if isinstance(prov, dict):
+                    measured.update(m for m in prov if m != "_default")
+    except Exception:
+        pass
+    return measured
+
+
+def healthy_provider_names(frame_providers: dict) -> set:
+    """Set of provider names currently healthy per flat_router.
+
+    Best-effort. Mirrors scripts/model_promote.py._healthy_providers(). Falls
+    back to the `live` probe map (providers with probe_status=='ok') when
+    flat_router cannot be fully introspected.
+    """
+    healthy: set = set()
+    try:
+        from flat_router import PROVIDER_MODELS, _is_provider_healthy  # type: ignore
+        for name in PROVIDER_MODELS:
+            try:
+                if _is_provider_healthy(name):
+                    healthy.add(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not healthy:
+        # fallback: any provider that just probed OK is presumed healthy
+        healthy = {n for n, e in frame_providers.items()
+                   if e.get("probe_status") == "ok"}
+    return healthy
+
+
 def probe(url: str, key: str | None, provider: str) -> dict:
     """Fetch a provider catalog. Returns FR-0-style probe record.
 
@@ -624,6 +791,27 @@ def main() -> int:
     if newly_eligible:
         print(f"[catalog-drift] intake eligible={len(newly_eligible)} "
               f"eligible_ids={','.join(newly_eligible)[:120]}")
+
+    # INTAKE-3/INTAKE-4: refresh advertised flags (tier wall + measured-price
+    # gate) and apply the 7-day removal grace window. A model absent from ALL
+    # live catalogs enters grace; after >7d non-promoted entries are dropped
+    # from the store, while promoted_routing entries are listed for MANUAL
+    # registry removal (never auto-removed). The digest stdout carries the
+    # 'PROMOTION BATCH:' and 'REMOVALS:' sections (omitted when empty so the
+    # drift cron stays empty-stdout-when-clean).
+    measured = measured_models()
+    intake = refresh_advertised_flags(
+        intake, healthy_providers=healthy_provider_names(live),
+        measured_models=measured)
+    intake, manual_removals = apply_removal_grace(intake, live)
+    graced_ids = [m for m, r in intake.items() if r.get("status") == "grace"]
+    digest = format_digest(intake, measured_models=measured,
+                           manual_removals=manual_removals)
+    grace_alert = format_grace_alert(graced_ids)
+    if grace_alert:
+        print(grace_alert)
+    if digest:
+        print(digest)
 
     drift = {"phantoms": {}, "missing_rungs": {}, "translation_gaps": {}, "context_gaps": {}}
     for name, cfg in PROVIDER_MODELS.items():

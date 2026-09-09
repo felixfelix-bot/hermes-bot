@@ -1645,6 +1645,131 @@ def _opencode_go_quota_fraction() -> float:
         return 1.0
 
 
+# Persisted bench flag (t_5f82cd0f): ~/.hermes/bot/.opencode_go_exhausted_until
+# holds the epoch the upstream 429 GoUsageLimitError reset lands on. Needed
+# because the routing gate is the in-memory _zai_key_health dict (restart =
+# empty = all lanes healthy) — without persistence /quota would flip back to
+# included/Infinity after a proxy restart even though the upstream monthly
+# limit is still hit, and the lane-wiring-audit (probes upstream directly)
+# would re-fire QUOTA_MODEL_DRIFT. Same shape as the ollama paywall
+# _ollama_exhausted_until flag: only LONG reset windows get persisted (a
+# 429 without a parseable "Resets in N days" hint is a transient throttle —
+# the in-memory short backoff alone is correct there).
+_OPENCODE_GO_BENCH_FLAG = Path.home() / ".hermes" / "bot" / ".opencode_go_exhausted_until"
+
+
+def _opencode_go_persist_bench(reset_seconds: float | None) -> None:
+    """Persist the upstream-declared exhaustion window to the bench flag.
+
+    Called from the 429 path with the parsed reset hint (e.g. "Resets in 15
+    days" → 1296000s, already capped at 14d by _parse_opencode_reset_seconds).
+    reset_seconds None/<=0 → write nothing (transient throttle, no known
+    window). Never raises."""
+    try:
+        if reset_seconds is None:
+            return
+        rs = float(reset_seconds)
+        if rs <= 0:
+            return
+        _OPENCODE_GO_BENCH_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        _OPENCODE_GO_BENCH_FLAG.write_text(str(time.time() + rs))
+    except Exception:
+        pass
+
+
+def _opencode_go_clear_persisted_bench() -> None:
+    """Remove the persisted bench flag — called from the 200-success path so a
+    probe-confirmed recovery restores /quota headroom immediately. Never raises."""
+    try:
+        _OPENCODE_GO_BENCH_FLAG.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _opencode_go_persisted_bench_until() -> float:
+    """Epoch the persisted bench flag expires at; 0.0 when absent/stale/garbage.
+    Never raises."""
+    try:
+        if not _OPENCODE_GO_BENCH_FLAG.exists():
+            return 0.0
+        return float(_OPENCODE_GO_BENCH_FLAG.read_text().strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _opencode_go_quota_entry() -> dict:
+    """Truthful /quota entry for the opencode_go lane (t_5f82cd0f).
+
+    Replaces the hardcoded "Per-token providers — effectively unlimited" dict
+    in _snapshot_quota() that kept reporting ``regime=included,
+    remaining=Infinity, used_pct=0.0`` while the lane sat 429-benched for a real
+    ``GoUsageLimitError: Monthly usage limit reached. Resets in 15 days``
+    (live 2026-09-09: key_health exhausted, backoff_until 2026-09-23). The
+    lane-wiring-audit compares /quota against a live probe and correctly flagged
+    QUOTA_MODEL_DRIFT — this builder makes /quota tell the same truth the
+    upstream API and the circuit breaker already hold.
+
+    Precedence (mirrors how routing actually gates):
+      1. ACTIVE circuit-breaker bench (healthy=False AND backoff_until in the
+         future) → regime="exhausted", used_pct=100, probe_exhausted=True,
+         resets_at = bench expiry. An EXPIRED bench is a historical mirror
+         note, not an active bench (the routing gate honours retry_after —
+         see the 2026-09-09 oc2 sticky-mirror false-positive).
+      2. Allowance depletion (remaining_usd fed by 200-response bodies'
+         cost.allowance_remaining_usd): used_pct = depletion fraction of the
+         $10/mo initial allowance; remaining/total carry USD figures.
+         remaining_usd <= 0 reads as exhausted (pay-per-use threshold).
+      3. Neither → legacy included/Infinity shape (full headroom).
+
+    Fail-open: any internal error returns the legacy dict — /quota must never
+    break because of this builder. Same probe-truth marker pattern as the
+    ollama t_30dde4c7 fix.
+    """
+    legacy = {"used_pct": 0.0, "remaining": float("inf"), "total": float("inf"),
+              "regime": "included", "probe_exhausted": False}
+    try:
+        entry = dict(legacy)
+        # 1. Active bench — in-memory breaker OR persisted upstream window;
+        #    the longer window wins (restart clears memory but not the flag).
+        h = _zai_key_health.get("opencode_go")
+        bench_until = 0.0
+        if h and not h.get("healthy", True):
+            try:
+                bench_until = float(h.get("backoff_until")
+                                    or h.get("retry_after") or 0)
+            except (TypeError, ValueError):
+                bench_until = 0.0
+        bench_until = max(bench_until,
+                          _opencode_go_persisted_bench_until())
+        benched = bench_until > time.time()
+        # 2. Allowance cache — best-effort, never authoritative over a bench.
+        try:
+            rem = _opencode_go_allowance.get("remaining_usd")
+        except Exception:
+            rem = None
+        if rem is not None:
+            rem = float(rem)
+            entry["used_pct"] = round(
+                max(0.0, min(100.0,
+                             (1.0 - rem / _OPENCODE_GO_INITIAL_ALLOWANCE) * 100.0)), 2)
+            entry["remaining"] = max(0.0, rem)
+            entry["total"] = _OPENCODE_GO_INITIAL_ALLOWANCE
+        depleted = rem is not None and rem <= 0.0
+        if benched or depleted:
+            entry["regime"] = "exhausted"
+            entry["used_pct"] = 100.0
+            entry["remaining"] = 0.0
+            entry["probe_exhausted"] = True
+            if rem is None:
+                entry["total"] = float("inf")
+            if benched:
+                entry["resets_at"] = bench_until
+                entry["error_type"] = (h or {}).get("last_error_type")
+        return entry
+    except Exception:
+        return legacy
+
+
 def _get_provider_cost(name: str, model_id: str) -> float:
     """Look up the combined cost per 1M tokens for a model on a provider.
     Resolution: per-model rate tables → model_matrix.json → real_price_tracker → PPQ_PRICING.
@@ -1974,13 +2099,10 @@ def _snapshot_quota() -> dict:
                 "weekly_tokens": oc_status.get("weekly_tokens", 0),
                 "monthly_tokens": oc_status.get("monthly_tokens", 0),
             }
-        # Per-token providers — effectively unlimited
-        snap["opencode_go"] = {
-            "used_pct": 0.0,
-            "remaining": float("inf"),
-            "total": float("inf"),
-            "regime": "included",
-        }
+        # opencode_go — truthful entry (t_5f82cd0f): breaker bench + allowance
+        # depletion replace the old hardcoded "effectively unlimited" dict that
+        # reported included/Infinity while the lane was 429-benched (drift).
+        snap["opencode_go"] = _opencode_go_quota_entry()
         # NW-API: real /v1/quota (energy allowance + lifetime cost) via the
         # neuralwatt_quota_entry bridge. Falls back to "{used_pct:0.0,
         # remaining:inf}" when the bridge is disabled / no fresh row (current
@@ -5532,6 +5654,9 @@ class Handler(BaseHTTPRequestHandler):
                 _record_spend("opencode_go", og_model, og_tokens)
                 self._spend_recorded = True
                 _mark_key_healthy("opencode_go")
+                # t_5f82cd0f: a live 200 proves the lane recovered — clear the
+                # persisted bench flag so /quota reports headroom again at once.
+                _opencode_go_clear_persisted_bench()
 
                 # Parse allowance_remaining_usd from Go response body for
                 # per-model pressure routing. The field is nested under
@@ -5606,6 +5731,11 @@ class Handler(BaseHTTPRequestHandler):
                 _og_reset_s = _parse_opencode_reset_seconds(_og_err_text)
                 _mark_key_failure("opencode_go", "exhausted",
                                   retry_after_seconds=_og_reset_s)
+                # t_5f82cd0f: persist the upstream-declared window so /quota
+                # stays truthful across proxy restarts (the in-memory breaker
+                # dies with the process; the lane-wiring-audit probes upstream
+                # directly and would re-fire QUOTA_MODEL_DRIFT otherwise).
+                _opencode_go_persist_bench(_og_reset_s)
             elif he.code in (401, 403):
                 # Model-scoped 403 (RegionError): the MODEL is unavailable in
                 # the key's region, but the KEY is fine — glm-5.3, kimi-k3

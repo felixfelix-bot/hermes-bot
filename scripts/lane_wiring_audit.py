@@ -270,7 +270,9 @@ def probe_end_to_end(model: str = "glm-5.2", state: dict | None = None) -> str |
         with urllib.request.urlopen(req, timeout=60) as r:
             prov = r.headers.get("X-Provider")
     except urllib.error.HTTPError as e:
-        prov = e.headers.get("X-Provider")
+        # headers can be None on synthesized/headerless HTTPErrors — never
+        # let the error handler itself raise.
+        prov = (e.headers or {}).get("X-Provider")
     except Exception:
         pass
     if state is not None:
@@ -344,20 +346,46 @@ def _emit_finding(category: str, lane: str, title: str, detail: str,
         tid = None
     findings[key] = {"status": "open", "task_id": tid, "first_seen": now}
     state["findings"] = findings
-    _save_state(state)
+    if not dry_run:
+        _save_state(state)
     print(f"[lane-wiring-audit] {category} {lane}: {detail}")
 
 
-def _resolve_finding(category: str, lane: str, state: dict) -> None:
-    """Mark a finding resolved (broken→ok)."""
+def _resolve_finding(category: str, lane: str, state: dict,
+                     dry_run: bool = False) -> None:
+    """Mark a finding resolved (broken→ok) and tell the open fix task.
+
+    Comments on the open kanban task so the worker/manager sees the condition
+    cleared (verify + close) — closing the loop end-to-end: broken → task →
+    fixed → resolved. Silent (no user surface).
+
+    Dry-run is fully inert: NO kanban comment, NO state persist (t_efc68b73
+    incident 2026-09-09 — the unguarded subprocess posted ~40 duplicate
+    "condition cleared" comments from inside pytest runs, because bare
+    audit(dry_run=True) reloads the real state file where the finding was
+    still open while _save_state no-ops).
+    """
     findings = state.setdefault("findings", {})
     key = f"{category}:{lane}"
-    if findings.get(key, {}).get("status") == "open":
-        findings[key]["status"] = "resolved"
-        findings[key]["resolved_at"] = time.time()
-        state["findings"] = findings
+    rec = findings.get(key, {})
+    if rec.get("status") != "open":
+        return
+    findings[key]["status"] = "resolved"
+    findings[key]["resolved_at"] = time.time()
+    state["findings"] = findings
+    if not dry_run:
         _save_state(state)
-        print(f"[lane-wiring-audit] {category} {lane}: resolved")
+    tid = rec.get("task_id")
+    if tid and not dry_run:
+        try:
+            subprocess.run(
+                ["hermes", "kanban", "--board", "llm-routing", "comment",
+                 tid, f"[lane-wiring-audit] condition cleared {time.strftime('%Y-%m-%d %H:%M')} "
+                      f"— verify + close (auto-resolution)"],
+                env=_hermes_env(), timeout=60, capture_output=True)
+        except Exception:
+            pass
+    print(f"[lane-wiring-audit] {category} {lane}: resolved")
 
 
 def _state_signature(quota: dict, health: dict) -> str:
@@ -536,7 +564,7 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
                           state, dry_run)
             found += 1
         elif h.get("last_error_type") == "dispatch_fail" and has_headroom and probe_code == 200:
-            _resolve_finding("SUSTAINED_DISPATCH_FAIL", lane, state)
+            _resolve_finding("SUSTAINED_DISPATCH_FAIL", lane, state, dry_run)
 
         # QUOTA_MODEL_DRIFT: /quota believes headroom but probe says limited,
         # OR proxy marks exhausted/dead but probe succeeds (stale backoff).
@@ -568,7 +596,7 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
             # Mirror recovered (error cleared or backoff expired) and the lane
             # serves live traffic — resolve the open finding so recurrence
             # detection re-arms instead of latching open forever.
-            _resolve_finding("QUOTA_MODEL_DRIFT", lane, state)
+            _resolve_finding("QUOTA_MODEL_DRIFT", lane, state, dry_run)
 
     # ── COST_LEAK: PAYGO spend while a quota lane idled ─────────────────────
     paygo_tokens = sum(v["tokens"] for k, v in spend.items() if k in PAYGO_LANES)
@@ -592,6 +620,14 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
                           f"healthy idle quota lanes: {','.join(idle)}.",
                           state, dry_run)
             found += 1
+    else:
+        # Leak cleared — PAYGO spend below threshold this window. Resolve any
+        # open COST_LEAK findings so recurrence re-arms instead of latching open
+        # forever (the 2026-09-09 t_efc68b73 latch: the outage ended at the pool
+        # restore, but the finding stayed "open" and held the backoff at 1h).
+        for key in list(findings):
+            if key.startswith("COST_LEAK:") and findings[key].get("status") == "open":
+                _resolve_finding("COST_LEAK", key.split(":", 1)[1], state, dry_run)
 
     # ── Backoff bookkeeping (real runs only; dry-run never mutates) ────────
     if not dry_run:

@@ -98,7 +98,14 @@ signal). The novelty-reset is what makes the 24h ceiling safe: incidents of the
 "lane broken" class always move a failure count or health flag before any
 threshold trips, collapsing the backoff to hourly long before a finding would fire.
 
-`--run-now` forces a pass (operator escape hatch). `--dry-run` never mutates state.
+`--run-now` forces a pass (operator escape hatch). `--dry-run` never mutates
+state. Dry-run is **fully inert**, including the resolve path: when a finding
+clears, `_resolve_finding(dry_run=True)` transitions the in-memory record but
+neither persists state nor posts the kanban "condition cleared" comment —
+only a real (non-dry) pass may write to the board (2026-09-09 t_efc68b73
+incident: the unguarded subprocess posted ~40 duplicate comments from inside
+pytest runs, because bare `audit(dry_run=True)` reloads the real state file
+where the finding was still open).
 
 ## Known heuristic nuance
 

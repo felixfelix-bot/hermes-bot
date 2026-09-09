@@ -2830,6 +2830,34 @@ def _resolve_caller_class(headers) -> str:
     return "internal"
 
 
+def _is_noop_api_call(*, key_name, model, status_code, error, total_tokens) -> bool:
+    """True for the T3 no-op telemetry signature: an api_calls row logging nothing.
+
+    Exactly matches the 37,461 audited no-op rows (docs/noop-call-drop-2026-09-09.md):
+    z.ai ``ours``/``friend`` keys only, zero total tokens, empty model, no HTTP
+    status and no error (2026-08-14→23, 2-11 ms — never reached an upstream LLM;
+    pure logging overhead from the legacy ``best_key()`` rollback path).
+
+    The guard is deliberately scoped to the audited signature's FULL discriminating
+    set (key ∈ ours/friend, total_tokens == 0) so it can NEVER swallow real
+    telemetry: every real forwarded call carries a non-empty model (from the
+    request body) OR a non-null HTTP status (200/4xx/5xx) OR an error string —
+    and any call that genuinely hit upstream reports non-zero tokens. A failure
+    row keeps its model/status/error; a non-z.ai provider key is never touched.
+    """
+    if key_name not in ("ours", "friend"):
+        return False
+    if total_tokens:
+        return False
+    if model is not None and model != "":
+        return False
+    if status_code is not None:
+        return False
+    if error is not None and error != "":
+        return False
+    return True
+
+
 def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   prompt_tokens=0, completion_tokens=0, total_tokens=0,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
@@ -2858,6 +2886,18 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
     _extract_cost() returns (None, None) due to parse failures, missing
     model rates, or unhandled provider branches. Source = 'estimated'.
     """
+    # ── T3 no-op drop (cost-reduction-sprint, t_66d2c01e): skip the insert
+    # for the audited empty telemetry signature (ours/friend key, zero tokens,
+    # no model, no status, no error — see docs/noop-call-drop-2026-09-09.md).
+    # Suppressed at the single chokepoint through which 100% of api_calls rows
+    # flow, so no-op rows are never generated again. Scoped to the exact audited
+    # signature so real/failure telemetry is never suppressed (a call that hit
+    # upstream reports tokens and a model/status/error, and non-z.ai keys are
+    # untouched). Fail-open: only skips the row, never raises.
+    if _is_noop_api_call(
+            key_name=key_name, model=model, status_code=status_code,
+            error=error, total_tokens=total_tokens):
+        return
     # ── Cost safety net: never insert NULL cost_usd for known providers ──
     if cost_usd is None and key_name:
         try:

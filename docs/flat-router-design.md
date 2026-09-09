@@ -443,24 +443,93 @@ sets on forwarded requests):
 
 The class is threaded into `select_provider(..., caller_class=...)`
 (`flat_router.py`). It carries **no cost or ordering weight** — ranking stays
-purely market-based. The ONE decision it drives is the sold-pressure gate.
+purely market-based. It drives exactly TWO availability/pressure decisions:
 
-**The sold 429 gate (the only routing-decision change in P0-3).**
-`flat_router.sold_gate_retry_after(predictions, sold_safety_hours=None)` returns
-`None` (serve) or the `Retry-After` SECONDS a sold request should wait. It
-blocks iff the most-urgent `predict_exhaustion()` window (any non-fallback
-candidate lane the request could route to) has `will_exhaust` true AND
-`exhausts_in_hours < SOLD_SAFETY_HOURS` (default 2, env-overridable
-`SOLD_SAFETY_HOURS`). Retry-After = the remaining headroom converted to seconds
-(`ceil(exhausts_in_hours × 3600)`), so a ~2h headroom yields `Retry-After:
-7200`, never a 2-second retry storm. The decision rides on the returned
-candidate list (`_sold_retry_after` on the first candidate); `zai_proxy._proxy()`
-emits HTTP 429 + `Retry-After` + `X-Provider: sold-gate` and returns WITHOUT
-entering the candidate loop. Internal requests are NEVER gated (no attribute is
-attached), and the gate fails OPEN — a missing/broken predictor degrades to
-serve, never to an infinite 429. Predictions are memoized 60s per provider
-(`_sold_predictions_cached`) so the sold path does not self-HTTP `/quota` per
-candidate per request.
+1. the sold-pressure 429 gate (below), and
+2. the C3 doxed-lane allowlist filter (section 2.11a).
+
+**The sold 429 gate (P0-3).** `flat_router.sold_gate_retry_after(predictions,
+sold_safety_hours=None)` returns `None` (serve) or the `Retry-After` SECONDS a
+sold request should wait. It blocks iff the most-urgent `predict_exhaustion()`
+window (any non-fallback candidate lane the request could route to) has
+`will_exhaust` true AND `exhausts_in_hours < SOLD_SAFETY_HOURS` (default 2,
+env-overridable `SOLD_SAFETY_HOURS`). Retry-After = the remaining headroom
+converted to seconds (`ceil(exhausts_in_hours × 3600)`), so a ~2h headroom
+yields `Retry-After: 7200`, never a 2-second retry storm. The decision rides
+on the returned candidate list (`_sold_retry_after` on the first candidate);
+`zai_proxy._proxy()` emits HTTP 429 + `Retry-After` + `X-Provider: sold-gate`
+and returns WITHOUT entering the candidate loop. Internal requests are NEVER
+gated (no attribute is attached), and the gate fails OPEN — a missing/broken
+predictor degrades to serve, never to an infinite 429. Predictions are
+memoized 60s per provider (`_sold_predictions_cached`) so the sold path does
+not self-HTTP `/quota` per candidate per request.
+
+### 2.11a C3 doxed-lane allowlist filter (2026-09-09)
+
+Operator override 2026-09-09 (docs/opsec-dox-status-log.md): the doxed lanes
+were re-enabled for INTERNAL use — their free included quota (ollama ~96%
+headroom) was idling while ~$40/day flowed to PAYGO lanes. Constraint:
+**internal-only**. Sold traffic must NEVER touch these accounts — a doxed
+upstream is an opsec exposure for the public sell chain, not a market
+participant. Before this filter, the P0-3 sold gate was only a
+quota-exhaustion 429 guard and did not filter lane identity — plan
+inference-routing-remediation C3 flagged that gap as an ACTIVE EXPOSURE
+(sold traffic could reach re-enabled doxed lanes) and required this filter
+as defense-in-depth before any routstr/sold re-enable.
+
+**Mechanism.** `flat_router.DOXED_PROVIDERS` — a `frozenset` of the opsec
+log's 6 flagged lanes:
+
+- `ollama_cloud`, `ollama_cloud_2`, `ollama_cloud_3`, `ollama_cloud_4`
+- `openrouter`
+- `telnyx`
+
+In `select_provider()`, the candidate-build loop applies the filter at step
+**0** — before the model filter, health gate, and every price-based gate:
+
+```python
+if caller_class == "sold" and not _sold_lane_allowed(name):
+    continue
+```
+
+Design properties:
+
+- **Hard availability filter, not a price multiplier.** No amount of market
+  pressure (a doxed lane being the cheapest or the ONLY remaining candidate)
+  may route a sold request onto a doxed account. If the sold pool for a model
+  becomes empty after the filter, the existing fallback candidate (clean 503
+  path) serves — the same behavior as any other empty pool.
+- **Inert for internal.** `caller_class="internal"` (the default) never
+  consults the filter — internal traffic keeps the full pool, which is the
+  operator's intent (free included quota for own workload).
+- **Fail-open on broken comparisons** (`_sold_lane_allowed` never raises);
+  unknown lane names pass through to the remaining gates (health, catalog,
+  cost) unchanged.
+- **deepinfra is NOT in the set** — it is operator-excluded (believed doxed)
+  but tracked separately (efficiency-monitor side); C3 implements the opsec
+  log's 6 flagged lanes exactly.
+- **Wiring unchanged.** No zai_proxy.py change: `caller_class` was already
+  threaded from `_resolve_caller_class` (L2678) through `_proxy` (L6183,
+  L6320) into `select_provider`. The filter rides the existing parameter.
+
+**Tests.** `tests/test_caller_class_gate.py` — `TestDoxedLaneFilter*`
+(deterministic: all live gates monkeypatched, pools compared against
+`PROVIDER_MODELS` registry membership):
+
+- sold pool NEVER contains a doxed lane, across every registry model;
+- sold pool is EXACTLY (registry servers) minus (doxed) — no over-blocking;
+- clean lanes (deepseek, chutes, ours, friend, opencode_go, ppq, neuralwatt)
+  stay sold-reachable;
+- sole-doxed-provider model → sold gets the clean 503 fallback, internal
+  still gets the lane;
+- internal pool equals the FULL registry (filter inert);
+- health gate still applies on top of the doxed filter (no gate weakening).
+
+**Rollback.** The filter is a pure in-function check on a module constant —
+remove `DOXED_PROVIDERS` members (or the step-0 check) to revert. No flag
+file needed; a one-line revert commit restores pre-C3 behavior. To
+temporarily re-admit a lane for sold traffic, delete it from the set (and
+update the registry test).
 
 ---
 

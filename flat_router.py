@@ -917,6 +917,43 @@ def _sold_safety_hours_default() -> float:
 
 SOLD_SAFETY_HOURS = _sold_safety_hours_default()
 
+
+# ── C3 doxed-lane allowlist filter (PLAN inference-routing-remediation
+# C3, task t_f36fc1ef, 2026-09-09) ──────────────────────────────────────────
+# Operator override 2026-09-09 (docs/opsec-dox-status-log.md): the doxed
+# lanes are re-enabled for INTERNAL use — their free included quota was
+# idling while ~$40/day flowed to PAYGO. Constraint: INTERNAL-ONLY. Sold
+# traffic (routstr public sell lane through tag-sidecar) must NEVER touch
+# these accounts — doxed upstreams are an opsec exposure, not a market
+# participant. This is a hard lane-availability filter at the
+# candidate-build step, deliberately NOT a price multiplier: no amount of
+# market pressure may route a sold request onto a doxed account.
+#
+# The set is the opsec log's 6 flagged lanes. deepinfra is operator-EXCLUDED
+# (believed doxed) but has NO flag and is NOT in this set — C3 follows the
+# task's 6-lane definition exactly; deepinfra's exclusion is tracked
+# separately (efficiency-monitor / maintainer-side operator decision).
+
+#: Lanes that may serve INTERNAL traffic ONLY — never returned for
+#: caller_class="sold", whatever their price or health.
+DOXED_PROVIDERS: frozenset[str] = frozenset({
+    "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4",
+    "openrouter", "telnyx",
+})
+
+
+def _sold_lane_allowed(name: str) -> bool:
+    """True when ``name`` may appear in a SOLD candidate pool.
+
+    False ONLY for the doxed lanes (opsec allowlist). Internal callers never
+    consult this — the filter is inert for caller_class="internal". Never
+    raises; unknown lane names are allowed (fail-open to the rest of the
+    router's gates: health/cost/catalog still apply)."""
+    try:
+        return name not in DOXED_PROVIDERS
+    except Exception:
+        return True  # never block routing on a broken comparison
+
 #: TTL for the sold-gate prediction memo. predict_exhaustion() performs a
 #: self-HTTP GET to /quota plus a burn-history DB read per provider, so the
 #: request path must NOT call it per candidate per request (zai_proxy's own
@@ -1187,6 +1224,18 @@ def select_provider(
         candidates: list[ProviderCandidate] = []
 
         for name, models in PROVIDER_MODELS.items():
+            # 0. C3 doxed-lane allowlist — sold traffic NEVER sees a doxed
+            # lane, whatever its price/health. A doxed account is an opsec
+            # exposure for the public sell chain, not a market participant:
+            # this is lane availability, so it runs BEFORE every price-based
+            # gate (a doxed lane must not even influence cost evaluation).
+            # Inert for internal (the default and the operator's intent —
+            # doxed included quota is free internal capacity). Runs first so
+            # a broken comparison can never re-admit a doxed lane through a
+            # later gate.
+            if caller_class == "sold" and not _sold_lane_allowed(name):
+                continue
+
             # 1. Model filter — only providers that can serve this model
             if model_id not in models:
                 # Exact match only — model translation happens at dispatch time.

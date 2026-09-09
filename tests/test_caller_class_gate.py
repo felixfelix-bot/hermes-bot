@@ -291,3 +291,177 @@ class TestCallerClassClassification:
         from zai_proxy import _resolve_caller_class
         headers = {"X-Priority": "SOLD"}
         assert _resolve_caller_class(headers) == "sold"
+
+
+# ── C3 doxed-lane allowlist filter (PLAN inference-routing-remediation C3,
+# task t_f36fc1ef, 2026-09-09) ───────────────────────────────────────────────
+#
+# Sold traffic must NEVER be routed to a doxed lane, even when the doxed lane
+# is the cheapest or ONLY candidate for the model. Internal traffic keeps
+# full pool access (operator override 2026-09-09: doxed lanes re-enabled for
+# internal use — free included quota instead of ~$40/day PAYGO bleed).
+
+#: The doxed lane set (docs/opsec-dox-status-log.md — the 6 flagged keys).
+#: Kept in sync with flat_router.DOXED_PROVIDERS by the registry test below.
+_DOXED_LANES = {
+    "ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4",
+    "openrouter", "telnyx",
+}
+
+
+def _force_static_pool(monkeypatch):
+    """Make select_provider() fully deterministic: every gate that consults
+    live state (health, live-catalog, exhaust weight, garbage multiplier,
+    sold-gate predictions, effective cost) is patched to a constant so the
+    candidate pool is EXACTLY the PROVIDER_MODELS registry membership."""
+    monkeypatch.setattr(fr, "_is_provider_healthy", lambda name: True)
+    monkeypatch.setattr(fr, "_passes_live_catalog_guard",
+                        lambda provider, model_id: True)
+    monkeypatch.setattr(fr, "_apply_exhaust_weight",
+                        lambda name, cost: cost)
+    monkeypatch.setattr(fr, "_garbage_mult_or_one",
+                        lambda name, model: 1.0)
+    monkeypatch.setattr(fr, "_sold_pool_predictions", lambda candidates: [])
+    monkeypatch.setattr(fr, "_get_effective_cost",
+                        lambda name, model_id, difficulty: 1.0)
+
+
+def _pool(model, caller_class="internal"):
+    """Candidate lane-name set (fallback excluded) for a request."""
+    cands = select_provider(model=model, caller_class=caller_class)
+    return {c.name for c in cands if c.name != "fallback"}
+
+
+def _registry_servers(model):
+    """Lanes whose PROVIDER_MODELS entry lists ``model`` (live module)."""
+    return {lane for lane, models in fr.PROVIDER_MODELS.items()
+            if model in models}
+
+
+class TestDoxedLaneFilterRegistry:
+    def test_doxed_lane_constant_exists(self):
+        """DOXED_PROVIDERS is exported and is a set of lane names."""
+        assert hasattr(fr, "DOXED_PROVIDERS")
+        assert isinstance(fr.DOXED_PROVIDERS, (set, frozenset))
+
+    def test_doxed_lane_constant_matches_opsec_log(self):
+        """The constant must list exactly the 6 doxed lanes from the opsec
+        log (ollama_cloud 1-4, openrouter, telnyx)."""
+        assert set(fr.DOXED_PROVIDERS) == _DOXED_LANES
+
+    def test_sold_lane_allowed_never_raises(self, monkeypatch):
+        """The allowlist check fails OPEN on a broken comparison: a
+        non-hashable/uncomparable name must never raise into routing and
+        never block the lane (the remaining gates still apply)."""
+        monkeypatch.setattr(fr, "DOXED_PROVIDERS", ["ollama_cloud"])
+        # list.__contains__ with a set arg raises TypeError -> fail-open
+        assert fr._sold_lane_allowed({"unhashable": 1}) is True
+        assert fr._sold_lane_allowed("ollama_cloud") is False
+        monkeypatch.setattr(fr, "DOXED_PROVIDERS", None)
+        assert fr._sold_lane_allowed("anything") is True
+
+
+class TestDoxedLaneFilterSold:
+    """caller_class='sold' NEVER receives a doxed candidate."""
+
+    def test_sold_pool_has_no_doxed_lanes(self, monkeypatch):
+        """Across every registry model, the sold pool contains zero doxed
+        lanes — the filter DROPS them, not re-orders them."""
+        _force_static_pool(monkeypatch)
+        for model in sorted({m for models in fr.PROVIDER_MODELS.values()
+                             for m in models}):
+            leaked = _pool(model, "sold") & _DOXED_LANES
+            assert not leaked, (
+                f"sold pool for {model!r} leaked doxed lane(s) "
+                f"{sorted(leaked)}")
+
+    def test_sold_pool_is_exactly_the_clean_lanes(self, monkeypatch):
+        """With every gate forced open, the sold pool for a model is EXACTLY
+        (registry servers of that model) minus (doxed lanes) — no more, no
+        less: the filter neither over-blocks clean lanes nor misses doxed
+        ones."""
+        _force_static_pool(monkeypatch)
+        for model in ("glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash"):
+            expected = _registry_servers(model) - _DOXED_LANES
+            assert expected, f"test model {model!r} has no clean lane?"
+            assert _pool(model, "sold") == expected
+
+    def test_sold_clean_lanes_still_reachable(self, monkeypatch):
+        """The plan's clean-lane regression set (deepseek, chutes, ours,
+        friend, opencode_go, ppq, neuralwatt) stays reachable by sold for
+        models they serve."""
+        _force_static_pool(monkeypatch)
+        sold_flash = _pool("deepseek/deepseek-v4-flash", "sold")
+        assert "deepseek" in sold_flash, "clean lane deepseek lost"
+        assert "chutes" in sold_flash, "clean lane chutes lost"
+        assert "opencode_go" in sold_flash, "clean lane opencode_go lost"
+        assert "ppq" in sold_flash, "clean lane ppq lost"
+        assert "neuralwatt" in sold_flash, "clean lane neuralwatt lost"
+        sold_glm = _pool("glm-5.2", "sold")
+        assert {"ours", "friend", "opencode_go", "ppq"} <= sold_glm
+
+    def test_sold_sole_doxed_provider_yields_fallback_only(self, monkeypatch):
+        """When a doxed lane is the ONLY provider for a model (registry
+        patched to just that lane), a sold request yields NO candidates —
+        the fallback (clean 503) path, never the doxed lane. An internal
+        request for the same model still gets the lane."""
+        _force_static_pool(monkeypatch)
+        orig = fr.PROVIDER_MODELS
+        try:
+            fr.PROVIDER_MODELS = {"ollama_cloud": set(orig["ollama_cloud"])}
+            assert _pool("glm-5.2", "sold") == set()
+            cands = select_provider(model="glm-5.2", caller_class="sold")
+            assert [c.name for c in cands] == ["fallback"]
+            assert _pool("glm-5.2", "internal") == {"ollama_cloud"}
+        finally:
+            fr.PROVIDER_MODELS = orig
+
+
+class TestDoxedLaneFilterInternal:
+    """caller_class='internal' keeps the doxed lanes (operator override
+    2026-09-09: free included quota for internal use)."""
+
+    def test_internal_pool_keeps_doxed_lanes(self, monkeypatch):
+        """Forced-healthy internal pool contains every REGISTERED doxed lane
+        that serves the model (ollama_cloud_4 has no registry entry yet —
+        its filter coverage is the constant-level test above)."""
+        _force_static_pool(monkeypatch)
+        for model in ("glm-5.2", "kimi-k3"):
+            expected_doxed = _registry_servers(model) & _DOXED_LANES
+            assert expected_doxed, f"model {model!r} serves no doxed lane?"
+            assert expected_doxed <= _pool(model, "internal"), (
+                f"internal pool for {model!r} lost doxed lanes "
+                f"{sorted(expected_doxed - _pool(model, 'internal'))}")
+
+    def test_internal_pool_equals_full_registry(self, monkeypatch):
+        """The filter is INERT for internal: pool == all registry servers."""
+        _force_static_pool(monkeypatch)
+        for model in ("glm-5.2", "kimi-k3", "deepseek/deepseek-v4-flash"):
+            assert _pool(model, "internal") == _registry_servers(model)
+
+    def test_default_caller_class_is_unfiltered(self, monkeypatch):
+        """The default caller_class (internal) applies no doxed filter."""
+        _force_static_pool(monkeypatch)
+        assert _pool("kimi-k3") == _registry_servers("kimi-k3")
+
+
+class TestDoxedLaneFilterLiveGates:
+    """The doxed filter must not weaken the OTHER gates: an unhealthy doxed
+    lane stays excluded for internal, and a healthy clean lane still passes
+    health for sold (filter ordering interplay)."""
+
+    def test_unhealthy_doxed_lane_excluded_for_internal(self, monkeypatch):
+        _force_static_pool(monkeypatch)
+        monkeypatch.setattr(
+            fr, "_is_provider_healthy",
+            lambda name: name != "ollama_cloud")
+        assert "ollama_cloud" not in _pool("glm-5.2", "internal")
+
+    def test_health_gate_still_applies_to_sold_clean_lanes(self, monkeypatch):
+        _force_static_pool(monkeypatch)
+        monkeypatch.setattr(
+            fr, "_is_provider_healthy",
+            lambda name: name != "opencode_go")
+        assert "opencode_go" not in _pool("glm-5.2", "sold")
+        assert "opencode_go" not in _pool("glm-5.2", "internal")
+

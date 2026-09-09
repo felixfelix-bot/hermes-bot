@@ -482,6 +482,7 @@ def test_emit_finding_creates_only_on_transition():
     state = {"findings": {}}
     with mock.patch.object(_MOD, "_save_state"), \
          mock.patch.object(_MOD, "_db_conn"), \
+         mock.patch.object(_MOD, "subprocess"), \
          mock.patch.object(_MOD, "_create_fix_task", return_value="t_deadbeef") as create:
         _MOD._emit_finding("COST_LEAK", "ollama_cloud", "t", "d", state, dry_run=False)
         # second call with same key → status open → should NOT create again
@@ -717,6 +718,55 @@ def test_emit_finding_recurrence_comments_on_open_task():
     create.assert_not_called()
     assert sp.run.called
     assert "still broken" in sp.run.call_args[0][0][6]
+
+
+def test_sustained_dispatch_fail_resolves_with_dry_run_threaded():
+    # Mirror of the QUOTA_MODEL_DRIFT/COST_LEAK resolve-arg tests: if someone
+    # drops the dry_run arg at the SUSTAINED_DISPATCH_FAIL call site, the
+    # resolve mock sees the old 3-arg signature and this goes red.
+    quota = _quota(("ollama_cloud_2", True))
+    open_finding = {"SUSTAINED_DISPATCH_FAIL:ollama_cloud_2": {
+        "status": "open", "task_id": "t_efc68b73", "first_seen": 1}}
+    # failure_count NOT climbing (fc_prev seeded from state) → emit's climbing
+    # guard fails → falls to the resolve elif, which resolves the open finding
+    # with dry_run threaded (True) — this is the branch whose args no test
+    # previously asserted.
+    state = {"findings": dict(open_finding), "failure_counts": {"ollama_cloud_2": 9}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health",
+                           return_value=_health(ollama_cloud_2={
+                               "failure_count": 9,
+                               "last_error_type": "dispatch_fail"})), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value=None), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    emit.assert_not_called()
+    resolve.assert_called_once_with("SUSTAINED_DISPATCH_FAIL", "ollama_cloud_2",
+                                    state, True)
+    # failure_count >= threshold AND climbing (fc_prev < fc_now) → emit fires,
+    # resolve does not (the if-branch wins the elif)
+    state2 = {"findings": dict(open_finding),
+              "failure_counts": {"ollama_cloud_2": 29}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health",
+                           return_value=_health(ollama_cloud_2={
+                               "failure_count": 30,
+                               "last_error_type": "dispatch_fail"})), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value=None), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state2)
+    emit.assert_called_once()
+    resolve.assert_not_called()
 
 
 def test_emit_finding_dry_run_no_persist_no_task():

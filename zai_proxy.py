@@ -2553,6 +2553,54 @@ def _will_exhaust(predictions: list[dict]) -> dict | None:
     return None
 
 
+def _extract_cache_read_tokens(usage: dict | None) -> int:
+    """Return how many PROMPT tokens were served from the provider's prompt
+    cache, resolving both OpenAI-compatible usage shapes. 0 when absent.
+
+    Cost-audit (T4): DeepSeek discounts cached prefixes ~10x and NW charges
+    real prefill compute, so the cached-vs-uncached prompt split drives a
+    large cost delta.  We persist exactly what the upstream reports:
+
+      * ``usage.cache_read_input_tokens``           — Anthropic/z.ai style
+      * ``usage.prompt_tokens_details.cached_tokens`` — OpenAI standard
+
+    When both are present the top-level ``cache_read_input_tokens`` wins (
+    it is the source of truth on Anthropic-compatible responses). Never
+    raises; never returns None.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        top = usage.get("cache_read_input_tokens")
+        if isinstance(top, int):
+            return max(top, 0)
+        if isinstance(top, float):
+            return max(int(top), 0)
+    except Exception:
+        pass
+    try:
+        details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            return 0
+        cached = details.get("cached_tokens") or 0
+        return max(int(cached), 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _ensure_api_calls_cached_tokens(conn: sqlite3.Connection) -> None:
+    """Backwards-safe migration: add the ``cached_tokens`` column to
+    ``api_calls``. Idempotent (guarded ALTER — duplicate-column error is
+    swallowed). Never rewrites existing rows — historical rows keep the
+    DEFAULT 0 because the split was never observed before this migration.
+    Mirrors the session_id / task_type guarded-ALTER pattern."""
+    try:
+        conn.execute("ALTER TABLE api_calls ADD COLUMN cached_tokens INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already migrated
+
+
 def _usage_db() -> sqlite3.Connection:
     """Lazy WAL-mode connection to the usage DB; creates schema on first call.
     Double-checked-locked singleton. Returns the shared autocommit connection."""
@@ -2585,8 +2633,17 @@ def _usage_db() -> sqlite3.Connection:
             cost_usd REAL DEFAULT NULL,
             cost_source TEXT DEFAULT NULL,
             session_id TEXT DEFAULT NULL,
-            task_type TEXT DEFAULT NULL
+            task_type TEXT DEFAULT NULL,
+            cached_tokens INTEGER DEFAULT 0
         )""")
+        # ── T4 cached-token split (cost-reduction-sprint) ─────────────────
+        # Same guarded-ALTER pattern as session_id/task_type: legacy DBs get
+        # the nullable cached_tokens column added on connect (defaulting to 0
+        # — the split was never observed before this migration). NO backfill —
+        # historical rows keep 0 by design because the value was never known
+        # (see docs/cached-tokens-instrumentation.md). Fresh DBs get it via
+        # the CREATE TABLE above.
+        _ensure_api_calls_cached_tokens(conn)
         conn.execute("""CREATE TABLE IF NOT EXISTS key_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts REAL NOT NULL,
@@ -2835,7 +2892,7 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
                   tier=None, cache_hit=0, ollama_hit=0, ppq_hit=0,
                   status_code=None, error=None, duration_ms=None,
                   cost_usd=None, cost_source=None, session_id=None,
-                  task_type=None):
+                  task_type=None, cached_tokens=0):
     """Log one API call event. Swallows all errors — logging must never break a request.
 
     cost_usd / cost_source (RP-2): the real $ cost of this call and how it was
@@ -2851,6 +2908,13 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
     type, from the X-Task-Type header (wins) or the body task_type field.
     NULL when unset/unknown — NEVER guessed. Threaded into EVERY logging
     site (z.ai primary, ollama_cloud, telnyx, external failover hops).
+
+    cached_tokens (T4, cost-reduction-sprint): the number of PROMPT tokens
+    the provider served from its prompt cache (usage.cache_read_input_tokens
+    or usage.prompt_tokens_details.cached_tokens; 0 when absent). Persisted
+    to the dedicated api_calls.cached_tokens column so cost analytics can
+    price cached vs uncached prompt tokens differently (DeepSeek discounts
+    cached prefixes ~10x). Defaults to 0.
 
     COST SAFETY NET: if cost_usd is None and key_name is a known provider,
     an estimated cost is computed via _estimate_cost_usd() before insert.
@@ -2876,10 +2940,10 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
             "INSERT INTO api_calls (ts, key_name, key_suffix, model, prompt_tokens, "
             "completion_tokens, total_tokens, tier, cache_hit, ollama_hit, ppq_hit, "
             "status_code, error, duration_ms, cost_usd, cost_source, session_id, "
-            "task_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "task_type, cached_tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), key_name, key_suffix, model, prompt_tokens, completion_tokens,
              total_tokens, tier, cache_hit, ollama_hit, ppq_hit, status_code, error,
-             duration_ms, cost_usd, cost_source, session_id, task_type))
+             duration_ms, cost_usd, cost_source, session_id, task_type, cached_tokens))
     except Exception:
         # Fallback 1: task_type column absent (DB predates the CG-5
         # migration) — retry without task_type (it is nullable telemetry;
@@ -5391,6 +5455,7 @@ class Handler(BaseHTTPRequestHandler):
                     cost_usd=_oc_cost, cost_source=_oc_cost_src,
                     session_id=getattr(self, "_session_id", None),
                     task_type=getattr(self, "_task_type", None),
+                    cached_tokens=_extract_cache_read_tokens(ollama_usage),
                 )
                 # Log key decision so dashboard shows the switch to ollama_cloud
                 _log_key_decision(
@@ -5712,6 +5777,7 @@ class Handler(BaseHTTPRequestHandler):
                     cost_usd=_og_cost, cost_source=_og_cost_src,
                     session_id=getattr(self, "_session_id", None),
                     task_type=getattr(self, "_task_type", None),
+                    cached_tokens=_extract_cache_read_tokens(og_usage),
                 )
                 _log_key_decision(
                     chosen_key="opencode_go",
@@ -5907,6 +5973,7 @@ class Handler(BaseHTTPRequestHandler):
                     cache_hit=_telnyx_cached,
                     session_id=getattr(self, "_session_id", None),
                     task_type=getattr(self, "_task_type", None),
+                    cached_tokens=_telnyx_cached,
                 )
                 _log_key_decision(
                     chosen_key="telnyx",
@@ -6023,6 +6090,7 @@ class Handler(BaseHTTPRequestHandler):
                         cost_usd=ext_cost, cost_source=ext_src,
                         session_id=getattr(self, "_session_id", None),
                         task_type=getattr(self, "_task_type", None),
+                        cached_tokens=_extract_cache_read_tokens(ext_usage),
                     )
                     return True
             except urllib.error.HTTPError as he:
@@ -6245,6 +6313,7 @@ class Handler(BaseHTTPRequestHandler):
                             cost_usd=ext_cost_usd, cost_source=ext_cost_source,
                             cache_hit=_ext_cached,
                             session_id=getattr(self, "_session_id", None),
+                            cached_tokens=_ext_cached,
                             task_type=getattr(self, "_task_type", None),
                         )
                         # Log key decision so dashboard shows the failover switch
@@ -6618,6 +6687,8 @@ class Handler(BaseHTTPRequestHandler):
                                     cost_source=_cost_src if '_cost_src' in dir() else None,
                                     session_id=getattr(self, "_session_id", None),
                                     task_type=getattr(self, "_task_type", None),
+                                    cached_tokens=_extract_cache_read_tokens(
+                                        _usage) if '_usage' in dir() else 0,
                                 )
                         except Exception:
                             pass
@@ -7246,6 +7317,10 @@ class Handler(BaseHTTPRequestHandler):
             _zai_tokens = int(usage.get("total_tokens") or 0)
             _zai_cost, _zai_cost_src = _extract_cost(
                 key_used, bytes(response_buffer), _zai_tokens)
+            # T4: cached-token split — how many prompt tokens came from the
+            # upstream prompt cache (persisted for cost analytics). Always 0
+            # when the provider didn't report the split.
+            _zai_cached = _extract_cache_read_tokens(usage)
             _log_api_call(
                 key_name=key_used, key_suffix=suffix, model=model,
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
@@ -7256,6 +7331,7 @@ class Handler(BaseHTTPRequestHandler):
                 cost_usd=_zai_cost, cost_source=_zai_cost_src,
                 session_id=getattr(self, "_session_id", None),
                 task_type=getattr(self, "_task_type", None),
+                cached_tokens=_zai_cached,
             )
             if not getattr(self, '_spend_recorded', False):
                 _record_spend(key_used, model, _zai_tokens)

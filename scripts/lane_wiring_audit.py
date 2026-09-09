@@ -564,7 +564,7 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
             found += 1
         elif probe_code == 200 and has_headroom \
                 and f"QUOTA_MODEL_DRIFT:{lane}" in findings \
-                and findings.get(f"QUOTA_MODEL_DRIFT:{lane}", {}).get("status") == "open":
+                and findings[f"QUOTA_MODEL_DRIFT:{lane}"].get("status") == "open":
             # Mirror recovered (error cleared or backoff expired) and the lane
             # serves live traffic — resolve the open finding so recurrence
             # detection re-arms instead of latching open forever.

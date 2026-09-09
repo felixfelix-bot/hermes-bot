@@ -49,8 +49,9 @@ backoff 2s, expired 09:59:05; self-healed by the proxy's server-truth recovery
 heuristic at 10:02:53). The audit read the stale mirror at 10:00:39 — 94s after
 the backoff expired — and scheduled a fix task for a lane that was already back
 in rotation. With the fix, that shape no longer fires; it instead **resolves**
-an open drift finding once the mirror shows no active bench and the lane
-probes 200 (previously the finding latched open forever — no resolve path).
+an open drift finding once the mirror shows no active bench, the lane probes
+200, and quota headroom exists (previously the finding latched open forever —
+no resolve path).
 
 ### Handling (operator directive 2026-09-09)
 

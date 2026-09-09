@@ -57,8 +57,12 @@ def fake_usage_db(monkeypatch):
         "ppq_hit INTEGER, status_code INTEGER, error TEXT, duration_ms INTEGER, "
         "cost_usd REAL, cost_source TEXT, session_id TEXT, task_type TEXT)"
     )
+    # Patch the PINNED module object directly (not by string name). Other test
+    # files in this suite replace sys.modules["zai_proxy"] mid-run (see
+    # conftest.py), so a string-based patch would hit the wrong object and the
+    # pinned _log_api_call would still use the real _usage_db.
     monkeypatch.setattr(
-        "zai_proxy._usage_db", lambda: conn, raising=False
+        zai_proxy, "_usage_db", lambda: conn, raising=False
     )
 
     class _Capture:

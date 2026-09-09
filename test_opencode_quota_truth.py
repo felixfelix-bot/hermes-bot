@@ -27,6 +27,15 @@ These tests pin the fixed contract for `_opencode_go_quota_entry()`:
 Import strategy: load the LIVE ~/.hermes/bot/zai_proxy.py by explicit path
 (same pattern as test_flat_router.py) — the module runs no servers on import
 and all state under test is plain module-level dicts we set directly.
+
+Hermeticity (kimi cold-review minor 1, t_5f82cd0f run 67): the builder reads
+the REAL ~/.hermes/bot/.opencode_go_exhausted_until at call time, so while the
+lane is genuinely benched (Sep 2026 monthly 429) the live flag exists and any
+test expecting "included" fails (4/14 observed RED with the live flag).
+conftest.py carries the suite-wide autouse fixture that monkeypatches
+_OPENCODE_GO_BENCH_FLAG (on every loaded zai_proxy copy) to a per-test
+tmp_path — the flag helpers resolve the module global at call time, so the
+patch covers persist/clear/read for every test, live flag or not.
 """
 from __future__ import annotations
 import importlib.util
@@ -34,13 +43,25 @@ import math
 import os
 import sys
 import time
-from pathlib import Path
 
 BOT = os.path.expanduser("~/.hermes/bot")
 _SPEC = importlib.util.spec_from_file_location("zai_proxy", os.path.join(BOT, "zai_proxy.py"))
 zp = importlib.util.module_from_spec(_SPEC)
 sys.modules["zai_proxy"] = zp
+# Unique registry key for THIS module object: test_ollama_quota_shadowing's
+# live_zai_proxy() fixture REPLACES sys.modules["zai_proxy"] mid-suite, which
+# orphans this object — conftest.py walks sys.modules.values() to find every
+# loaded copy (including this one via the unique key) so the per-test flag
+# monkeypatch reaches it regardless of who owns the canonical name.
+sys.modules["_zai_proxy_opencode_quota_truth"] = zp
 _SPEC.loader.exec_module(zp)
+
+# Hermeticity: conftest.py's suite-wide autouse fixture monkeypatches
+# zp._OPENCODE_GO_BENCH_FLAG to a per-test tmp_path (single mechanism for the
+# whole suite — it also protects the sibling test_user_agent_headers.py
+# 200-mock tests, whose _try_opencode_go success path would otherwise UNLINK
+# the live flag). _flag_path() below resolves the module global at call time
+# so it follows the patch.
 
 LEGACY_SHAPE = {"used_pct": 0.0, "remaining": float("inf"), "total": float("inf"),
                 "regime": "included"}
@@ -191,7 +212,10 @@ def test_builder_fails_open():
 # Same fix shape as the ollama paywall _ollama_exhausted_until flag.
 
 def _flag_path():
-    return Path.home() / ".hermes" / "bot" / ".opencode_go_exhausted_until"
+    # Resolve the MODULE global at call time so the autouse hermeticity
+    # fixture (monkeypatch of zp._OPENCODE_GO_BENCH_FLAG) is honoured —
+    # hardcoding Path.home()/... here would desync from the module under test.
+    return zp._OPENCODE_GO_BENCH_FLAG
 
 
 def _clear_flag():

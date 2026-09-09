@@ -51,16 +51,18 @@ no history.
 
 ## Checklist
 
-- [ ] Write plan markdown (this file)
-- [ ] `burn_attribution.py`: add `task_cost_rollup` table + UPSERT before purge
-- [ ] Backfill rollup: run `burn_attribution.py --since 35d`
-- [ ] `kanban_viz.py`: `scan_boards()` + daily time-series builders
-- [ ] `kanban_viz.py`: `load_task_cost()` from `task_cost_rollup`
-- [ ] `kanban_viz.py`: renderers burnup / state-stacked / throughput / cost-per-task
-- [ ] `kanban_viz.py`: `render_ascii()` digest block + `render_all()` + `__main__`
-- [ ] `send-viz-signal.sh`: append kanban ASCII + attach kanban PNGs to digest
-- [ ] Crontab: hourly `kanban_viz.py` entry
-- [ ] `test_kanban_viz.py`: time-series math, top-N collapsing, rollup idempotency,
+- [x] Write plan markdown (this file)
+- [x] `burn_attribution.py`: add `task_cost_rollup` table + UPSERT before purge
+- [x] Backfill rollup: run `burn_attribution.py --since 35d` (running in
+      background; rollup pre-populated from the live attribution table)
+- [x] `kanban_viz.py`: `scan_boards()` + daily time-series builders
+- [x] `kanban_viz.py`: `load_task_cost()` from `task_cost_rollup`
+- [x] `kanban_viz.py`: renderers burnup / state-stacked / throughput / cost-per-task
+- [x] `kanban_viz.py`: `render_ascii()` digest block + `render_all()` + `__main__`
+- [x] `send-viz-signal.sh`: append kanban ASCII + attach kanban PNGs to digest
+- [x] Crontab: hourly `kanban_viz.py` entry
+- [x] `test_kanban_viz.py`: time-series math, top-N collapsing, rollup idempotency,
       render_all graceful on empty data
-- [ ] Run `kanban_viz.py`; verify 4 PNGs + ASCII render
-- [ ] Run `test_kanban_viz.py` + viz regression tests
+- [x] Run `kanban_viz.py`; verify 4 PNGs + ASCII render
+- [x] Run `test_kanban_viz.py` + viz regression tests
+

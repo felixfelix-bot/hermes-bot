@@ -1,17 +1,21 @@
 """Tests for T3 no-op API-call drop (cost-reduction-sprint, t_66d2c01e).
 
 Writes the failing test FIRST (Gate 1, TDD) against the drop predicate +
-`_log_api_call` guard. The predicate and guard do not exist yet, so importing
-`_is_noop_api_call` from zai_proxy fails → RED. After the implementation the
-same assertions pass → GREEN.
+`_log_api_call` guard. The predicate and guard do not exist at the start, so
+importing `_is_noop_api_call` from zai_proxy fails → RED. After the
+implementation the same assertions pass → GREEN.
 
 The no-op signature (characterized from zai_usage.db, see
 docs/noop-call-drop-2026-09-09.md, tightened per cold-review CHANGES_REQUESTED
-2026-09-09): a row with `key_name IN ('ours','friend')` AND `total_tokens=0`
-AND empty model AND no status_code AND no error. 37,461 such historical rows
-(2026-08-14→23), 2-11 ms (never reached upstream). We drop ONLY this exact
-signature so genuine failure/exhaustion telemetry (model-less bodies on the
-503/404 paths with a real key, or non-z.ai providers) is never suppressed.
+2026-09-09 and round-2 execution review 2026-09-09): a row with
+`key_name IN ('ours','friend')` AND `total_tokens=0` AND empty model AND no
+status_code AND no error AND a SHORT duration (<= 50ms). The duration guard is
+the round-2 fix: the real 503 "all providers exhausted" path and the non-chat
+404 path leave status_code/error as None (they never assign the local
+variables), so key+tokens+model alone is NOT a safe discriminator — but those
+real failure paths always take >50ms (they cycle providers / make upstream
+attempts), whereas the pure-logging no-op class is 2-11ms. Only the fast
+no-op class is dropped; slow/real failure rows always survive.
 """
 import sqlite3
 import sys
@@ -67,70 +71,104 @@ def fake_usage_db(monkeypatch):
 # ── Drop predicate (the pure decision) ──────────────────────────────────────
 
 class TestNoopPredicate:
-    def test_drop_ours_friend_empty_full_signature(self):
-        """Audited no-op: ours/friend key, zero tokens, no model/status/error."""
+    def test_drop_fast_ours_friend_empty_full_signature(self):
+        """Audited no-op: ours/friend key, zero tokens, no model/status/error,
+        short duration (2-11ms class)."""
         for key in ("ours", "friend"):
             assert zai_proxy._is_noop_api_call(
                 key_name=key, model=None, status_code=None,
-                error=None, total_tokens=0) is True
+                error=None, total_tokens=0, duration_ms=5) is True
 
-    def test_drop_empty_string_model(self):
+    def test_drop_fast_empty_string_model(self):
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model="", status_code=None,
-            error="", total_tokens=0) is True
+            error="", total_tokens=0, duration_ms=11) is True
 
     def test_keep_non_zai_provider(self):
         """A non z.ai provider key is never touched even with no model/status."""
         assert zai_proxy._is_noop_api_call(
             key_name="deepseek", model=None, status_code=None,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
         assert zai_proxy._is_noop_api_call(
             key_name="telnyx", model=None, status_code=None,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
 
     def test_keep_any_nonzero_tokens(self):
         """token>0 proves an upstream round-trip happened — never drop."""
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model=None, status_code=None,
-            error=None, total_tokens=5) is False
+            error=None, total_tokens=5, duration_ms=5) is False
 
     def test_keep_when_model_present(self):
         """A real call always carries a model — never dropped."""
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model="glm-5.2", status_code=None,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
 
     def test_keep_when_status_present_even_model_less(self):
-        """Genuine diagnostic rows (503 exhaustion / 404, model-less body) KEPT.
-        Cold review flagged this class as the over-broad-drop risk.
-        """
+        """Genuine diagnostic rows (503 exhaustion / 404, model-less body) KEPT
+        when they carry an explicit status. Cold review flagged this class."""
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model=None, status_code=503,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
         assert zai_proxy._is_noop_api_call(
             key_name="friend", model=None, status_code=404,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
 
     def test_keep_when_error_present(self):
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model=None, status_code=None,
-            error="client disconnect: BrokenPipeError", total_tokens=0) is False
+            error="client disconnect: BrokenPipeError", total_tokens=0,
+            duration_ms=5) is False
 
     def test_status_zero_int_kept(self):
         assert zai_proxy._is_noop_api_call(
             key_name="ours", model=None, status_code=0,
-            error=None, total_tokens=0) is False
+            error=None, total_tokens=0, duration_ms=5) is False
+
+    # ── Round-2 execution review: SLOW/real rows must survive even when
+    # status_code/error are None (the real 503 & non-chat-404 paths leave them
+    # None but take real wall-clock time cycling providers / upstream)
+    def test_keep_slow_model_less_503_reserved(self):
+        """The REAL production 503 path: status_code stays None (line 7040-41
+        never assigned), model is None (empty body), but the request took
+        thousands of ms cycling providers -> NOT a no-op, must be kept."""
+        assert zai_proxy._is_noop_api_call(
+            key_name="ours", model=None, status_code=None,
+            error=None, total_tokens=0, duration_ms=2000) is False
+
+    def test_keep_slow_model_less_404_reserved(self):
+        """The REAL non-chat 404 path: returns before setting status/error,
+        but is a genuine diagnostic on a live proxy path -> kept."""
+        assert zai_proxy._is_noop_api_call(
+            key_name="friend", model=None, status_code=None,
+            error=None, total_tokens=0, duration_ms=250) is False
+
+    def test_keep_duration_null(self):
+        """A row with NULL duration (cannot confirm it is the fast no-op class)
+        is preserved — fail-open when the signal is unknown. This protects the
+        3 fresh NULL-duration no-op-signature rows observed today."""
+        assert zai_proxy._is_noop_api_call(
+            key_name="ours", model=None, status_code=None,
+            error=None, total_tokens=0, duration_ms=None) is False
+
+    def test_keep_duration_zero(self):
+        """duration 0ms (e.g. a synchronous logger with no round-trip record)
+        is ambiguous — preserved, never auto-dropped."""
+        assert zai_proxy._is_noop_api_call(
+            key_name="ours", model=None, status_code=None,
+            error=None, total_tokens=0, duration_ms=0) is False
 
 
 # ── Logging chokepoint skips the insert for no-ops ─────────────────────────-
 
 class TestLogApiCallGuard:
     def test_noop_call_writes_no_row(self, fake_usage_db):
-        """A no-op signature must NOT insert an api_calls row."""
+        """A fast no-op signature must NOT insert an api_calls row."""
         zai_proxy._log_api_call(
             key_name="ours", model=None, status_code=None, error=None,
             total_tokens=0, prompt_tokens=0, completion_tokens=0, tier="zai",
-            cost_usd=0.0, cost_source="flat_rate")
+            cost_usd=0.0, cost_source="flat_rate", duration_ms=5)
         assert fake_usage_db.rowcount() == 0
 
     def test_real_call_still_writes_row(self, fake_usage_db):
@@ -139,7 +177,8 @@ class TestLogApiCallGuard:
             key_name="ours", model="glm-5.2", prompt_tokens=10,
             completion_tokens=20, total_tokens=30, tier="zai",
             status_code=200, error=None, cost_usd=0.0,
-            cost_source="flat_rate", session_id="sess-1", task_type="coding")
+            cost_source="flat_rate", session_id="sess-1", task_type="coding",
+            duration_ms=500)
         assert fake_usage_db.rowcount() == 1
 
     def test_real_failure_row_still_written(self, fake_usage_db):
@@ -148,16 +187,26 @@ class TestLogApiCallGuard:
             key_name="friend", model="glm-5.2", total_tokens=0,
             prompt_tokens=0, completion_tokens=0, tier="zai",
             status_code=429, error="HTTPError 429", cost_usd=0.0,
-            cost_source="estimated")
+            cost_source="estimated", duration_ms=80)
         assert fake_usage_db.rowcount() == 1
 
-    def test_503_exhaustion_model_less_row_still_written(self, fake_usage_db):
-        """Model-less 503 'all providers exhausted' diagnostic — kept (cold
-        review: this is the failure-telemetry class that must never be dropped)."""
+    def test_real_503_model_less_slow_row_still_written(self, fake_usage_db):
+        """The REAL production model-less 503 exhaustion path: status stays
+        None and model is None, but it took 2s cycling providers — MUST be kept
+        (round-2 blocking fix)."""
         zai_proxy._log_api_call(
-            key_name="ours", model=None, status_code=503, error=None,
+            key_name="ours", model=None, status_code=None, error=None,
             total_tokens=0, prompt_tokens=0, completion_tokens=0, tier="zai",
-            cost_usd=0.0, cost_source="flat_rate")
+            cost_usd=0.0, cost_source="flat_rate", duration_ms=2000)
+        assert fake_usage_db.rowcount() == 1
+
+    def test_real_404_model_less_slow_row_still_written(self, fake_usage_db):
+        """The REAL non-chat 404 path (status/error None, but 250ms diagnostic
+        on a live proxy path) — kept."""
+        zai_proxy._log_api_call(
+            key_name="friend", model=None, status_code=None, error=None,
+            total_tokens=0, prompt_tokens=0, completion_tokens=0, tier="zai",
+            cost_usd=0.0, cost_source="flat_rate", duration_ms=250)
         assert fake_usage_db.rowcount() == 1
 
     def test_non_zai_provider_noop_kept(self, fake_usage_db):
@@ -166,5 +215,5 @@ class TestLogApiCallGuard:
         zai_proxy._log_api_call(
             key_name="deepseek", model=None, status_code=None, error=None,
             total_tokens=0, prompt_tokens=0, completion_tokens=0, tier="deepseek",
-            cost_usd=0.0, cost_source="estimated")
+            cost_usd=0.0, cost_source="estimated", duration_ms=5)
         assert fake_usage_db.rowcount() == 1

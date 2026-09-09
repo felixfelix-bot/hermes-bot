@@ -2830,21 +2830,28 @@ def _resolve_caller_class(headers) -> str:
     return "internal"
 
 
-def _is_noop_api_call(*, key_name, model, status_code, error, total_tokens) -> bool:
+def _is_noop_api_call(*, key_name, model, status_code, error, total_tokens,
+                      duration_ms) -> bool:
     """True for the T3 no-op telemetry signature: an api_calls row logging nothing.
 
     Exactly matches the 37,461 audited no-op rows (docs/noop-call-drop-2026-09-09.md):
     z.ai ``ours``/``friend`` keys only, zero total tokens, empty model, no HTTP
-    status and no error (2026-08-14→23, 2-11 ms — never reached an upstream LLM;
-    pure logging overhead from the legacy ``best_key()`` rollback path).
+    status, no error, AND a SHORT duration (2-11 ms — never reached an upstream
+    LLM; pure logging overhead from the legacy ``best_key()`` rollback path).
 
-    The guard is deliberately scoped to the audited signature's FULL discriminating
-    set (key ∈ ours/friend, total_tokens == 0) so it can NEVER swallow real
-    telemetry: every real forwarded call carries a non-empty model (from the
-    request body) OR a non-null HTTP status (200/4xx/5xx) OR an error string —
-    and any call that genuinely hit upstream reports non-zero tokens. A failure
-    row keeps its model/status/error; a non-z.ai provider key is never touched.
+    The DURATION GUARD is the round-2 execution-review fix (2026-09-09): the
+    real production failure paths — the 503 "all providers exhausted" branch
+    and the non-chat 404 branch — leave the local ``status_code``/``error_text``
+    variables as None (they are only assigned inside the retry loop) and may
+    carry a model-less body (``_extract_model`` → None), so key+tokens+model
+    alone is NOT a safe discriminator. Those real failure rows always take real
+    wall-clock time (>50ms cycling providers / making upstream attempts),
+    whereas the pure-logging no-op class is 2-11ms. Therefore the guard drops
+    ONLY the fast no-op class (0 < duration_ms <= NOOP_DURATION_MS_CAP) and
+    preserves every slow/real failure row, every NULL-duration row (fail-open
+    when the duration signal is unknown), and every non-z.ai provider key.
     """
+    NOOP_DURATION_MS_CAP = 50
     if key_name not in ("ours", "friend"):
         return False
     if total_tokens:
@@ -2854,6 +2861,10 @@ def _is_noop_api_call(*, key_name, model, status_code, error, total_tokens) -> b
     if status_code is not None:
         return False
     if error is not None and error != "":
+        return False
+    # Duration guard: only the fast class is a pure-logging no-op. NULL/0/slow
+    # durations are ambiguous or real failure telemetry — never auto-dropped.
+    if duration_ms is None or duration_ms <= 0 or duration_ms > NOOP_DURATION_MS_CAP:
         return False
     return True
 
@@ -2888,15 +2899,17 @@ def _log_api_call(*, key_name=None, key_suffix=None, model=None,
     """
     # ── T3 no-op drop (cost-reduction-sprint, t_66d2c01e): skip the insert
     # for the audited empty telemetry signature (ours/friend key, zero tokens,
-    # no model, no status, no error — see docs/noop-call-drop-2026-09-09.md).
-    # Suppressed at the single chokepoint through which 100% of api_calls rows
-    # flow, so no-op rows are never generated again. Scoped to the exact audited
-    # signature so real/failure telemetry is never suppressed (a call that hit
-    # upstream reports tokens and a model/status/error, and non-z.ai keys are
-    # untouched). Fail-open: only skips the row, never raises.
+    # no model, no status, no error, SHORT duration — see
+    # docs/noop-call-drop-2026-09-09.md). Suppressed at the single chokepoint
+    # through which 100% of api_calls rows flow, so no-op rows are never
+    # generated again. Scoped to the exact audited signature + a duration guard
+    # so real/failure telemetry is never suppressed (a call that hit upstream
+    # reports tokens and a model/status/error, and non-z.ai keys are untouched;
+    # slow or NULL-duration rows are preserved). Fail-open: only skips the row,
+    # never raises.
     if _is_noop_api_call(
             key_name=key_name, model=model, status_code=status_code,
-            error=error, total_tokens=total_tokens):
+            error=error, total_tokens=total_tokens, duration_ms=duration_ms):
         return
     # ── Cost safety net: never insert NULL cost_usd for known providers ──
     if cost_usd is None and key_name:

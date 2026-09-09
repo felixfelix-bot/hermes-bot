@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -43,7 +44,9 @@ def _health(**lanes):
                    "failure_count": spec.get("failure_count", 0),
                    "last_error_type": spec.get("last_error_type"),
                    "backoff_seconds": spec.get("backoff_seconds", 0),
-                   "disabled_manually": 0}
+                   "disabled_manually": 0,
+                   # epoch seconds the lane stays benched until; 0 = not benched
+                   "backoff_until": spec.get("backoff_until", 0.0)}
     return d
 
 
@@ -250,6 +253,72 @@ def test_resolve_finding_marks_resolved():
     with mock.patch.object(_MOD, "_save_state"):
         _MOD._resolve_finding("COST_LEAK", "ollama_cloud", state)
     assert state["findings"]["COST_LEAK:ollama_cloud"]["status"] == "resolved"
+
+
+# ── backoff (novelty-reset binary exponential, 24h cap) ──────────────────────
+
+def test_backoff_interval_ladder():
+    assert _MOD._backoff_interval(0) == 3600
+    assert _MOD._backoff_interval(1) == 7200
+    assert _MOD._backoff_interval(2) == 14400
+    assert _MOD._backoff_interval(3) == 28800
+    assert _MOD._backoff_interval(4) == 57600
+
+
+def test_backoff_interval_caps_at_24h():
+    assert _MOD._backoff_interval(5) == 86400
+    assert _MOD._backoff_interval(100) == 86400
+
+
+def test_update_backoff_advances_on_clean_same_signature():
+    state = {"backoff": {"clean_streak": 1, "last_signature": "sigA"}}
+    with mock.patch.object(_MOD, "_save_state"):
+        _MOD._update_backoff(state, "sigA", found=0)
+    b = state["backoff"]
+    assert b["clean_streak"] == 2
+    assert b["next_run_at"] > b["last_run_at"]
+    assert b["last_signature"] == "sigA"
+
+
+def test_update_backoff_resets_on_finding():
+    state = {"backoff": {"clean_streak": 3, "last_signature": "sigA"}}
+    with mock.patch.object(_MOD, "_save_state"):
+        _MOD._update_backoff(state, "sigA", found=1)
+    assert state["backoff"]["clean_streak"] == 0
+
+
+def test_update_backoff_resets_on_signature_change():
+    state = {"backoff": {"clean_streak": 3, "last_signature": "sigA"}}
+    with mock.patch.object(_MOD, "_save_state"):
+        _MOD._update_backoff(state, "sigB", found=0)
+    assert state["backoff"]["clean_streak"] == 0
+
+
+def test_update_backoff_holds_on_open_finding():
+    state = {"backoff": {"clean_streak": 3, "last_signature": "sigA"},
+             "findings": {"QUOTA_MODEL_DRIFT:opencode_go": {"status": "open"}}}
+    with mock.patch.object(_MOD, "_save_state"):
+        _MOD._update_backoff(state, "sigA", found=0)
+    assert state["backoff"]["clean_streak"] == 0
+
+
+def test_should_run_now():
+    assert _MOD._should_run_now({"backoff": {"next_run_at": 0}}) is True
+    assert _MOD._should_run_now({"backoff": {"next_run_at": time.time() + 10000}}) is False
+    assert _MOD._should_run_now({"backoff": {"next_run_at": time.time() + 10000}}, force=True) is True
+
+
+def test_state_signature_changes_with_failure_count():
+    quota = _quota(("ollama_cloud", True))
+    h1 = _health(ollama_cloud={"failure_count": 0, "healthy": 1})
+    h2 = _health(ollama_cloud={"failure_count": 5, "last_error_type": "dispatch_fail"})
+    assert _MOD._state_signature(quota, h1) != _MOD._state_signature(quota, h2)
+
+
+def test_state_signature_stable_for_same_state():
+    quota = _quota(("ollama_cloud_4", True))
+    h = _health(ollama_cloud_4={"healthy": 1})
+    assert _MOD._state_signature(quota, h) == _MOD._state_signature(quota, h)
 
 
 if __name__ == "__main__":

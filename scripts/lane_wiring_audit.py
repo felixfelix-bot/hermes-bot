@@ -52,6 +52,14 @@ PROXY_URL = "http://localhost:9099"
 
 _DRY_RUN = False
 
+# Backoff: when consecutive runs find everything stable, double the interval
+# between REAL audit passes until it caps at 24h. Reset to 1h on any novelty
+# (a finding, an unresolved open finding, or a state-signature change). The
+# cron still fires hourly; the script self-throttles via next_run_at in state.
+BACKOFF_BASE_S = 3600                 # 1h base interval
+BACKOFF_CAP_S = 24 * 3600             # 24h max
+BACKOFF_STEPS = int(BACKOFF_CAP_S / BACKOFF_BASE_S).bit_length()  # ~5 steps
+
 PROBE_INTERVAL_S = 6 * 3600          # 1 probe per lane per 6h
 OLLAMA_BASE = "https://ollama.com/v1"
 OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
@@ -275,6 +283,8 @@ def _quota_has_headroom(quota: dict, lane: str) -> bool:
     if lane not in quota:
         return False
     q = quota.get(lane, {})
+    if not isinstance(q, dict):  # e.g. /quota "active": "friend" — non-lane entries
+        return False
     if lane in ("ours", "friend"):
         # z.ai: windows carry used_pct; headroom if max used < 60%.
         mx = max((w.get("used_pct", 0) for w in q.get("windows", [])), default=100)
@@ -345,6 +355,68 @@ def _resolve_finding(category: str, lane: str, state: dict) -> None:
         print(f"[lane-wiring-audit] {category} {lane}: resolved")
 
 
+def _state_signature(quota: dict, health: dict) -> str:
+    """Cheap, stable hash of the routing-relevant state.
+
+    Novelty-reset: any change here (failure count, error type, health flag,
+    headroom, e2e provider) resets the backoff to 1h — incidents of the
+    "lane broken" class always move at least one of these before any threshold
+    trips. A 24h backoff therefore can never sit across a developing outage.
+    """
+    sig: dict = {}
+    for lane in sorted(QUOTA_LANES | PAYGO_LANES):
+        h = health.get(lane, {})
+        headroom = _quota_has_headroom(quota, lane)
+        sig[lane] = [
+            h.get("healthy", 0),
+            h.get("failure_count", 0),
+            h.get("last_error_type"),
+            h.get("backoff_seconds", 0),
+            int(bool(headroom)),
+        ]
+    return json.dumps(sig, sort_keys=True)
+
+
+def _backoff_interval(streak: int) -> int:
+    """Interval in seconds for the given clean-streak (binary exp, 24h cap)."""
+    return min(BACKOFF_BASE_S * (2 ** max(0, streak)), BACKOFF_CAP_S)
+
+
+def _should_run_now(state: dict, force: bool = False) -> bool:
+    """True if a real audit pass is due (or forced)."""
+    if force:
+        return True
+    next_run = state.get("backoff", {}).get("next_run_at", 0)
+    return time.time() >= next_run
+
+
+def _update_backoff(state: dict, signature: str, found: int) -> None:
+    """Advance or reset the backoff after a real pass.
+
+    - any finding this run → reset to 1h
+    - any open (unresolved) finding → hold at 1h (watch known-broken lanes)
+    - signature changed vs last run → reset to 1h (novelty)
+    - otherwise → clean streak+1, interval doubles toward the 24h cap
+    """
+    b = state.setdefault("backoff", {})
+    now = time.time()
+    findings = state.get("findings", {})
+    open_any = any(f.get("status") == "open" for f in findings.values())
+    changed = b.get("last_signature") not in (None, signature)
+
+    if found or open_any or changed:
+        b["clean_streak"] = 0
+        b["next_run_at"] = now + BACKOFF_BASE_S
+    else:
+        streak = b.get("clean_streak", 0) + 1
+        b["clean_streak"] = streak
+        b["next_run_at"] = now + _backoff_interval(streak)
+    b["last_signature"] = signature
+    b["last_run_at"] = now
+    state["backoff"] = b
+    _save_state(state)
+
+
 def _hermes_env() -> dict:
     e = dict(os.environ)
     e["HERMES_URGENCY_EXEMPT"] = "1"
@@ -410,6 +482,7 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
 
     found = 0
     findings = state.setdefault("findings", {})
+    signature = _state_signature(quota, health)
 
     # ── End-to-end wiring gap ──────────────────────────────────────────────
     xprov = probe_end_to_end(state=state)
@@ -500,10 +573,20 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
                           state, dry_run)
             found += 1
 
-    _save_state(state)
+    # ── Backoff bookkeeping (real runs only; dry-run never mutates) ────────
+    if not dry_run:
+        _update_backoff(state, signature, found)
+    else:
+        _save_state(state)
     return 1 if found else 0
 
 
 if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
+    force = "--run-now" in sys.argv
+    if not dry:
+        state = _load_state()
+        if not _should_run_now(state, force=force):
+            # Not due yet (backoff active) — silent no-op.
+            sys.exit(0)
     sys.exit(audit(dry_run=dry))

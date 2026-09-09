@@ -55,8 +55,38 @@ python3 ~/.hermes/bot/scripts/lane_wiring_audit.py --dry-run
 # manual run (real findings → silent anomaly + SOON fix task)
 python3 ~/.hermes/bot/scripts/lane_wiring_audit.py
 
+# force a run even if backoff says not-due
+python3 ~/.hermes/bot/scripts/lane_wiring_audit.py --run-now
+
 # tests
 ~/.hermes/hermes-agent/venv/bin/python -m pytest test_lane_wiring_audit.py
 ```
 
 Exit codes: `0` = clean, `1` = findings (still silent; tasks created).
+
+## Backoff (novelty-reset, binary exponential, 24h cap)
+
+The cron still fires hourly, but the script self-throttles via `next_run_at` in
+`lane_audit_state.json`. After a real pass:
+
+- **any finding** this run → reset to 1h
+- **any open (unresolved) finding** → hold at 1h (known-broken lanes stay watched)
+- **state-signature changed** → reset to 1h (novelty: failure counts, error
+  types, health flags, headroom, e2e provider)
+- otherwise → clean-streak +1, interval doubles: 1h → 2h → 4h → 8h → 16h → **24h cap**
+
+This mirrors the G1 recovery-hold philosophy (binary-exponential, capped, reset on
+signal). The novelty-reset is what makes the 24h ceiling safe: incidents of the
+"lane broken" class always move a failure count or health flag before any
+threshold trips, collapsing the backoff to hourly long before a finding would fire.
+
+`--run-now` forces a pass (operator escape hatch). `--dry-run` never mutates state.
+
+## Known heuristic nuance
+
+`COST_LEAK` may name a specific idle lane (e.g. `ollama_cloud_2`) that is idle
+by design — the ollama pool drains fullest-remaining first (`_ollama_cloud_key_order`),
+so a sibling key can legitimately sit idle while another absorbs the pool's traffic.
+The finding is still worth investigating (22M tokens/h spilled to PAYGO while the
+pool had headroom), but the *culprit lane* is a hint, not a hard diagnosis.
+

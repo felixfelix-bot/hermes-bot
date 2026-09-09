@@ -60,6 +60,7 @@ send() {
 
 ASCII_FILE="$VIZ_DIR/ascii-summary.txt"
 INSIGHTS_FILE="$VIZ_DIR/insights-strip.txt"
+KANBAN_ASCII_FILE="$VIZ_DIR/kanban-ascii.txt"
 DEFAULT_PLOTS=(
     "$VIZ_DIR/price-envelope.png"
     "$VIZ_DIR/price-heatmap.png"
@@ -71,6 +72,11 @@ DIGEST_PLOTS=(
     "$VIZ_DIR/quota-heatmap.png"
     "$VIZ_DIR/model-mix-7d.png"
     "$VIZ_DIR/model-by-lane.png"
+)
+# Kanban fleet plots appended to the daily digest (see # hourly-kanban-viz).
+KANBAN_DIGEST_PLOTS=(
+    "$VIZ_DIR/kanban-burnup.png"
+    "$VIZ_DIR/kanban-cost-per-task.png"
 )
 
 # args parse
@@ -88,6 +94,7 @@ done
 
 # Trigger fresh render before sending (so plots reflect latest data)
 "$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/.hermes/bot/price_viz.py" >> "$LOG" 2>&1 || true
+"$HOME/.hermes/hermes-agent/venv/bin/python" "$HOME/.hermes/bot/kanban_viz.py" >> "$LOG" 2>&1 || true
 
 # Read ASCII summary
 ASCII=""
@@ -101,6 +108,12 @@ if [[ -f "$INSIGHTS_FILE" ]]; then
     INSIGHTS=$(cat "$INSIGHTS_FILE")
 fi
 
+# Read kanban fleet ASCII (empty when kanban_viz hasn't produced it yet).
+KANBAN_ASCII=""
+if [[ -f "$KANBAN_ASCII_FILE" ]]; then
+    KANBAN_ASCII=$(cat "$KANBAN_ASCII_FILE")
+fi
+
 case "$MODE" in
     all)
         MSG="${CUSTOM_MSG:-📊 Price Landscape Snapshot — $(date '+%H:%M %b %d %Z')}\n\n${ASCII}"
@@ -112,8 +125,11 @@ case "$MODE" in
         if [[ -n "$INSIGHTS" ]]; then
             DIGEST_BODY="🔎 Insights\n${INSIGHTS}\n\n${ASCII}"
         fi
+        if [[ -n "$KANBAN_ASCII" ]]; then
+            DIGEST_BODY="${DIGEST_BODY}\n\n${KANBAN_ASCII}"
+        fi
         MSG="${CUSTOM_MSG:-📈 Daily Digest — $(date '+%Y-%m-%d')}\n\n${DIGEST_BODY}"
-        PAYLOAD=$(build_payload "$MSG" "${DIGEST_PLOTS[@]}")
+        PAYLOAD=$(build_payload "$MSG" "${DIGEST_PLOTS[@]}" "${KANBAN_DIGEST_PLOTS[@]}")
         ;;
     single)
         PLOT_PATH="$VIZ_DIR/${PLOT_NAME}.png"

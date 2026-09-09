@@ -81,6 +81,27 @@ CREATE TABLE IF NOT EXISTS attribution (
 );
 CREATE INDEX IF NOT EXISTS idx_attr_window ON attribution(window_since, call_id);
 CREATE INDEX IF NOT EXISTS idx_attr_profile ON attribution(window_since, profile);
+
+-- Permanent per-call attribution rollup. Survives the rolling-window purge in
+-- write_rows() so task/board cost history accumulates instead of being limited
+-- to the last --since window. One row per (call x candidate), keyed by ukey;
+-- INSERT OR REPLACE on every run means the freshest attribution of a call wins
+-- and re-running overlapping windows never double-counts a call_id.
+CREATE TABLE IF NOT EXISTS task_cost_rollup (
+    ukey       TEXT PRIMARY KEY,
+    call_id    INTEGER NOT NULL,
+    ts         REAL NOT NULL,
+    board      TEXT,
+    task_id    TEXT,
+    profile    TEXT,
+    kind       TEXT,
+    session_id TEXT,
+    method     TEXT,
+    tokens     REAL NOT NULL,
+    cost       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rollup_task ON task_cost_rollup(board, task_id);
+CREATE INDEX IF NOT EXISTS idx_rollup_ts   ON task_cost_rollup(ts);
 """
 
 
@@ -408,6 +429,51 @@ def attribute_window(since: float, min_tokens: int = 0):
     return summary, all_rows
 
 
+def _upsert_rollup(conn, rows: list[dict]) -> None:
+    """Mirror window rows into task_cost_rollup (INSERT OR REPLACE).
+
+    Idempotent per (call x candidate): re-running overlapping windows never
+    double-counts a call_id, and calls that age out of --since stay in the
+    rollup forever (kanban_viz reads history from here).
+    """
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO task_cost_rollup
+        (ukey, call_id, ts, board, task_id, profile, kind, session_id, method,
+         tokens, cost)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                "|".join((
+                    str(r["call_id"]), r["kind"],
+                    r["board"] or "", r["task_id"] or "", r["profile"] or "",
+                )),
+                r["call_id"], r["ts"], r["board"], r["task_id"], r["profile"],
+                r["kind"], r["session_id"], r["method"],
+                r["tokens_share"], r["cost_share"],
+            )
+            for r in rows
+        ],
+    )
+    conn.commit()
+
+
+def write_rollup_only(rows: list[dict]) -> None:
+    """Backfill path: upsert the rollup WITHOUT touching the attribution table.
+
+    Used for a one-time deep-history run (e.g. --since 35d). attribute_window()
+    only READS zai_usage.db / board DBs, so it can run alongside the hourly
+    cron; skipping the DELETE/VACUUM avoids sqlite lock contention with it.
+    """
+    conn = sqlite3.connect(ATTR_DB, timeout=30)
+    try:
+        conn.executescript(ATTR_SCHEMA)
+        _upsert_rollup(conn, rows)
+    finally:
+        conn.close()
+
+
 def write_rows(since: float, rows: list[dict]) -> None:
     conn = sqlite3.connect(ATTR_DB)
     conn.executescript(ATTR_SCHEMA)
@@ -441,6 +507,8 @@ def write_rows(since: float, rows: list[dict]) -> None:
         ],
     )
     conn.commit()
+    # Permanent rollup: mirror the window rows into task_cost_rollup.
+    _upsert_rollup(conn, rows)
     conn.close()
 
 
@@ -470,6 +538,9 @@ def main() -> int:
     ap.add_argument("--min-tokens", type=int, default=0)
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--rollup-only", action="store_true",
+                    help="only upsert task_cost_rollup; leave attribution "
+                         "table untouched (safe deep-history backfill)")
     args = ap.parse_args()
 
     since = parse_since(args.since)
@@ -477,6 +548,9 @@ def main() -> int:
     print_report(summary, rows, top=args.top)
     if args.dry_run:
         print("\n(dry run — nothing written)")
+    elif args.rollup_only:
+        write_rollup_only(rows)
+        print(f"\nrollup-only: upserted {len(rows)} rows → {ATTR_DB}")
     else:
         write_rows(since, rows)
         print(f"\nwrote {len(rows)} rows → {ATTR_DB}")

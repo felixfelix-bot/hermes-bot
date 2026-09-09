@@ -84,23 +84,120 @@ SEED_RATES = {
     "routstrd": 1.00,
 }
 
-# Color palette per provider
+# Color palette per provider.
+# 12 maximally-distinct hues — picked so NO two curves look alike at thin,
+# log-scale, alpha-0.8 rendering. Pairs that previously blurred together
+# (ollama_cloud green vs ollama_cloud_2 teal vs routstr olive; friend cyan vs
+# ollama_cloud_2; neuralwatt red vs routstrd pink) are now far apart.
 PROVIDER_COLORS = {
-    "ours": "#1f77b4",
-    "friend": "#17becf",
-    "ollama_cloud": "#2ca02c",
-    "ollama_cloud_2": "#90c3c4",
-    "opencode_go": "#ff7f0e",
-    "neuralwatt": "#d62728",
-    "deepinfra": "#9467bd",
-    "ppq": "#8c564b",
-    "telnyx": "#e377c2",
-    "openrouter": "#7f7f7f",
-    "routstr": "#bcbd22",
-    "routstrd": "#ff9896",
+    "ours": "#053061",          # dark blue
+    "friend": "#4393c3",        # light blue
+    "ollama_cloud": "#a6d96a",  # light green
+    "ollama_cloud_2": "#1b7837", # dark green
+    "opencode_go": "#7fbc41",   # mid green (distinct from light/dark greens)
+    "neuralwatt": "#b2182b",    # crimson
+    "deepinfra": "#fddbc7",     # pale salmon
+    "ppq": "#8c510a",           # brown
+    "telnyx": "#762a83",        # purple
+    "openrouter": "#01665e",    # teal (dark — distinct from blues/greens)
+    "routstr": "#f768a1",       # hot pink
+    "routstrd": "#f4a582",      # light coral
+}
+
+# Per-provider dash pattern — belt-and-suspenders so even colorblind viewers
+# can tell curves apart by marker/dash even if two hues still read as close.
+# Eor=evenly-spaced dashes, em=em-width units; mirror the 12-provider set.
+PROVIDER_LINESTYLES = {
+    "ours": "-",                 # solid
+    "friend": "--",              # dashed
+    "ollama_cloud": (0, (5, 4)), # dash-dot 5/4
+    "ollama_cloud_2": ":",       # dotted
+    "opencode_go": (0, (3, 2, 1, 2)),  # dense dash-dot
+    "neuralwatt": (0, (5, 5)),   # wide dash
+    "deepinfra": (0, (1, 1)),    # 1px dash
+    "ppq": (0, (8, 3, 2, 3)),    # long-short
+    "telnyx": (0, (3, 5)),       # dash 3/5
+    "openrouter": (0, (2, 3, 4, 3)),   # short-long
+    "routstr": (0, (6, 2, 1, 2, 1, 2)),  # dash-dot-dot
+    "routstrd": (0, (4, 4, 1, 4)),      # dash-dot 4/4/1/4
 }
 
 LOG_Y = True  # default: logarithmic y-axis
+
+
+# ── Viz endpoint overlay ──────────────────────────────────────────────────────
+# viz_coverage_survey.py (run every 5th catalog-drift cron) writes this file
+# when it finds router/proxy endpoints missing from the static tables above.
+# _merge_overlay() folds it into the tables at render time so newly-onboarded
+# endpoints (chutes, deepseek, ollama_cloud_3, ...) appear in every renderer
+# without a manual edit here.
+VIZ_OVERLAY_PATH = Path.home() / ".hermes" / "bot" / "viz_provider_overlay.json"
+
+# Extended palette + linestyles for endpoints the survey discovers that are not
+# already hand-assigned in PROVIDER_COLORS / PROVIDER_LINESTYLES.
+_EXTRA_COLORS = [
+    "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#ffff33", "#a65628",
+    "#f781bf", "#999999", "#e41a1c", "#66c2a5", "#fc8d62", "#8da0cb",
+    "#e78ac3", "#a6d854", "#ffd92f", "#e5c494",
+]
+_EXTRA_LINESTYLES = [
+    (0, (4, 2)), (0, (1, 3)), (0, (7, 3)), (0, (2, 2, 1, 2)),
+    (0, (3, 1, 3, 1)), (0, (5, 2, 1, 2)), "-.", (0, (6, 3, 1, 3)),
+]
+
+
+def _derive_color(name: str) -> str:
+    """Deterministic, stable color for an endpoint not in PROVIDER_COLORS."""
+    taken = set(PROVIDER_COLORS.values())
+    idx = sum(ord(c) for c in name) % len(_EXTRA_COLORS)
+    for offset in range(len(_EXTRA_COLORS)):
+        c = _EXTRA_COLORS[(idx + offset) % len(_EXTRA_COLORS)]
+        if c not in taken:
+            return c
+    return "#333333"
+
+
+def _derive_linestyle(name: str):
+    """Deterministic, stable linestyle for an endpoint not in PROVIDER_LINESTYLES."""
+    taken = set(PROVIDER_LINESTYLES.values())
+    idx = sum(ord(c) for c in name) % len(_EXTRA_LINESTYLES)
+    for offset in range(len(_EXTRA_LINESTYLES)):
+        ls = _EXTRA_LINESTYLES[(idx + offset) % len(_EXTRA_LINESTYLES)]
+        if ls not in taken:
+            return ls
+    return _EXTRA_LINESTYLES[idx]
+
+
+def _merge_overlay() -> None:
+    """Merge viz_provider_overlay.json into the static provider/lane tables.
+
+    Idempotent; a missing/unreadable overlay is a no-op. Provider display
+    attributes (color/linestyle) are derived deterministically by name when the
+    overlay doesn't carry them, so assignment is stable across runs.
+    """
+    try:
+        overlay = json.loads(VIZ_OVERLAY_PATH.read_text())
+    except Exception:
+        return
+    providers = overlay.get("providers", {}) or {}
+    for name, meta in providers.items():
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("tier"):
+            PROVIDER_TIER[name] = meta["tier"]
+        if meta.get("seed_rate") is not None:
+            SEED_RATES[name] = float(meta["seed_rate"])
+        PROVIDER_COLORS[name] = meta.get("color") or _derive_color(name)
+        PROVIDER_LINESTYLES[name] = meta.get("linestyle") or _derive_linestyle(name)
+    lanes = overlay.get("lanes", {}) or {}
+    for name, meta in lanes.items():
+        if not isinstance(meta, dict):
+            continue
+        entry = dict(LANE_REGISTRY_STATIC.get(name, {}))
+        entry["kind"] = meta.get("kind") or entry.get("kind") or "token"
+        entry["capacity"] = meta.get("capacity", entry.get("capacity"))
+        entry["session_capacity"] = meta.get("session_capacity", entry.get("session_capacity"))
+        LANE_REGISTRY_STATIC[name] = entry
 
 
 # ── Data layer ───────────────────────────────────────────────────────────────
@@ -305,8 +402,9 @@ def render_envelope(outdir: Path, log_y: bool = True) -> Path:
     for provider in sorted(PROVIDER_TIER, key=lambda p: SEED_RATES.get(p, 99)):
         usage, prices = compute_theoretical_curve(provider)
         color = PROVIDER_COLORS.get(provider, "#cccccc")
+        linestyle = PROVIDER_LINESTYLES.get(provider, "-")
         label = provider
-        ax.plot(usage * 100, prices, label=label, color=color, linewidth=1.5, alpha=0.8)
+        ax.plot(usage * 100, prices, label=label, color=color, linestyle=linestyle, linewidth=1.5, alpha=0.8)
 
         # Mark current operating point
         cur_pct = current_state.get(provider, 0) * 100
@@ -528,6 +626,7 @@ def _lane_limits(lane: str, registry: dict) -> tuple[int, int]:
     sess = entry.get("session_capacity") or _DEFAULT_SESSION_LIMIT
     wkly = entry.get("capacity") or _DEFAULT_WEEKLY_LIMIT
     return int(sess), int(wkly)
+
 
 QUOTA_ENDPOINT = "http://localhost:9099/quota"
 
@@ -1525,6 +1624,11 @@ def render_all(outdir: Path = None, log_y: bool = True) -> list[Path]:
     if outdir is None:
         outdir = DEFAULT_OUTDIR
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Merge the coverage-survey overlay before rendering so newly-onboarded
+    # endpoints appear in every renderer. Called at render time (not import)
+    # so unit tests that exercise individual renderers stay hermetic.
+    _merge_overlay()
 
     rendered = []
     try:

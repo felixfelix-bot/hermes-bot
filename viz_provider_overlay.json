@@ -1,0 +1,32 @@
+{
+  "lanes": {
+    "ollama_cloud_3": {
+      "capacity": 3500000000,
+      "kind": "token",
+      "session_capacity": 500000000
+    },
+    "ollama_cloud_4": {
+      "capacity": 500000000,
+      "kind": "token",
+      "session_capacity": 500000000
+    }
+  },
+  "providers": {
+    "chutes": {
+      "seed_rate": 0.096,
+      "tier": "per_token"
+    },
+    "deepseek": {
+      "seed_rate": 0.05,
+      "tier": "per_token"
+    },
+    "ollama_cloud_3": {
+      "seed_rate": 0.4,
+      "tier": "included"
+    },
+    "ollama_cloud_4": {
+      "seed_rate": 0.4,
+      "tier": "included"
+    }
+  }
+}

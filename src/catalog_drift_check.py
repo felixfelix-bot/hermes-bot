@@ -511,6 +511,24 @@ def main() -> int:
     n_cg = sum(len(v) for v in drift["context_gaps"].values())
     print(f"[catalog-drift] probes={len(live)} phantoms={n_ph} "
           f"missing_rungs={n_mr} context_gaps={n_cg} new={new_drift}")
+
+    # Viz coverage survey — every 5th run, ensure all live endpoints appear in
+    # the plots. Isolated: a survey failure must never fail this job.
+    try:
+        _src_dir = str(Path(__file__).resolve().parent)
+        if _src_dir not in sys.path:
+            sys.path.insert(0, _src_dir)
+        from viz_coverage_survey import run_if_due
+        result = run_if_due()
+        if result is not None:
+            print(f"[viz-survey] missing={result.get('missing')} "
+                  f"added={result.get('added')} "
+                  f"unrepresentable={result.get('unrepresentable')}")
+        else:
+            print("[viz-survey] skipped (not due this run)")
+    except Exception as e:
+        print(f"[viz-survey] error: {e}", file=sys.stderr)
+
     return 0
 
 

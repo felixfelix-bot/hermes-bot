@@ -728,13 +728,18 @@ OLLAMA_CLOUD_KEY_4 = _EXTERNAL_KEYS.get("ollama_cloud_4", "")
 # pool enters rotation at the head until it draws down. Empty keys are dropped
 # below.
 #
-# P0-1 RUGPULL-RESILIENCE (2026-09-08): ALL FOUR ollama cloud keys are excluded
-# from the active routing pool. Operator hard-exclusion (no ollama key #1, no
-# key with an @embedsmart.de email) + UNKNOWN-email keys excluded to be safe.
-# The .key_disabled_* flags gate the flat-router lanes; this list is emptied so
-# the ollama-any dispatcher never fires. Re-enable by rm-ing the flags AND
-# restoring the 4 entries below (reversible).
-_OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = []
+# P0-1 rugpull-exclusion (2026-09-08) REVERSED 2026-09-09 by operator directive:
+# doxed lanes re-enabled for INTERNAL use. The .key_disabled_* flags were rm'd
+# (proxy restarted) AND this list is restored so the ollama-any dispatcher fires
+# again. Sold/routstr traffic must never reach these lanes — enforced by C3
+# (doxed-lane sold-filter in flat_router.select_provider) + the reverse tunnel is
+# dead (T0, 2026-09-09). .key_disabled_* flags remain the operator off-switch.
+_OLLAMA_CLOUD_KEYS: list[tuple[str, str]] = [
+    ("ollama_cloud", OLLAMA_CLOUD_KEY),
+    ("ollama_cloud_2", OLLAMA_CLOUD_KEY_2),
+    ("ollama_cloud_3", OLLAMA_CLOUD_KEY_3),
+    ("ollama_cloud_4", OLLAMA_CLOUD_KEY_4),
+]
 _OLLAMA_CLOUD_KEYS = [(n, k) for n, k in _OLLAMA_CLOUD_KEYS if k]  # drop empty
 
 # DeepInfra — preferred external failover (prompt caching reduces effective cost)

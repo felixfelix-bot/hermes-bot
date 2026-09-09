@@ -438,6 +438,53 @@ def run_intake_probes(store: dict, providers: dict, ctx_reg: dict, keys: dict,
     return store
 
 
+# ── INTAKE-3: tier wall + measured-price gate (advertise flag) ──────────────
+# A promoted_routing model may be advertised on /v1/models ONLY if BOTH:
+#   (a) ≥1 healthy NON-z.ai provider serves it (z.ai-backed models are NEVER
+#       public — z.ai ToS quota-resale; zai/ours/friend/manager/worker* keys
+#       all count as z.ai), AND
+#   (b) a measured price exists (real_price_tracker n≥50). Seed/estimated
+#       prices NEVER advertise; unmeasured stays false and is auto-retried on
+#       later runs.
+def is_zai_provider(name: str) -> bool:
+    """True if the provider key is z.ai-backed (tier wall — NEVER public).
+
+    z.ai keys: 'zai', 'ours', 'friend', 'manager', and any 'worker*' key.
+    Everything else (neuralwatt, opencode_go, deepinfra, ppq, openrouter,
+    telnyx, ollama_cloud, routstr, routstrd, ...) is a genuine external
+    provider that may back a public advertisement.
+    """
+    n = (name or "").strip().lower()
+    if n in {"zai", "ours", "friend", "manager"}:
+        return True
+    if n.startswith("worker"):
+        return True
+    return False
+
+
+def refresh_advertised_flags(store: dict, healthy_providers: set,
+                             measured_models: set, now_iso: str | None = None) -> dict:
+    """Recompute the `advertised` flag for every promoted_routing entry.
+
+    advertised=True ONLY IF (a) ≥1 healthy NON-z.ai provider serves the model
+    AND (b) the model has a measured price (in measured_models). Non-promoted
+    entries are untouched. Unmeasured / z.ai-only models stay advertised=False
+    (auto-retried on later runs). Returns the updated store (also persisted).
+    """
+    now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    for mid, rec in store.items():
+        if rec.get("status") != "promoted_routing":
+            continue
+        providers = set(rec.get("raw_ids", {}).keys())
+        healthy_non_zai = any(
+            p in healthy_providers and not is_zai_provider(p) for p in providers)
+        measured = mid in measured_models
+        rec["advertised"] = bool(healthy_non_zai and measured)
+        rec.setdefault("decided_at", now_iso)
+    INTAKE_FILE.write_text(json.dumps(store, indent=2))
+    return store
+
+
 def probe(url: str, key: str | None, provider: str) -> dict:
     """Fetch a provider catalog. Returns FR-0-style probe record.
 

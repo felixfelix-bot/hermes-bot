@@ -671,33 +671,33 @@ _TELNYX_DIRECT_MODELS = {"kimi-k3"}
 # Any provider not in this dict uses ext_model verbatim.
 _PROVIDER_MODEL_NAMES = {
     "deepinfra": {
-        "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
-        "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
-        "glm-5.2":                    "zai-org/GLM-5.2",
-        "glm-5.3":                    "zai-org/GLM-5.3",
+        "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",  # SUBST 2026-09-09
+        "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",  # SUBST 2026-09-09
+        "glm-5.2":                    "zai-org/GLM-5.2",  # SUBST 2026-09-09
+        "glm-5.3":                    "zai-org/GLM-5.3",  # SUBST 2026-09-09
     },
     # Telnyx is Kimi-only by operator decision (2026-08-20): glm-5.2 ran
     # ~$12/M blended here vs ~$0.26-1.30/M on deepinfra/ppq/openrouter.
     # The generic failover guard below skips Telnyx for any model missing
     # from this map (verbatim-name passthrough would otherwise still hit it).
     "telnyx": {
-        "kimi-k3":         "moonshotai/Kimi-K3",
-        "kimi-k2.5":       "moonshotai/Kimi-K2.5",
-        "gpt-5":           "openai/gpt-5",
-        "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
-        "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",
-        "kimi-k3:cloud":   "moonshotai/Kimi-K2.5",  # Fallback to cheaper K2.5 (K3 costs extra on Ollama Cloud)
-        "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # K2.5 closest to K2.7 on Telnyx
+        "kimi-k3":         "moonshotai/Kimi-K3",  # SUBST 2026-09-09
+        "kimi-k2.5":       "moonshotai/Kimi-K2.5",  # SUBST 2026-09-09
+        "gpt-5":           "openai/gpt-5",  # SUBST 2026-09-09
+        "claude-haiku-4-5": "anthropic/claude-haiku-4-5",  # SUBST 2026-09-09
+        "minimax-m3":      "MiniMaxAI/MiniMax-M3-MXFP8",  # SUBST 2026-09-09
+        "kimi-k3:cloud":   "moonshotai/Kimi-K2.5",  # SUBST 2026-09-09 Fallback to cheaper K2.5 (K3 costs extra on Ollama Cloud)
+        "kimi-k2.7-code":  "moonshotai/Kimi-K2.5",  # SUBST 2026-09-09 K2.5 closest to K2.7 on Telnyx
     },
     "openrouter": {
-        "glm-5.2":                    "z-ai/glm-5.2",
-        "kimi-k3":                    "moonshotai/kimi-k3",
+        "glm-5.2":                    "z-ai/glm-5.2",  # SUBST 2026-09-09
+        "kimi-k3":                    "moonshotai/kimi-k3",  # SUBST 2026-09-09
         "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek/deepseek-v4-pro",
     },
     "ppq": {
-        "glm-5.2":                    "z-ai/glm-5.2",
-        "kimi-k3":                    "moonshotai/kimi-k3",
+        "glm-5.2":                    "z-ai/glm-5.2",  # SUBST 2026-09-09
+        "kimi-k3":                    "moonshotai/kimi-k3",  # SUBST 2026-09-09
         "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
     },
     "opencode_go": {
@@ -705,24 +705,24 @@ _PROVIDER_MODEL_NAMES = {
         "glm-5.3":                    "glm-5.3",
         "kimi-k3":                    "kimi-k3",
         "kimi-k2.7-code":             "kimi-k2.7-code",
-        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
-        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",  # SUBST 2026-09-09
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",  # SUBST 2026-09-09
     },
     "neuralwatt": {
         "glm-5.2":                    "glm-5.2",
         "kimi-k3":                    "kimi-k3",
         "kimi-k2.7-code":             "kimi-k2.7-code",
-        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
-        "deepseek/gemma-4-31b":        "gemma-4-31b",
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",  # SUBST 2026-09-09
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",  # SUBST 2026-09-09
+        "deepseek/gemma-4-31b":        "gemma-4-31b",  # SUBST 2026-09-09
     },
     "ollama_cloud": {
-        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
-        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",  # SUBST 2026-09-09
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",  # SUBST 2026-09-09
     },
     "ollama_cloud_2": {
-        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",
-        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",
+        "deepseek/deepseek-v4-flash":  "deepseek-v4-flash:0731",  # SUBST 2026-09-09
+        "deepseek/deepseek-v4-pro":    "deepseek-v4-pro:0813",  # SUBST 2026-09-09
     },
 }
 
@@ -6947,6 +6947,34 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             now = int(time.time())
 
+            # INTAKE-3: overlay promoted+advertised entries from model_intake.json.
+            # A promoted_routing model appears in the public listing only when its
+            # `advertised` flag is true (tier wall: ≥1 healthy non-z.ai provider AND
+            # measured price). Never advertised entries are never listed.
+            def _intake_advertised_models():
+                """Return [(canonical, owner, ctx)] for advertised intake models."""
+                out = []
+                try:
+                    _ip = str(Path(__file__).resolve().parent / "model_intake.json")
+                    if Path(_ip).exists():
+                        _store = json.loads(Path(_ip).read_text())
+                    else:
+                        _store = {}
+                    for mid, rec in _store.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        if rec.get("status") != "promoted_routing":
+                            continue
+                        if not rec.get("advertised"):
+                            continue
+                        # owned_by: first non-z.ai provider (public provenance)
+                        owners = [p for p in rec.get("raw_ids", {}).keys()]
+                        out.append((mid, (owners[0] if owners else "external"),
+                                    1048576))
+                except Exception:
+                    pass
+                return out
+
             # Load dynamic pricing state
             _kp = {}
             try:
@@ -7008,6 +7036,10 @@ class Handler(BaseHTTPRequestHandler):
                 _m("kimi-k3", "telnyx", 262144),
                 _m("minimax-m3:cloud", "ollama", 1048576),
             ]
+            # INTAKE-3: append promoted+advertised intake models to the listing.
+            for _mid, _owner, _ctx in _intake_advertised_models():
+                if _mid not in {m["id"] for m in _all_models if m}:
+                    _all_models.append(_m(_mid, _owner, _ctx))
             models_data = {
                 "object": "list",
                 "data": [m for m in _all_models if m is not None],

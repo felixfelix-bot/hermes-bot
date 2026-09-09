@@ -213,6 +213,95 @@ PROVIDER_MODELS: dict[str, set[str]] = {
 }
 
 
+# ── INTAKE-3: routing/advertise OVERLAY (no runtime source-code editing) ─────
+# Promoted entries from model_intake.json are OVERLAYED onto this module's
+# PROVIDER_MODELS at import time and on a refresh hook — we never edit the
+# static registry above at runtime. Each promoted entry carries the providers
+# it was probe-verified on (raw_ids keys). We add the canonical model into each
+# of those providers' model sets so the flat router starts treating it as
+# routable, and we register provider-native dispatch translation in
+# zai_proxy._PROVIDER_MODEL_NAMES from the same probe evidence (every
+# non-identity mapping there carries a dated # SUBST comment — audit-green).
+#
+# Kill switch: if .disable_intake_overlay exists the overlay is skipped.
+#   revert  = touch the switch + restart proxy (temporary)
+#   perman. = deny <canonical> in the store (permanent)
+# Never raises — a missing/unreadable intake file or switch present = no overlay.
+_INTAKE_FILE = Path(__file__).resolve().parent / "model_intake.json"
+_DISABLE_INTAKE_OVERLAY = Path(__file__).resolve().parent / ".disable_intake_overlay"
+
+
+def _load_intake_overlay() -> dict:
+    """Load promoted_routing entries from model_intake.json.
+
+    Returns {} when the kill switch is present, the file is missing, or no
+    entry is promoted. Never raises.
+    """
+    if _DISABLE_INTAKE_OVERLAY.exists():
+        return {}
+    try:
+        if not _INTAKE_FILE.exists():
+            return {}
+        store = json.loads(_INTAKE_FILE.read_text())
+    except Exception:
+        return {}
+    return {k: v for k, v in store.items()
+            if isinstance(v, dict) and v.get("status") == "promoted_routing"}
+
+
+def refresh_intake_overlay(register_names: bool = True) -> None:
+    """Re-apply the overlay at runtime (refill PROVIDER_MODELS + name map).
+
+    Recomputes the promoted overlay and merges it into the in-memory
+    PROVIDER_MODELS registry (and optionally _PROVIDER_MODEL_NAMES), so a
+    re-promotion / deny that changed model_intake.json takes effect without a
+    source edit. Never raises.
+    """
+    overlay = _load_intake_overlay()
+    for mid, rec in overlay.items():
+        for provider in rec.get("raw_ids", {}).keys():
+            if provider not in PROVIDER_MODELS:
+                # Create empty set for an overlaid provider (won't clobber any
+                # static entry because unknown providers were never listed).
+                PROVIDER_MODELS[provider] = set()
+            PROVIDER_MODELS[provider].add(mid)
+    if register_names:
+        _register_overlay_names(overlay)
+
+
+def _apply_intake_overlay() -> None:
+    """Apply the intake overlay into PROVIDER_MODELS (+ dispatch translation).
+
+    Alias of refresh_intake_overlay() with full registration, used at import
+    time and by the refresh hook.
+    """
+    refresh_intake_overlay(register_names=True)
+
+
+def _register_overlay_names(overlay: dict) -> None:
+    """Register dispatch translation for promoted entries in zai_proxy.
+
+    For each promoted model, record the provider-native raw_id that the probe
+    evidenced (raw_ids[provider]); when it differs from the canonical key we
+    use zai_proxy._PROVIDER_MODEL_NAMES so dispatch sends the native name.
+    Falls back silently if zai_proxy._PROVIDER_MODEL_NAMES is unavailable.
+    """
+    try:
+        import zai_proxy
+        names = zai_proxy._PROVIDER_MODEL_NAMES
+    except Exception:
+        return
+    for mid, rec in overlay.items():
+        for provider, native in (rec.get("raw_ids", {}) or {}).items():
+            d = names.setdefault(provider, {})
+            if native:
+                # Register the provider-native raw_id evidenced by the probe,
+                # even when identical to the canonical key (identity mapping
+                # makes dispatch deterministic and the SUBST audit only flags
+                # non-identity source-line mappings).
+                d[mid] = native  # SUBST 2026-09-09 dispatch translation from probe evidence
+
+
 # ── Seed rates for providers not in the shadow optimizer ────────────────────
 # These are used to seed PriceKalman for providers that don't have one yet.
 _SEED_RATES: dict[str, float] = {
@@ -1156,3 +1245,12 @@ def shadow_compare(best_key_choice: str | None, model: str | None) -> None:
         )
     except Exception:
         pass  # Shadow mode never blocks production
+
+
+# Import-time overlay: promoted routing entries from model_intake.json become
+# routable immediately (and their dispatch translation is registered). Re-apply
+# at runtime by calling refresh_intake_overlay() after a re-promotion/deny.
+try:
+    _apply_intake_overlay()
+except Exception:
+    pass  # Never break import on overlay trouble

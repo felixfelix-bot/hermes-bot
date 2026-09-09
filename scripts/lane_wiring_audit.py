@@ -154,11 +154,16 @@ def read_key_health() -> dict[str, dict]:
         c = _db_conn()
         for row in c.execute(
                 "SELECT key_name, healthy, failure_count, last_error_type, "
-                "backoff_seconds, disabled_manually FROM key_health"):
+                "backoff_seconds, disabled_manually, backoff_until FROM key_health"):
             out[row[0]] = {
                 "healthy": row[1], "failure_count": row[2],
                 "last_error_type": row[3], "backoff_seconds": row[4],
                 "disabled_manually": row[5],
+                # epoch seconds the lane stays benched until (0/None = not benched).
+                # The routing gate (zai_proxy._is_key_healthy) honours retry_after
+                # = backoff_until; an EXPIRED backoff is a historical mirror note,
+                # NOT an active bench — see the 2026-09-09 oc2 false-positive.
+                "backoff_until": row[6],
             }
         c.close()
     except Exception:
@@ -535,20 +540,35 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
 
         # QUOTA_MODEL_DRIFT: /quota believes headroom but probe says limited,
         # OR proxy marks exhausted/dead but probe succeeds (stale backoff).
+        # "Stale backoff" requires the bench to be STILL ACTIVE: the mirror's
+        # last_error_type lingers after recovery (sticky until the next state
+        # transition), so it alone is not a bench. Only fire when
+        # backoff_until is in the future — the 2026-09-09 oc2 false-positive
+        # fired 94s after a 2s backoff had already expired (one transient 429,
+        # self-healed by the proxy's server-truth recovery 3min later).
+        _benched = (h.get("last_error_type") in ("exhausted", "dead")
+                    and float(h.get("backoff_until") or 0) > time.time())
         if probe_code in (429, 403) and has_headroom:
             _emit_finding("QUOTA_MODEL_DRIFT", lane,
                           f"{lane} /quota reports headroom but probe returns {probe_code}",
                           f"/quota regime/headroom says available, live probe HTTP {probe_code}.",
                           state, dry_run)
             found += 1
-        elif probe_code == 200 and h.get("last_error_type") in ("exhausted", "dead") \
-                and has_headroom:
+        elif probe_code == 200 and _benched and has_headroom:
             _emit_finding("QUOTA_MODEL_DRIFT", lane,
                           f"{lane} marked {h.get('last_error_type')} but probe=200 (stale backoff)",
                           f"key_health={h.get('last_error_type')} backoff {h.get('backoff_seconds')}s "
+                          f"(active until {h.get('backoff_until'):.0f}) "
                           f"but live probe HTTP 200.",
                           state, dry_run)
             found += 1
+        elif probe_code == 200 and has_headroom \
+                and f"QUOTA_MODEL_DRIFT:{lane}" in findings \
+                and findings.get(f"QUOTA_MODEL_DRIFT:{lane}", {}).get("status") == "open":
+            # Mirror recovered (error cleared or backoff expired) and the lane
+            # serves live traffic — resolve the open finding so recurrence
+            # detection re-arms instead of latching open forever.
+            _resolve_finding("QUOTA_MODEL_DRIFT", lane, state)
 
     # ── COST_LEAK: PAYGO spend while a quota lane idled ─────────────────────
     paygo_tokens = sum(v["tokens"] for k, v in spend.items() if k in PAYGO_LANES)

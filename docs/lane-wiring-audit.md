@@ -32,8 +32,25 @@ router keeps dispatch-failing is a config gap, not an outage.
 |---|---|---|
 | `LANE_WIRING_GAP` | end-to-end glm-5.2 probe lands on PAYGO while a quota lane is healthy + headroom | empty `_OLLAMA_CLOUD_KEYS` |
 | `SUSTAINED_DISPATCH_FAIL` | `dispatch_fail` streak *actively climbing* + probe 200 + headroom | wiring/config gap (not stale history) |
-| `QUOTA_MODEL_DRIFT` | `/quota` says headroom but probe 429, or marked dead/exhausted but probe 200 | opencode_go `remaining: inf` vs real 429 |
+| `QUOTA_MODEL_DRIFT` | `/quota` says headroom but probe 429, or marked dead/exhausted **with an ACTIVE backoff** but probe 200 | opencode_go `remaining: inf` vs real 429 |
 | `COST_LEAK` | 1h PAYGO spend while a wired-healthy quota lane idled | $5.05/h → deepseek/chutes |
+
+#### Active-bench discrimination (2026-09-09 oc2 incident)
+
+The "stale backoff" QUOTA_MODEL_DRIFT arm requires the bench to be **still
+active**: `key_health.backoff_until` must be in the future. The mirror's
+`last_error_type` is sticky — it lingers after recovery until the next state
+transition — so it alone does not mean the lane is benched. The routing gate
+(`zai_proxy._is_key_healthy`) only benches a key while `now < retry_after`
+(= `backoff_until`).
+
+Live case: ollama_cloud_2 took ONE transient 429 at 09:59:03 (exhausted #1,
+backoff 2s, expired 09:59:05; self-healed by the proxy's server-truth recovery
+heuristic at 10:02:53). The audit read the stale mirror at 10:00:39 — 94s after
+the backoff expired — and scheduled a fix task for a lane that was already back
+in rotation. With the fix, that shape no longer fires; it instead **resolves**
+an open drift finding once the mirror shows no active bench and the lane
+probes 200 (previously the finding latched open forever — no resolve path).
 
 ### Handling (operator directive 2026-09-09)
 

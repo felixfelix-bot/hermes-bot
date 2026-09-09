@@ -177,6 +177,165 @@ def test_no_drift_when_exhausted_lane_skipped():
     assert not any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
 
 
+# ── QUOTA_MODEL_DRIFT: active-bench discrimination (2026-09-09 oc2 incident) ──
+# Live case: oc2 took ONE transient 429 at 09:59:03 (exhausted #1, backoff 2s,
+# expired 09:59:05). The proxy's server-truth recovery heuristic cleared the
+# breaker at 10:02:53. The audit read the stale mirror at 10:00:39 — 94s after
+# the 2s backoff expired — and flagged "stale backoff" for a lane that was
+# already back in rotation. The detector must only fire while the breaker is
+# STILL ACTIVE (backoff_until in the future); an expired backoff is a
+# historical note, not a bench.
+
+def test_no_drift_when_backoff_expired():
+    # EXACT oc2 incident shape: mirror says exhausted, probe 200, but the
+    # backoff_until is in the PAST — the lane is not benched anymore.
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"last_error_type": "exhausted",
+                                     "backoff_seconds": 2,
+                                     "backoff_until": time.time() - 60})
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True)
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT"
+                   and c[0][1] == "ollama_cloud_2" for c in emit.call_args_list)
+
+
+def test_drift_fires_when_backoff_still_active():
+    # Genuine stale bench: mirror says exhausted, probe 200, backoff_until
+    # still in the FUTURE (e.g. opencode_go 14-day backoff, 2026-09-04 class).
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"last_error_type": "exhausted",
+                                     "backoff_seconds": 900,
+                                     "backoff_until": time.time() + 600})
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True)
+    assert any(c[0][0] == "QUOTA_MODEL_DRIFT"
+               and c[0][1] == "ollama_cloud_2" for c in emit.call_args_list)
+
+
+def test_drift_resolved_when_no_longer_stale():
+    # Latch-open bug: once a QUOTA_MODEL_DRIFT finding opens, nothing ever
+    # resolves it — state latches open forever even after the lane recovers.
+    # A healthy mirror + probe 200 must resolve the finding.
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"healthy": 1,
+                                     "last_error_type": None})
+    state = {"findings": {"QUOTA_MODEL_DRIFT:ollama_cloud_2": {
+        "status": "open", "task_id": "t_b77b3aba", "first_seen": 1}}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_called_once_with("QUOTA_MODEL_DRIFT", "ollama_cloud_2", state)
+
+
+def test_no_drift_when_backoff_null_legacy_row():
+    # Legacy-row edge (kimi cold review 2026-09-09): backoff_until is NULL in
+    # rows never benched (or written by older code). float(None or 0) = 0 →
+    # NOT benched: must not fire drift, and an open drift finding resolves
+    # because the lane provably serves (mirror clean, probe 200, headroom).
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"last_error_type": "exhausted",
+                                     "backoff_seconds": 2,
+                                     "backoff_until": None})
+    state = {"findings": {"QUOTA_MODEL_DRIFT:ollama_cloud_2": {
+        "status": "open", "task_id": "t_x", "first_seen": 1}}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
+    resolve.assert_called_once_with("QUOTA_MODEL_DRIFT", "ollama_cloud_2", state)
+
+
+def test_no_resolve_when_probe_limited():
+    # Negative-resolve (kimi cold review): probe 429 while an open drift
+    # finding exists must NOT resolve — the lane is not provably serving.
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"healthy": 1})
+    state = {"findings": {"QUOTA_MODEL_DRIFT:ollama_cloud_2": {
+        "status": "open", "task_id": "t_x", "first_seen": 1}}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=429), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_not_called()
+    # probe 429 + headroom is itself drift — fires (deduped silently: already open)
+    assert any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
+
+
+def test_no_resolve_when_no_headroom():
+    # Negative-resolve: no quota headroom → the lane cannot serve; an open
+    # drift finding must stay open even though the probe returns 200.
+    quota = _quota(("ollama_cloud_2", False))
+    health = _health(ollama_cloud_2={"healthy": 1})
+    state = {"findings": {"QUOTA_MODEL_DRIFT:ollama_cloud_2": {
+        "status": "open", "task_id": "t_x", "first_seen": 1}}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_not_called()
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
+
+
+def test_no_resolve_without_open_finding():
+    # Negative-resolve: nothing latched open → resolve must not be called
+    # (recurrence detection re-arms cleanly without spurious resolutions).
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"healthy": 1})
+    state = {"findings": {}}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end", return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "probe_lane", return_value=200), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_not_called()
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
+
+
 # ── COST_LEAK ───────────────────────────────────────────────────────────────
 
 def test_cost_leak_when_paygo_spends_while_quota_idle():

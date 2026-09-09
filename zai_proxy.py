@@ -138,8 +138,15 @@ except Exception as _rpte:
     print(f"[real_price_tracker] DISABLED — {_rpte}", flush=True)
     _rpt_get_rate = None
 
-# Kill switch: set OLLAMA_EXTRA_USAGE_ENABLED=false to disable regime-based pricing
-_OLLAMA_EXTRA_USAGE_ENABLED = os.environ.get("OLLAMA_EXTRA_USAGE_ENABLED", "false").lower() in ("1", "true", "yes")
+# Kill switch: set OLLAMA_EXTRA_USAGE_ENABLED=false to disable regime-based
+# pricing. DEFAULT IS ON (t_c8b7a852): the proxy must never silently go
+# quota-blind just because an instance was spawned outside systemd — the
+# 2026-09-09 QUOTA_MODEL_DRIFT incident had a watchdog-spawned instance
+# (proxy-watchdog.sh nohup, no unit env) serving :9099 with all ollama
+# lanes frozen at "included/0%" while ollama_cloud_3's monthly pool was
+# server-side 100% exhausted (live probes 429). Explicit =false still
+# disables; unset now means ENABLED.
+_OLLAMA_EXTRA_USAGE_ENABLED = os.environ.get("OLLAMA_EXTRA_USAGE_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # Cache the quota status to avoid DB queries on every snapshot call.
 # Updated by _snapshot_quota() at most every _OLLAMA_QUOTA_CACHE_TTL seconds.
@@ -7779,6 +7786,8 @@ class Handler(BaseHTTPRequestHandler):
                 "kimi-k3:cloud":    "ollama_cloud",
                 "kimi-k3":          "telnyx",
                 "minimax-m3:cloud": "ollama_cloud",
+                "deepseek/deepseek-v4-flash": "deepseek",
+                "deepseek/deepseek-v4-pro":   "deepseek",
             }
 
             # Default near-zero pricing (internal use — our own agents pay ~$0)
@@ -7820,6 +7829,8 @@ class Handler(BaseHTTPRequestHandler):
                 _m("kimi-k3:cloud", "ollama", 262144),
                 _m("kimi-k3", "telnyx", 262144),
                 _m("minimax-m3:cloud", "ollama", 1048576),
+                _m("deepseek/deepseek-v4-flash", "deepseek"),
+                _m("deepseek/deepseek-v4-pro", "deepseek"),
             ]
             models_data = {
                 "object": "list",

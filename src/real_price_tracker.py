@@ -206,6 +206,7 @@ LAST_RESORT_RATES: dict[str, float] = {
     "deepinfra":          1.30,     # known list price
     "routstr":            0.53,     # daemon network catalog (cheapest node, Cashu-routed)
     "routstrd":           0.53,     # local routstrd daemon — same network catalog
+    "deepseek":           0.22,     # DeepSeek Direct — per-token, deepseek-v4-flash $0.14/M in + $0.28/M out blended
 }
 
 #: Per-model last-resort rates ($/M). Keyed by provider, then model name.
@@ -243,6 +244,7 @@ PROVIDER_WINDOW_HOURS: dict[str, float] = {
     "ppq":          30 * 24,    # 720  — pay-per-token
     "deepinfra":    30 * 24,    # 720  — pay-per-token
     "openrouter":   30 * 24,    # 720  — pay-per-token
+    "deepseek":     30 * 24,    # 720  — DeepSeek Direct, pay-per-token
 }
 
 #: Cold-start seed $/M. Returned by :func:`get_trailing_rate_with_seed` only
@@ -263,6 +265,7 @@ SEED_RATES: dict[str, float] = {
     "ppq":          0.14,     # list price
     "openrouter":   0.135,    # list price
     "deepinfra":    1.30,     # all-time measured average (real)
+    "deepseek":     0.22,     # DeepSeek Direct — deepseek-v4-flash blended
 }
 
 #: Providers that must report a measured (non-seed) rate before the T6 gate

@@ -430,6 +430,7 @@ _QUOTA_TOTALS: dict[str, float] = {
     "telnyx":       float("inf"),  # credit-based, no hard quota
     "routstr":      float("inf"),  # Cashu wallet, balance-probed
     "routstrd":     float("inf"),  # local daemon, Cashu wallet balance-probed
+    "deepseek":     float("inf"),  # DeepSeek Direct, pay-per-token, no hard quota
 }
 
 # z.ai peak hours (UTC) — Ollama/PPQ/OpenRouter/DeepInfra have no peak
@@ -681,7 +682,7 @@ def _compute_credit_pressure(
 
 
 # All providers that are NOT z.ai — these are the failover candidates
-_EXTERNAL_PROVIDERS = ("ollama_cloud", "ollama_cloud_2", "opencode_go", "neuralwatt", "ppq", "openrouter", "deepinfra", "telnyx", "routstr", "routstrd")
+_EXTERNAL_PROVIDERS = ("ollama_cloud", "ollama_cloud_2", "opencode_go", "neuralwatt", "ppq", "openrouter", "deepinfra", "telnyx", "routstr", "routstrd", "deepseek")
 
 # ── CPVO cache (Phase 2.5.4) ─────────────────────────────────────────────────
 # Effective-rate lookups query the telemetry DB; cache them so a hot failover

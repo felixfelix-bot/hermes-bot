@@ -186,8 +186,10 @@ def test_snapshot_quota_uses_builder():
     assert snap["opencode_go"]["regime"] == "exhausted"
     assert snap["opencode_go"]["probe_exhausted"] is True
     assert snap["opencode_go"]["used_pct"] == 100.0
-    # sibling lanes untouched by this change
-    assert snap["neuralwatt"]["used_pct"] in (0.0,) or isinstance(snap["neuralwatt"], dict)
+    # sibling lanes untouched by this change (bridge-state-dependent shape:
+    # the neuralwatt balance entry may or may not carry used_pct depending
+    # on whether the balance bridge cache is warm — only presence matters)
+    assert isinstance(snap.get("neuralwatt"), dict)
 
 
 def test_builder_fails_open():
@@ -216,6 +218,16 @@ def _flag_path():
     # fixture (monkeypatch of zp._OPENCODE_GO_BENCH_FLAG) is honoured —
     # hardcoding Path.home()/... here would desync from the module under test.
     return zp._OPENCODE_GO_BENCH_FLAG
+
+
+def _blocked_flag(tmp_path) -> "object":
+    """A flag path whose parent is a FILE → mkdir/unlink raise OSError.
+
+    Used to prove the persist/clear helpers swallow filesystem errors.
+    """
+    f = tmp_path / "parent_is_a_file"
+    f.write_text("x")
+    return f / ".opencode_go_exhausted_until"
 
 
 def _clear_flag():
@@ -288,3 +300,88 @@ def test_memory_bench_extends_flag_window():
         assert entry["resets_at"] == zp._zai_key_health["opencode_go"]["backoff_until"]
     finally:
         _clear_flag()
+
+
+# ── fail-open hardening (run 81): every error path in the fix block ────────
+# Coverage gaps found via the run-81 coverage run: the persist/clear/read
+# error handlers, the bad-type backoff guard and the builder's outer
+# fail-open had no red/green guard. Each test below pins one handler.
+
+def test_persist_nonpositive_writes_nothing():
+    """reset_seconds <= 0 (garbage hint) → write nothing, never raise."""
+    _clear_state()
+    _clear_flag()
+    zp._opencode_go_persist_bench(0)
+    zp._opencode_go_persist_bench(-3600)
+    assert not _flag_path().exists()
+
+
+def test_persist_never_raises_on_unwritable_flag(monkeypatch, tmp_path):
+    """OSError inside persist (unwritable path) is swallowed — never raises."""
+    _clear_state()
+    with monkeypatch.context() as m:
+        m.setattr(zp, "_OPENCODE_GO_BENCH_FLAG", _blocked_flag(tmp_path))
+        zp._opencode_go_persist_bench(15 * 86400)  # must not raise
+
+
+def test_clear_never_raises_on_missing_parent(monkeypatch, tmp_path):
+    """OSError inside clear (blocked path) is swallowed — never raises."""
+    with monkeypatch.context() as m:
+        m.setattr(zp, "_OPENCODE_GO_BENCH_FLAG", _blocked_flag(tmp_path))
+        zp._opencode_go_clear_persisted_bench()  # must not raise
+
+
+def test_persisted_until_garbage_content_reads_zero():
+    """A corrupted flag (partial write) maps to 0.0 — silent recovery,
+    never a crash, and /quota falls back to the in-memory breaker only."""
+    _clear_state()
+    _clear_flag()
+    _flag_path().write_text("not-a-numb")  # partial write after crash
+    try:
+        assert zp._opencode_go_persisted_bench_until() == 0.0
+        entry = zp._opencode_go_quota_entry()
+        assert entry["regime"] == "included"
+    finally:
+        _clear_flag()
+
+
+def test_bad_backoff_type_is_historical_not_bench():
+    """A malformed backoff_until in the breaker (string/garbage) must read
+    as NO memory bench (0.0) — never raise out of the snapshot path."""
+    _clear_state()
+    _clear_flag()
+    zp._zai_key_health["opencode_go"] = {
+        "healthy": False,
+        "consecutive_failures": 1,
+        "last_error_type": "exhausted",
+        "backoff_until": "not-a-number",   # ← malformed mirror state
+        "retry_after": None,
+        "disabled_manually": False,
+    }
+    try:
+        entry = zp._opencode_go_quota_entry()
+        assert entry["regime"] == "included"  # no active bench, no flag
+    finally:
+        zp._zai_key_health.pop("opencode_go", None)
+
+
+def test_builder_fails_open_on_any_internal_error(monkeypatch):
+    """The outer fail-open: an unexpected internal error yields the legacy
+    dict — /quota must never 500 because of the opencode_go builder.
+
+    (test_builder_fails_open covers the allowance read; this one forces an
+    error the inner try/except does NOT catch — the persisted-bench read —
+    to hit the builder's outer except and prove the legacy fallback.)
+    """
+    _clear_state()
+    _clear_flag()
+
+    def _boom():
+        raise RuntimeError("unexpected")
+
+    with monkeypatch.context() as m:
+        m.setattr(zp, "_opencode_go_persisted_bench_until", _boom)
+        entry = zp._opencode_go_quota_entry()
+        assert entry["regime"] == "included"
+        assert entry["remaining"] == float("inf")
+        assert entry.get("probe_exhausted") is False

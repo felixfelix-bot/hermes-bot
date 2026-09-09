@@ -71,6 +71,20 @@ z.ai keys get preferential treatment in every routing decision. External provide
 - Flat-rate $10/mo provider. Direct API call to `opencode.ai/zen/go/v1`.
 - Health-gated via `_is_key_healthy("opencode_go")`.
 - Records spend, marks healthy on success.
+- **Quota truth (t_5f82cd0f):** /quota's opencode_go entry is built by
+  `_opencode_go_quota_entry()` — breaker state (in-memory `_zai_key_health`
+  backoff) merged with the persisted bench flag
+  (`~/.hermes/bot/.opencode_go_exhausted_until`, written by
+  `_opencode_go_persist_bench()` on a live 429 GoUsageLimitError, parsed via
+  `_parse_opencode_reset_seconds()`) and the 200-fed allowance
+  (`_opencode_go_allowance`). Active bench → regime="exhausted",
+  used_pct=100, probe_exhausted=true, resets_at=backoff epoch (max of
+  memory/flag windows). Every error path fails open to the legacy
+  included/∞ shape. Suite hermeticity: conftest's autouse
+  `_hermetic_proxy_state_files` redirects BOTH the bench flag AND the
+  `_log_key_health` DB-mirror write funnel to per-test tmp paths — mocked-200
+  test paths can no longer unlink the live flag or flip the live key_health
+  mirror (observed 3x on 2026-09-09, runs 79-81).
 
 #### `_try_telnyx()` (line 4250) — Telnyx Kimi Handler
 - Kimi-model-only failover. Maps model names via `_PROVIDER_MODEL_NAMES["telnyx"]`.

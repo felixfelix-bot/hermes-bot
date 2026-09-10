@@ -146,6 +146,160 @@ def test_no_sustained_dispatch_fail_for_stale_count():
     assert not any(c[0][0] == "SUSTAINED_DISPATCH_FAIL" for c in emit.call_args_list)
 
 
+# ── SUSTAINED_DISPATCH_FAIL: stale-probe confirmation (2026-09-10 t_a8d878cc) ─
+# Same staleness class as QUOTA_MODEL_DRIFT (t_cb9de508): the probe cache TTL
+# (6h) can outlive the dispatch-fail condition it measures. The
+# SUSTAINED_DISPATCH_FAIL fire and resolve arms both consume cached probe=200
+# evidence to change state. A stale cached 200 could resolve a finding whose
+# dispatch failures are still live, or fire a finding for a lane that already
+# recovered. Both arms must CONFIRM with ONE fresh probe before acting; None
+# (probe impossible) → do not act.
+
+def test_sustained_dispatch_fail_not_resolved_when_fresh_probe_limited():
+    # Stale cached 200 + genuinely dispatch-failing lane: the cached 200 is
+    # hours old; a fresh probe returns 429 → the lane is still limited, the
+    # open finding must NOT resolve (stale-evidence latch).
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"failure_count": 12,
+                                   "last_error_type": "dispatch_fail"})
+    state = {"failure_counts": {"ollama_cloud": 12},  # NOT climbing → resolve arm
+             "findings": {"SUSTAINED_DISPATCH_FAIL:ollama_cloud": {
+                 "status": "open", "task_id": "t_x", "first_seen": 1}},
+             "probes": {"ollama_cloud": {"ts": time.time() - 7200,
+                                         "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(429, "{}")) as pc, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_not_called()
+    # the confirmation probe actually ran, bypassing the cache…
+    assert pc.call_count == 1
+    assert pc.call_args[0][1] == "k"
+    # …and the stale 200 entry was refreshed with the live truth
+    assert state["probes"]["ollama_cloud"]["code"] == 429
+
+
+def test_sustained_dispatch_fail_resolved_when_fresh_probe_confirms_200():
+    # A stale cached 200 that a fresh probe CONFIRMS as 200 → the lane
+    # provably serves → the open finding resolves.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"failure_count": 12,
+                                   "last_error_type": "dispatch_fail"})
+    state = {"failure_counts": {"ollama_cloud": 12},  # NOT climbing → resolve arm
+             "findings": {"SUSTAINED_DISPATCH_FAIL:ollama_cloud": {
+                 "status": "open", "task_id": "t_x", "first_seen": 1}},
+             "probes": {"ollama_cloud": {"ts": time.time() - 7200,
+                                         "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(200, "{}")) as pc, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_called_once_with("SUSTAINED_DISPATCH_FAIL", "ollama_cloud",
+                                    state, True)
+    assert pc.call_count == 1
+    assert state["probes"]["ollama_cloud"]["code"] == 200
+
+
+def test_sustained_dispatch_fail_not_fired_when_fresh_probe_limited():
+    # Fire arm: failures climbing + cached 200, but a fresh probe returns 429
+    # → the lane is limited, not a dispatch-fail paradox → must NOT fire.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"failure_count": 12,
+                                   "last_error_type": "dispatch_fail"})
+    state = {"failure_counts": {"ollama_cloud": 8},  # climbing 8 -> 12
+             "probes": {"ollama_cloud": {"ts": time.time() - 7200,
+                                         "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(429, "{}")) as pc, \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert not any(c[0][0] == "SUSTAINED_DISPATCH_FAIL"
+                   for c in emit.call_args_list), \
+        "fresh 429 must not be read as a dispatch-fail paradox"
+    assert pc.call_count == 1
+    assert state["probes"]["ollama_cloud"]["code"] == 429
+
+
+def test_sustained_dispatch_fail_fired_when_fresh_probe_confirms_200():
+    # Fire arm: failures climbing + cached 200, fresh probe confirms 200 →
+    # genuine dispatch-fail paradox → fires.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"failure_count": 12,
+                                   "last_error_type": "dispatch_fail"})
+    state = {"failure_counts": {"ollama_cloud": 8},  # climbing 8 -> 12
+             "probes": {"ollama_cloud": {"ts": time.time() - 7200,
+                                         "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(200, "{}")) as pc, \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert any(c[0][0] == "SUSTAINED_DISPATCH_FAIL"
+               for c in emit.call_args_list), \
+        "fresh-confirmed 200 + climbing dispatch-fail is a genuine paradox"
+    assert pc.call_count == 1
+    assert state["probes"]["ollama_cloud"]["code"] == 200
+
+
+def test_sustained_dispatch_fail_skipped_when_confirmation_probe_impossible():
+    # If the confirmation probe cannot run (env key vanished since the cached
+    # probe was taken), the cached 200 is unconfirmable → do NOT resolve (or
+    # fire) on possibly-stale evidence.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"failure_count": 12,
+                                   "last_error_type": "dispatch_fail"})
+    state = {"failure_counts": {"ollama_cloud": 12},  # NOT climbing → resolve arm
+             "findings": {"SUSTAINED_DISPATCH_FAIL:ollama_cloud": {
+                 "status": "open", "task_id": "t_x", "first_seen": 1}},
+             "probes": {"ollama_cloud": {"ts": time.time() - 7200,
+                                         "code": 200, "body": ""}}}
+    env = {}  # key present at probe time, gone now
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud_4"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat") as pc, \
+         mock.patch.object(_MOD, "_resolve_finding") as resolve, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    resolve.assert_not_called()
+    pc.assert_not_called()
+
+
 # ── QUOTA_MODEL_DRIFT ───────────────────────────────────────────────────────
 
 def test_drift_when_probe_limited_but_quota_says_headroom():

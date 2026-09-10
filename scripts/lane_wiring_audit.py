@@ -605,7 +605,15 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
                        .get("status") == "open")
         if probe_code in (429, 403) and has_headroom:
             probe_code = probe_lane(lane, env, state, force=True)
-        elif probe_code == 200 and (_benched or (has_headroom and _open_drift)):
+        elif probe_code == 200 and has_headroom \
+                and (_benched or _open_drift):
+            # Cold-review minor #1 (kimi, t_cb9de508): has_headroom gates the
+            # re-probe too — both consumers of a cached-200 confirmation
+            # (stale-backoff fire, open-drift resolve) require headroom, so
+            # probing a benched lane with NO headroom would spend a 1-token
+            # probe no arm can consume. Mirror the consumer conditions
+            # exactly: (_benched and has_headroom) or (has_headroom and
+            # _open_drift).
             probe_code = probe_lane(lane, env, state, force=True)
         if probe_code in (429, 403) and has_headroom:
             _emit_finding("QUOTA_MODEL_DRIFT", lane,

@@ -230,13 +230,22 @@ def _probe_zai(key: str) -> tuple[int, str]:
         return 0, ""
 
 
-def probe_lane(lane: str, env: dict[str, str], state: dict) -> int | None:
-    """Rate-limited probe of one lane. Returns http code or None if skipped."""
+def probe_lane(lane: str, env: dict[str, str], state: dict,
+               force: bool = False) -> int | None:
+    """Rate-limited probe of one lane. Returns http code or None if skipped.
+
+    force=True bypasses the TTL cache ONCE (t_cb9de508): the audit's drift
+    arms use it to confirm a cached code that contradicts fresh state before
+    firing (or resolving) on it. The fresh result replaces the cached entry,
+    restarting the rate-limit window — so a confirmed contradiction keeps the
+    probe evidence provably live while an incident is open.
+    """
     if lane not in PROBE_KEYS:
         return None
     probes = state.setdefault("probes", {})
     last = probes.get(lane, {})
-    if time.time() - last.get("ts", 0) < PROBE_INTERVAL_S and "code" in last:
+    if (not force and time.time() - last.get("ts", 0) < PROBE_INTERVAL_S
+            and "code" in last):
         return last["code"]
     env_var, base = PROBE_KEYS[lane]
     key = env.get(env_var, "")
@@ -576,10 +585,33 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
         # self-healed by the proxy's server-truth recovery 3min later).
         _benched = (h.get("last_error_type") in ("exhausted", "dead")
                     and float(h.get("backoff_until") or 0) > time.time())
+        # Stale-evidence guard (t_cb9de508, 2026-09-10 false positive): the
+        # probe cache TTL (6h) outlives the ollama 5h session window it
+        # measures. The 15:00 probe caught a genuine session-limit 429; the
+        # window rolled at 16:02 (777 dispatches served); the 17:00 run then
+        # compared FRESH /quota headroom against the 2h-stale cached 429 and
+        # fired a fix task for a lane that was actively serving. /quota,
+        # key_health and spend are read fresh every run — the probe is the
+        # ONLY signal that may be hours old. So before any drift arm consumes
+        # probe evidence to CHANGE state (fire or resolve), confirm the
+        # contradiction with ONE fresh probe. Cost: zero extra probes in
+        # steady state; ≤1 per lane per run at contradiction moments and while
+        # a finding is open — exactly when a 1-token probe is justified.
+        # None = the confirmation probe could not run → the cached evidence
+        # is unconfirmable → do not act on it (no fire, no resolve). The
+        # lane's other signals (mirror, /quota server truth, spend) are
+        # still audited every run.
+        _open_drift = (findings.get(f"QUOTA_MODEL_DRIFT:{lane}", {})
+                       .get("status") == "open")
+        if probe_code in (429, 403) and has_headroom:
+            probe_code = probe_lane(lane, env, state, force=True)
+        elif probe_code == 200 and (_benched or (has_headroom and _open_drift)):
+            probe_code = probe_lane(lane, env, state, force=True)
         if probe_code in (429, 403) and has_headroom:
             _emit_finding("QUOTA_MODEL_DRIFT", lane,
                           f"{lane} /quota reports headroom but probe returns {probe_code}",
-                          f"/quota regime/headroom says available, live probe HTTP {probe_code}.",
+                          f"/quota regime/headroom says available, live probe HTTP {probe_code} "
+                          f"(re-probed fresh this run).",
                           state, dry_run)
             found += 1
         elif probe_code == 200 and _benched and has_headroom:
@@ -587,12 +619,10 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
                           f"{lane} marked {h.get('last_error_type')} but probe=200 (stale backoff)",
                           f"key_health={h.get('last_error_type')} backoff {h.get('backoff_seconds')}s "
                           f"(active until {h.get('backoff_until'):.0f}) "
-                          f"but live probe HTTP 200.",
+                          f"but live probe HTTP 200 (re-probed fresh this run).",
                           state, dry_run)
             found += 1
-        elif probe_code == 200 and has_headroom \
-                and f"QUOTA_MODEL_DRIFT:{lane}" in findings \
-                and findings[f"QUOTA_MODEL_DRIFT:{lane}"].get("status") == "open":
+        elif probe_code == 200 and has_headroom and _open_drift:
             # Mirror recovered (error cleared or backoff expired) and the lane
             # serves live traffic — resolve the open finding so recurrence
             # detection re-arms instead of latching open forever.

@@ -409,6 +409,34 @@ def test_stale_backoff_arm_also_requires_fresh_confirmation():
     assert state["probes"]["ollama_cloud_2"]["code"] == 429
 
 
+def test_no_confirmation_probe_when_no_arm_can_consume_it():
+    # Cold-review minor #1 (kimi, t_cb9de508): benched + NO headroom — the
+    # stale-backoff arm (needs headroom) and the resolve arm (needs headroom)
+    # can never consume a re-probe result, so the confirmation guard must NOT
+    # spend a probe on this shape either.
+    quota = _quota(("ollama_cloud_2", False))  # no headroom
+    health = _health(ollama_cloud_2={"last_error_type": "exhausted",
+                                     "backoff_seconds": 900,
+                                     "backoff_until": time.time() + 600})
+    state = {"probes": {"ollama_cloud_2": {"ts": time.time() - 7200,
+                                           "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY_2": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat") as pc, \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    pc.assert_not_called()
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT"
+                   for c in emit.call_args_list)
+
+
 def test_probe_lane_force_bypasses_cache_and_refreshes():
     # Unit: force=True skips the TTL cache-hit branch and rewrites the
     # cached entry with the fresh result.

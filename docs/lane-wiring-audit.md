@@ -31,7 +31,7 @@ router keeps dispatch-failing is a config gap, not an outage.
 | Finding | Trigger | Caught |
 |---|---|---|
 | `LANE_WIRING_GAP` | end-to-end glm-5.2 probe lands on PAYGO while a quota lane is healthy + headroom | empty `_OLLAMA_CLOUD_KEYS` |
-| `SUSTAINED_DISPATCH_FAIL` | `dispatch_fail` streak *actively climbing* + probe 200 + headroom | wiring/config gap (not stale history) |
+| `SUSTAINED_DISPATCH_FAIL` | `dispatch_fail` streak *actively climbing* + probe 200 + headroom — the 200 **confirmed by a fresh re-probe** before firing/resolving | wiring/config gap (not stale history) |
 | `QUOTA_MODEL_DRIFT` | `/quota` says headroom but probe 429, or marked dead/exhausted **with an ACTIVE backoff** but probe 200 — either contradiction **confirmed by a fresh re-probe** before firing/resolving | opencode_go `remaining: inf` vs real 429; 2026-09-10 stale-cache 429 false positive |
 | `COST_LEAK` | 1h PAYGO spend while a wired-healthy quota lane idled | $5.05/h → deepseek/chutes |
 
@@ -53,7 +53,7 @@ an open drift finding once the mirror shows no active bench, the lane probes
 200, and quota headroom exists (previously the finding latched open forever —
 no resolve path).
 
-#### Fresh-probe confirmation (2026-09-10 t_cb9de508 incident)
+#### Fresh-probe confirmation (2026-09-10 t_cb9de508 + t_a8d878cc)
 
 Every signal the drift arms compare is read fresh each run — `/quota`,
 `key_health`, 1h spend — **except the lane probe**, which is TTL-cached for
@@ -69,9 +69,10 @@ the exhaustion it captured:
   **2h-stale cached 429** → contradiction → false QUOTA_MODEL_DRIFT task for a
   lane that was actively serving traffic.
 
-The fix: before any QUOTA_MODEL_DRIFT arm consumes probe evidence to **change
-state** (fire a finding, or resolve an open one), it re-probes the lane once
-with `probe_lane(..., force=True)`, bypassing the cache:
+The fix: before **any** finding arm (QUOTA_MODEL_DRIFT *and*
+SUSTAINED_DISPATCH_FAIL) consumes probe evidence to **change state** (fire a
+finding, or resolve an open one), it re-probes the lane once with
+`probe_lane(..., force=True)`, bypassing the cache:
 
 - Fresh 200 after a cached 429 → the cached code was stale → no finding (and
   an open finding resolves — the lane provably serves).
@@ -81,9 +82,18 @@ with `probe_lane(..., force=True)`, bypassing the cache:
   action; the lane's other signals (mirror, `/quota` server truth, spend) are
   still audited hourly.
 
+The SUSTAINED_DISPATCH_FAIL arms are the same staleness class: a cached 200
+can outlive the dispatch-fail condition it measures. A stale cached 200 could
+resolve a finding whose dispatch failures are still live, or fire a finding for
+a lane that already recovered — so both its fire and resolve arms confirm the
+200 with one fresh probe before acting. The two finding types share a single
+per-lane confirmation probe per run (a lane re-probed for one arm is not
+re-probed for the other), keeping the cost bound at ≤1 extra probe per lane
+per run.
+
 Cost bound: zero extra probes in steady state (no contradiction → no
 re-probe); at most one extra 1-token probe per lane per run, only while a
-contradiction or an open drift finding exists. The fresh result replaces the
+contradiction or an open finding exists. The fresh result replaces the
 cached entry, restarting the rate-limit window.
 
 ### Handling (operator directive 2026-09-09)

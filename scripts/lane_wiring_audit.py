@@ -562,14 +562,35 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
 
         # SUSTAINED_DISPATCH_FAIL: failures ACTIVELY climbing while probe works
         # and quota headroom exists → live wiring/config gap (not stale).
-        if (h.get("last_error_type") == "dispatch_fail"
-                and fc_now > fc_before
-                and fc_now >= DISPATCH_FAIL_STREAK
-                and has_headroom and probe_code == 200):
+        # Stale-evidence guard (t_a8d878cc, kimi cold-review minor #2): the
+        # probe cache TTL (6h) can outlive the dispatch-fail condition it
+        # measures. Both arms below consume cached probe=200 evidence to
+        # change state (fire or resolve). Before acting, confirm the 200 with
+        # ONE fresh probe — a stale cached 200 could resolve a finding whose
+        # dispatch failures are still live, or fire a finding for a lane that
+        # already recovered. None (probe impossible) → do not act. The lane's
+        # other signals (mirror, /quota server truth, spend) are still audited
+        # every run.
+        _sdf_climbing = (h.get("last_error_type") == "dispatch_fail"
+                         and fc_now > fc_before
+                         and fc_now >= DISPATCH_FAIL_STREAK)
+        _open_sdf = (findings.get(f"SUSTAINED_DISPATCH_FAIL:{lane}", {})
+                     .get("status") == "open")
+        # Mirror the consumer conditions exactly so a re-probe is only spent
+        # when an arm can consume it: the fire arm needs _sdf_climbing, the
+        # resolve arm needs an open finding AND the mirror still dispatch_fail.
+        _reprobed = False
+        if probe_code == 200 and has_headroom and (
+                _sdf_climbing
+                or (_open_sdf and h.get("last_error_type") == "dispatch_fail")):
+            probe_code = probe_lane(lane, env, state, force=True)
+            _reprobed = True
+        if _sdf_climbing and has_headroom and probe_code == 200:
             _emit_finding("SUSTAINED_DISPATCH_FAIL", lane,
                           f"{lane} dispatch-failing ({fc_now}x, +{fc_now - fc_before} this run) but probe=200",
                           f"key_health dispatch_fail x{fc_now} (climbing); "
-                          f"live probe HTTP 200; quota headroom present. Wiring/config gap.",
+                          f"live probe HTTP 200 (re-probed fresh this run); "
+                          f"quota headroom present. Wiring/config gap.",
                           state, dry_run)
             found += 1
         elif h.get("last_error_type") == "dispatch_fail" and has_headroom and probe_code == 200:
@@ -603,9 +624,9 @@ def audit(dry_run: bool = False, state: dict | None = None) -> int:
         # still audited every run.
         _open_drift = (findings.get(f"QUOTA_MODEL_DRIFT:{lane}", {})
                        .get("status") == "open")
-        if probe_code in (429, 403) and has_headroom:
+        if not _reprobed and probe_code in (429, 403) and has_headroom:
             probe_code = probe_lane(lane, env, state, force=True)
-        elif probe_code == 200 and has_headroom \
+        elif not _reprobed and probe_code == 200 and has_headroom \
                 and (_benched or _open_drift):
             # Cold-review minor #1 (kimi, t_cb9de508): has_headroom gates the
             # re-probe too — both consumers of a cached-200 confirmation

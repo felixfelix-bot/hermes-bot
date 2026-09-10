@@ -256,6 +256,7 @@ def test_no_drift_when_backoff_null_legacy_row():
     # rows never benched (or written by older code). float(None or 0) = 0 →
     # NOT benched: must not fire drift, and an open drift finding resolves
     # because the lane provably serves (mirror clean, probe 200, headroom).
+
     quota = _quota(("ollama_cloud_2", True))
     health = _health(ollama_cloud_2={"last_error_type": "exhausted",
                                      "backoff_seconds": 2,
@@ -275,6 +276,154 @@ def test_no_drift_when_backoff_null_legacy_row():
     assert not any(c[0][0] == "QUOTA_MODEL_DRIFT" for c in emit.call_args_list)
     resolve.assert_called_once_with("QUOTA_MODEL_DRIFT", "ollama_cloud_2", state,
                                     True)
+
+
+# ── QUOTA_MODEL_DRIFT: stale-probe confirmation (2026-09-10 t_cb9de508) ─────
+# Live case: the 15:00 probe caught a GENUINE session-limit 429 on
+# ollama_cloud. The 5h session window rolled at 16:02 (first 200 dispatch at
+# ts 1789038135); 777 successful dispatches followed. The 17:00 audit run then
+# compared FRESH /quota headroom (session 29%) against the 2h-stale cached
+# 429 (probe cache TTL is 6h — it outlives the 5h window it measures) and
+# fired a false QUOTA_MODEL_DRIFT task for a lane that was actively serving.
+# The drift arms must CONFIRM a cached-probe contradiction with ONE fresh
+# probe before firing (or resolving) — the probe is the only live signal in
+# that decision, and everything else (/quota, key_health, spend) is fresh.
+
+def _stale_probe_state(age_s=7200, code=429):
+    """State exactly like lane_audit_state.json at 17:00: a cached probe
+    taken `age_s` ago whose code contradicts the current fresh /quota."""
+    return {"probes": {"ollama_cloud": {"ts": time.time() - age_s,
+                                        "code": code, "body": ""}}}
+
+
+def test_drift_not_fired_when_fresh_probe_recovered_after_cached_429():
+    # EXACT t_cb9de508 incident shape: cached 429 (2h old, within the 6h
+    # TTL), fresh /quota headroom, live lane. A confirmation re-probe
+    # returns 200 → the cached 429 was stale → NO finding, cache refreshed.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"healthy": 1})
+    state = _stale_probe_state()
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(200, "{}")) as pc, \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT"
+                   for c in emit.call_args_list), \
+        "stale cached 429 + fresh 200 re-probe must not fire drift"
+    # the confirmation probe actually ran, bypassing the cache…
+    assert pc.call_count == 1
+    assert pc.call_args[0][1] == "k"
+    # …and the stale 429 entry was refreshed with the live truth
+    assert state["probes"]["ollama_cloud"]["code"] == 200
+
+
+def test_drift_fires_when_fresh_probe_confirms_cached_429():
+    # A cached 429 that a fresh probe CONFIRMS is genuine drift (/quota
+    # server-truth stale, upstream still limited) → fires, with the cache
+    # refreshed so the evidence is provably live.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"healthy": 1})
+    state = _stale_probe_state()
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(429, "{}")), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert any(c[0][0] == "QUOTA_MODEL_DRIFT" and c[0][1] == "ollama_cloud"
+               for c in emit.call_args_list), \
+        "fresh-confirmed 429 + headroom is genuine drift and must fire"
+    assert state["probes"]["ollama_cloud"]["code"] == 429
+
+
+def test_drift_skipped_when_confirmation_probe_impossible():
+    # If the confirmation probe cannot run at all (env key vanished since the
+    # cached probe was taken), the cached contradiction is unconfirmable —
+    # do NOT schedule a fix task on possibly-stale evidence. The lane's other
+    # signals (mirror, /quota server truth, spend) are still audited hourly.
+    quota = _quota(("ollama_cloud", True))
+    health = _health(ollama_cloud={"healthy": 1})
+    state = _stale_probe_state()
+    env = {}  # key present at probe time, gone now
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat") as pc, \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert not any(c[0][0] == "QUOTA_MODEL_DRIFT"
+                   for c in emit.call_args_list), \
+        "unconfirmable cached evidence must not fire drift"
+    pc.assert_not_called()
+
+
+def test_stale_backoff_arm_also_requires_fresh_confirmation():
+    # Mirror says benched (active backoff) + cached 200 → before firing the
+    # "stale backoff" drift arm, confirm with a fresh probe. Here the fresh
+    # probe returns 429 → the bench is REAL (upstream limited again): do not
+    # fire the stale-backoff arm (and, no headroom change, nothing fires —
+    # expected-exhaustion state).
+    quota = _quota(("ollama_cloud_2", True))
+    health = _health(ollama_cloud_2={"last_error_type": "exhausted",
+                                     "backoff_seconds": 900,
+                                     "backoff_until": time.time() + 600})
+    state = {"probes": {"ollama_cloud_2": {"ts": time.time() - 7200,
+                                           "code": 200, "body": ""}}}
+    env = {"OLLAMA_CLOUD_API_KEY_2": "k"}
+    with mock.patch.object(_MOD, "fetch_quota", return_value=quota), \
+         mock.patch.object(_MOD, "read_key_health", return_value=health), \
+         mock.patch.object(_MOD, "read_1h_spend", return_value={}), \
+         mock.patch.object(_MOD, "disabled_flags", return_value=set()), \
+         mock.patch.object(_MOD, "probe_end_to_end",
+                           return_value="ollama_cloud"), \
+         mock.patch.object(_MOD, "_load_env", return_value=env), \
+         mock.patch.object(_MOD, "_probe_chat", return_value=(429, "{}")), \
+         mock.patch.object(_MOD, "_emit_finding") as emit, \
+         mock.patch.object(_MOD, "_save_state"):
+        _MOD.audit(dry_run=True, state=state)
+    assert not any(c[0][1] == "ollama_cloud_2" and "stale backoff"
+                   in c[0][2] for c in emit.call_args_list), \
+        "fresh 429 must not be read as a stale bench"
+    # the fresh 429 + headroom IS a genuine drift, though — that arm fires
+    assert any(c[0][0] == "QUOTA_MODEL_DRIFT" and c[0][1] == "ollama_cloud_2"
+               for c in emit.call_args_list)
+    assert state["probes"]["ollama_cloud_2"]["code"] == 429
+
+
+def test_probe_lane_force_bypasses_cache_and_refreshes():
+    # Unit: force=True skips the TTL cache-hit branch and rewrites the
+    # cached entry with the fresh result.
+    env = {"OLLAMA_CLOUD_API_KEY": "k"}
+    state = {"probes": {"ollama_cloud": {"ts": time.time(), "code": 429,
+                                         "body": ""}}}
+    with mock.patch.object(_MOD, "_probe_chat",
+                           return_value=(200, "{}")) as pc:
+        assert _MOD.probe_lane("ollama_cloud", env, state, force=True) == 200
+    pc.assert_called_once()
+    assert state["probes"]["ollama_cloud"]["code"] == 200
+    # force=False honours the cache: no probe, cached code returned
+    with mock.patch.object(_MOD, "_probe_chat") as pc2:
+        assert _MOD.probe_lane("ollama_cloud", env, state) == 200
+    pc2.assert_not_called()
 
 
 def test_no_resolve_when_probe_limited():

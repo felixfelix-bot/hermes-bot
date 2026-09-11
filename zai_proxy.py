@@ -1951,6 +1951,26 @@ def _neuralwatt_quota_snapshot() -> dict:
         return {"used_pct": 0.0, "remaining": float("inf")}
 
 
+def _ollama_probe_truth_override(used_pct: float, regime: str,
+                                 oc_status: dict) -> tuple:
+    """Force /quota's aggregate ollama used_pct/regime to match the probe.
+
+    t_30dde4c7 prong (c): the LOCAL token counter cannot see a consumed
+    server-side pool, so without this the aggregate fields contradicted the
+    probe markers and misled operators — live 2026-09-11, ollama_cloud_4 read
+    ``used_pct=21.62 / remaining=392M`` while ollama.com/api/usage reported
+    ``monthly.usage=1.0`` (the plan's only window; it has no weekly field).
+    Exhausted → used_pct 100 so remaining computes to 0 and the entry agrees
+    with ``probe_exhausted``. Never raises; an unusable status is a no-op.
+    """
+    try:
+        if oc_status.get("probe_exhausted", False):
+            return 100.0, "exhausted"
+    except Exception:
+        pass
+    return used_pct, regime
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -1991,6 +2011,11 @@ def _snapshot_quota() -> dict:
             if _ollama_paywall_active(_oc_key):
                 oc_used_pct = 100.0
                 oc_regime = "paywalled"
+            else:
+                # t_30dde4c7 (c): probe-exhausted pools must not advertise
+                # local-counter headroom (remaining) they do not have.
+                oc_used_pct, oc_regime = _ollama_probe_truth_override(
+                    oc_used_pct, oc_regime, oc_status)
             oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0)) if oc_total else float("inf")
             snap[_oc_key] = {
                 "used_pct": float(oc_used_pct),

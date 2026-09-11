@@ -14,6 +14,7 @@ Run from the WORKTREE (so `import zai_proxy` resolves to the worktree copy):
 """
 
 import importlib.util
+import os
 import sys
 import time
 import sqlite3
@@ -27,11 +28,18 @@ from unittest import mock
 # test_flat_router.py anti-trap: pytest may have already registered `zai_proxy`
 # in sys.modules (from a prior test module) pointing at the LIVE file, so a
 # bare `import zai_proxy` would test stale code. Load by absolute path.
+#
+# Deployment check: set ZAI_PROXY_TARGET=/home/c03rad0r/.hermes/bot/zai_proxy.py
+# to run this same suite against the ARTIFACT THAT IS ACTUALLY RUNNING (run it
+# from ~/.hermes/bot so the live module's relative imports resolve):
+#     cd ~/.hermes/bot && ZAI_PROXY_TARGET=~/.hermes/bot/zai_proxy.py \
+#         pytest ~/worktrees/t_30dde4c7/test_ollama_probe_sync.py -q
 _WORKTREE = str(Path(__file__).resolve().parent)
 if _WORKTREE not in sys.path:
     sys.path.insert(0, _WORKTREE)
 
-_WT_ZAI_PROXY = str(Path(_WORKTREE) / "zai_proxy.py")
+_WT_ZAI_PROXY = os.environ.get("ZAI_PROXY_TARGET") or str(
+    Path(_WORKTREE) / "zai_proxy.py")
 _spec = importlib.util.spec_from_file_location("zai_proxy_wt", _WT_ZAI_PROXY)
 _zp_mod = importlib.util.module_from_spec(_spec)
 sys.modules["zai_proxy_wt"] = _zp_mod
@@ -195,6 +203,110 @@ class OllamaProbeSyncFixture(unittest.TestCase):
             self.zp._recover_ollama_stale_backoffs()
         h = self.zp._zai_key_health.get("ollama_cloud_3", {})
         self.assertFalse(h.get("healthy", True))
+
+
+class OllamaPaywallDisarmTest(OllamaProbeSyncFixture):
+    """Prong (b) completion: the persisted 403-paywall flag must not outlive a
+    server-proven pool reset.
+
+    The 403 handler arms `.ollama_exhausted_until[_N]` until a next-Monday
+    00:00 UTC horizon, but the real ollama weekly pool is a ROLLING 7-day
+    window and ollama_cloud_3's pool is MONTHLY — so a flagged key stayed
+    benched for days after the pool had actually reset. Clearing the in-memory
+    backoff alone is not enough: `_is_key_healthy()` consults the paywall flag
+    FIRST, before it ever looks at the health dict.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._flagdir = Path(tempfile.mkdtemp())
+        mock.patch.object(self.zp, "_OLLAMA_PAYWALL_FLAGS",
+                          self._flags()).start()
+        self.zp._ollama_paywall_disarms.clear()
+
+    def _flags(self):
+        d = self._flagdir
+        return {
+            "ollama_cloud": d / ".ollama_exhausted_until",
+            "ollama_cloud_2": d / ".ollama_exhausted_until_2",
+            "ollama_cloud_3": d / ".ollama_exhausted_until_3",
+            "ollama_cloud_4": d / ".ollama_exhausted_until_4",
+        }
+
+    def _arm(self, key):
+        """Simulate the 403 handler arming the persisted paywall flag."""
+        f = self._flags()[key]
+        f.write_text(str(time.time() + 48 * 3600))
+        return f
+
+    def _local_zero(self, monthly_limit=500_000_00):
+        return {"regime": "included", "session_used_pct": 0.0,
+                "weekly_used_pct": 0.0, "monthly_used_pct": 0.0,
+                "session_tokens": 0, "weekly_tokens": 0, "monthly_tokens": 0,
+                "monthly_limit": monthly_limit}
+
+    def _recover_with_probe(self, fracs):
+        with mock.patch.object(self.zp, "_get_quota_status",
+                               return_value=self._local_zero()), \
+             mock.patch.object(self.oeu, "fetch_ollama_usage",
+                               return_value=(None if fracs is None
+                                             else self._make_usage(fracs))):
+            self.zp._recover_ollama_stale_backoffs()
+
+    def test_flag_disarmed_when_probe_proves_reset(self):
+        # Key is paywalled (flag armed) but the server pool has reset.
+        f = self._arm("ollama_cloud_2")
+        # Also benched in memory (the 403 handler marks exhausted too).
+        self.zp._zai_key_health["ollama_cloud_2"] = {
+            "healthy": False, "last_error_type": "exhausted",
+            "retry_after": time.time() + 3600, "consecutive_failures": 3}
+        self._recover_with_probe({"session": 0.0, "weekly": 0.1})
+        self.assertFalse(f.exists(), "paywall flag must be disarmed on reset")
+        h = self.zp._zai_key_health.get("ollama_cloud_2", {})
+        self.assertTrue(h.get("healthy", False),
+                        "in-memory exhaustion backoff must be cleared too")
+
+    def test_flag_kept_while_probe_still_exhausted(self):
+        f = self._arm("ollama_cloud_3")
+        self._recover_with_probe({"monthly": 1.0})
+        self.assertTrue(f.exists(), "still-exhausted pool must keep the flag")
+        self.assertFalse(self.zp._ollama_paywall_disarms.get("ollama_cloud_3"),
+                         "no disarm may be recorded while the pool is exhausted")
+
+    def test_flag_kept_when_probe_unavailable(self):
+        # Server fetch failed → no probe truth → NO action (retry-storm guard).
+        f = self._arm("ollama_cloud")
+        self._recover_with_probe(None)
+        self.assertTrue(f.exists(), "no fresh probe → never disarm")
+
+    def test_flag_kept_at_boundary_usage(self):
+        # 99.5% is not probe_exhausted but is NOT a clear reset either — a
+        # disarm here would flap against the 403 gate.
+        f = self._arm("ollama_cloud_4")
+        self._recover_with_probe({"monthly": 0.995})
+        self.assertTrue(f.exists(), "boundary usage must not trigger a disarm")
+
+    def test_disarm_cap_prevents_flap(self):
+        # A lapsed-plan 403 re-arms on every dispatch; the cap must stop the
+        # probe loop from flapping forever (bounded wasted requests).
+        key = "ollama_cloud"
+        for _ in range(3):
+            f = self._arm(key)
+            self._recover_with_probe({"weekly": 0.2})
+            self.assertFalse(f.exists(), "first 3 disarms are allowed")
+        f = self._arm(key)          # 4th re-arm within the 24h window
+        self._recover_with_probe({"weekly": 0.2})
+        self.assertTrue(f.exists(), "4th disarm must be refused by the cap")
+        self.assertEqual(len(self.zp._ollama_paywall_disarms[key]), 3)
+
+    def test_expired_flags_do_not_count_as_benched(self):
+        # `_ollama_paywall_active` is horizon-based; an expired flag leaves the
+        # key routable and the recovery loop must not touch it.
+        f = self._flags()["ollama_cloud"]
+        f.write_text(str(time.time() - 60))
+        self._recover_with_probe({"weekly": 0.0})
+        self.assertTrue(f.exists())   # untouched (not armed → not our business)
+        self.assertFalse(self.zp._ollama_paywall_active("ollama_cloud"))
 
 
 if __name__ == "__main__":

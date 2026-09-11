@@ -1080,6 +1080,62 @@ def _ollama_paywall_active(key_name: str = "ollama_cloud") -> bool:
         return False
 
 
+# ── Probe-driven paywall disarm (t_30dde4c7 prong b) ────────────────────────
+# The persisted 403-paywall flag is armed until a next-Monday-00:00-UTC horizon,
+# which is only an APPROXIMATION of the real pool reset: ollama's weekly window
+# is a rolling 7 days anchored at the subscription start, and ollama_cloud_3's
+# pool is MONTHLY. A key benched by the flag therefore stayed benched for days
+# after the server pool had already reset — the same stale-health livelock this
+# task removes, one level down (the flag is consulted FIRST in _is_key_healthy,
+# so clearing the in-memory backoff alone is not enough).
+# _recover_ollama_stale_backoffs now disarms the flag as soon as a FRESH server
+# probe proves the pool is no longer exhausted.
+#
+# Anti-thrash guard: a 403 "requires a subscription" body is emitted BOTH for
+# quota exhaustion (pool resets) and for a lapsed/cancelled plan (never resets),
+# and /api/usage only reports usage fractions — it cannot tell them apart. A
+# genuine reset heals on the first disarm; a lapsed plan simply re-arms on the
+# next 403 and a genuinely dead pool would flap forever. So cap probe-driven
+# disarms per key per 24h and then leave the flag to expire on its own horizon.
+_OLLAMA_PAYWALL_DISARM_LIMIT = 3
+_OLLAMA_PAYWALL_DISARM_WINDOW_S = 24 * 3600
+_ollama_paywall_disarms: dict[str, list] = {}
+
+
+def _ollama_paywall_disarm_allowed(key_name: str,
+                                   now: float | None = None) -> bool:
+    """True while *key_name* is still under the probe-disarm cap.
+
+    Prunes the per-key disarm history to the trailing 24h window and compares
+    against _OLLAMA_PAYWALL_DISARM_LIMIT. Fail-CLOSED (False) on error: a
+    bookkeeping failure must never authorise unbounded disarms.
+    """
+    try:
+        _now = time.time() if now is None else now
+        _hist = [t for t in _ollama_paywall_disarms.get(key_name, [])
+                 if _now - t < _OLLAMA_PAYWALL_DISARM_WINDOW_S]
+        _ollama_paywall_disarms[key_name] = _hist
+        return len(_hist) < _OLLAMA_PAYWALL_DISARM_LIMIT
+    except Exception:
+        return False
+
+
+def _disarm_ollama_paywall_flag(key_name: str = "ollama_cloud") -> bool:
+    """Remove the persisted paywall flag after a probe proved the pool reset.
+
+    Returns True when a flag was actually removed. Counts against the
+    anti-thrash cap. Never raises.
+    """
+    try:
+        flag = _OLLAMA_PAYWALL_FLAGS.get(key_name, _OLLAMA_PAYWALL_FLAG)
+        existed = flag.exists()
+        flag.unlink(missing_ok=True)
+        _ollama_paywall_disarms.setdefault(key_name, []).append(time.time())
+        return existed
+    except Exception:
+        return False
+
+
 def _is_manually_disabled(name: str) -> bool:
     """True iff the operator has touched ~/.hermes/bot/.key_disabled_<name>.
 
@@ -4616,15 +4672,27 @@ def _recover_ollama_stale_backoffs():
     livelock. Weekly/monthly pool resets are invisible to both the frozen
     local token counter AND the backoff. Each refresh cycle, check the
     server-derived usage (fetch_ollama_usage → probe-truth override in
-    _get_ollama_quota_status) for keys that are currently benched by an
-    *exhaustion* failure: if the server pool is no longer at 100% (reset),
-    clear the backoff so the key re-enters rotation immediately.
+    _get_ollama_quota_status) for keys that are currently benched: if the
+    server pool is no longer at 100% (reset), clear the bench so the key
+    re-enters rotation immediately.
+
+    TWO bench mechanisms are healed, because each blocks dispatch on its own
+    (and the paywall flag is consulted FIRST in _is_key_healthy, so clearing
+    the in-memory backoff alone leaves the key benched):
+      * in-memory exhaustion backoff (`_mark_key_exhausted` on 429/403)
+      * the persisted 403-paywall flag (`.ollama_exhausted_until[_N]`), whose
+        next-Monday-00:00-UTC horizon is only an approximation of the real
+        reset (rolling 7-day weekly window; MONTHLY pool for ollama_cloud_3).
 
     Safe by design (mirrors the key-health-stale-backoff structural fix):
-    - Only CONSIDER keys whose health flag says exhausted/unhealthy.
+    - Only CONSIDER keys that are actually benched (health OR paywall flag).
     - Only heal when a FRESH server probe actually returned (probe_ts set) —
       a failed fetch will NOT heal, preventing a retry storm vs a genuinely
       exhausted key.
+    - The probe must show a CLEAR reset (server used_pct well under 100), not
+      a boundary value.
+    - Paywall disarms are capped per key per 24h (see
+      _ollama_paywall_disarm_allowed) so a lapsed-plan 403 cannot flap.
     - A genuinely-still-exhausted key simply re-429s on next dispatch and
       re-arms its backoff — self-healing either way (worst case 1 wasted try).
     Never raises.
@@ -4632,19 +4700,40 @@ def _recover_ollama_stale_backoffs():
     for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
         try:
             h = _zai_key_health.get(_oc_key, {})
-            if h.get("healthy", True):
+            benched_health = (not h.get("healthy", True)
+                              and h.get("last_error_type") == "exhausted")
+            benched_flag = _ollama_paywall_active(_oc_key)
+            if not (benched_health or benched_flag):
                 continue  # not benched — nothing to recover
-            if h.get("last_error_type") not in ("exhausted",):
-                continue  # only decay exhaustion backoffs, never dead/server
             st = _get_ollama_quota_status(_oc_key)  # server-truth (30s cache)
             if st.get("probe_ts") is None:
                 continue  # server fetch unavailable — do NOT risk a retry storm
             if st.get("probe_exhausted", False):
                 continue  # server still says 100% — pool not reset yet
-            _mark_key_healthy(_oc_key)
-            print(f"[ollama] {_oc_key} server pool no longer exhausted "
-                  f"(server_used_pct={st.get('server_used_pct')}) → "
-                  f"cleared stale exhaustion backoff", flush=True)
+            _srv_pct = st.get("server_used_pct")
+            if _srv_pct is None or float(_srv_pct) >= 99.0:
+                continue  # boundary value — not a clear reset
+            if benched_health:
+                _mark_key_healthy(_oc_key)
+                print(f"[ollama] {_oc_key} server pool no longer exhausted "
+                      f"(server_used_pct={_srv_pct}) → "
+                      f"cleared stale exhaustion backoff", flush=True)
+            if benched_flag:
+                if not _ollama_paywall_disarm_allowed(_oc_key):
+                    if len(_ollama_paywall_disarms.get(_oc_key, [])) == _OLLAMA_PAYWALL_DISARM_LIMIT:
+                        print(f"[ollama] {_oc_key} probe-disarm cap reached "
+                              f"({_OLLAMA_PAYWALL_DISARM_LIMIT}/"
+                              f"{_OLLAMA_PAYWALL_DISARM_WINDOW_S // 3600}h) while "
+                              f"the server reports the pool available "
+                              f"(server_used_pct={_srv_pct}) — leaving the "
+                              f"paywall flag to expire on its own horizon",
+                              flush=True)
+                    continue
+                if _disarm_ollama_paywall_flag(_oc_key):
+                    print(f"[ollama] {_oc_key} server pool no longer exhausted "
+                          f"(server_used_pct={_srv_pct}) → disarmed persisted "
+                          f"paywall flag (recovered without a restart)",
+                          flush=True)
         except Exception:
             pass
 

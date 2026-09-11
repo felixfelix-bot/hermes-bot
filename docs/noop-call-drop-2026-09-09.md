@@ -22,8 +22,8 @@ Evidence (all read-only):
 
 | Query | Result |
 |---|---|
-| Total api_calls rows | 224,764 |
-| Rows with the no-op signature (any key) | 37,464 |
+| Total api_calls rows | 224,764 @ audit · 254,165 re-verified 2026-09-11 |
+| Rows with the no-op signature (any key) | 37,464 @ audit · 37,471 re-verified 2026-09-11 |
 | No-op rows on `ours`/`friend` keys, `tier='zai'` | 37,464 (all of them) |
 | Rows with zero tokens at all | 46,139 (rest are flagged 200/400/502/401) |
 | No-op rows with `model` set | **0** |
@@ -31,6 +31,9 @@ Evidence (all read-only):
 | No-op rows with `error` set | **0** |
 | No-op `session_id` set | **0** — all `(null),(null)` |
 | Duration of the fast no-op class | 2–11 ms (no upstream network round trip) |
+| Would be DROPPED by this change (`0 < duration_ms ≤ 50`) | **31,361** |
+| Kept (duration > 50 ms — real upstream attempts) | **6,102** |
+| Kept (NULL duration — fail-open) | **8** |
 
 **Duration distribution of the 37,464 signature rows** (the round-2 fix's
 evidence — the signature alone is NOT a safe discriminator):
@@ -58,20 +61,32 @@ body, so key+tokens+model alone would silently drop them. **The duration guard
 (0 < duration_ms ≤ 50) is what separates the pure-logging no-op class from real
 failure telemetry.**
 
-**Time scope — CORRECTED (round-2)**: the bulk of the 37,461 rows fall between
-**2026-08-14 and 2026-08-23** (the legacy `best_key()` rollback path, dormant
-after the flat-router full cutover ~Aug 24). However, the earlier claim that
-"ZERO no-op rows exist since Aug 25" is **empirically false**: the live DB shows
-**3 fresh no-op-signature rows logged TODAY (2026-09-09)** — ids 222080, 223259,
-224612, all `ours`, 0 tokens, NULL model/status/error, **NULL duration**. These
-are emitted by the currently-running daemon (PID 2183661, started 19:17 running
-pre-T4 code) whose neighbor rows (224613, 224614) also carry NULL duration —
-the running daemon's `_log_api_call` does not populate `duration_ms` for the
-z.ai path. Because these today-rows have **NULL duration**, the duration guard
-**preserves them** (fail-open when the duration signal is unknown) — they are
-NOT dropped by this change. They are a separate, small (3/day) residual class
-that the manager may choose to address separately; this task's scope is the
-37k fast no-op class.
+**Time scope — CORRECTED (round-2), re-verified 2026-09-11**: the bulk of the
+signature rows fall between **2026-08-14 and 2026-08-23** (the legacy
+`best_key()` rollback path, dormant after the flat-router cutover ~Aug 24).
+However, the earlier claim that "ZERO no-op rows exist since Aug 25" is
+**empirically false**. Re-verified read-only on 2026-09-11: signature rows are
+still appearing at roughly 3/day — 3 on 2026-09-09 (ids 222080/223259/224612)
+and 3 more on 2026-09-10 (ids 240549/240569/240592). All 6 are `ours`,
+0 tokens, NULL model/status/error, `cost_source='flat_rate'`, and **NULL
+duration**.
+
+**Attribution — verified, not assumed.** Every `_log_api_call()` call site in
+the current source passes `duration_ms=int((time.time() - t0) * 1000)`, including
+the z.ai site that alone emits `tier='zai'` (zai_proxy.py ~line 7336); `git log`
+confirms that has held for every `zai_proxy.py` revision of the past week. So the
+residual NULL-duration rows are **not** produced by the current code path — they
+were written either by a daemon running an older/different revision or by an
+out-of-band writer. This is recorded as an **open follow-up** (verify which
+process writes them after the T3/T4 restart); it is NOT in T3's scope.
+
+Because those residual rows carry **NULL duration**, the duration guard
+**preserves them** (fail-open when the duration signal is unknown). Expected
+effect of T3: the fast (≤50 ms) pure-logging no-op class is suppressed, as is any
+future fast no-op row; the ~3/day NULL-duration residual class survives until its
+emitter is identified. Measured scope of this change on existing data: **31,361**
+of 37,471 signature rows (83.7%) are dropped; the 6,102 slow (>50 ms) real-failure
+rows and the 8 NULL-duration rows are kept.
 
 **What the fast no-op rows are**: empty telemetry rows logged by the historical
 `best_key()` rollback path in `zai_proxy.py` (the `finally` block at ~line 7249

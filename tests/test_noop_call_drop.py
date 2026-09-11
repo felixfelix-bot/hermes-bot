@@ -221,3 +221,128 @@ class TestLogApiCallGuard:
             total_tokens=0, prompt_tokens=0, completion_tokens=0, tier="deepseek",
             cost_usd=0.0, cost_source="estimated", duration_ms=5)
         assert fake_usage_db.rowcount() == 1
+
+
+# ── Production call-site contract (round-2 review, blocking item 1b) ─────────
+#
+# The round-2 execution review blocked on: "the regression test passes
+# status_code=503 directly, but the real 503 path NEVER sets status_code (it
+# stays None) — so the test asserts a scenario the production code does not
+# emit and does not actually protect the failure class."
+#
+# The predicate/guard tests above now feed the REAL production tuple (status
+# None + model-less + slow). This class closes the remaining gap by proving,
+# against the production source itself, that the tuple the tests feed IS what
+# the live 503 exhaustion chokepoint emits. Without this, the tests could drift
+# from production the moment someone sets status_code on that branch.
+
+
+class TestProductionCallSiteContract:
+    """Static contract checks on the real `_proxy()` z.ai chokepoint."""
+
+    @staticmethod
+    def _proxy_fn():
+        import ast
+
+        src = (_REPO / "zai_proxy.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_proxy":
+                return node
+        raise AssertionError("_proxy() not found in zai_proxy.py")
+
+    @staticmethod
+    def _zai_log_call(fn):
+        """The single `_log_api_call(..., tier="zai")` chokepoint call."""
+        import ast
+
+        calls = []
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Call):
+                continue
+            if getattr(n.func, "id", None) != "_log_api_call":
+                continue
+            for k in n.keywords:
+                if (k.arg == "tier" and isinstance(k.value, ast.Constant)
+                        and k.value.value == "zai"):
+                    calls.append(n)
+        return calls
+
+    def test_zai_chokepoint_logs_loop_locals_and_wallclock_duration(self):
+        """The chokepoint logs `status_code`/`error_text` — the locals the 503
+        and non-chat-404 branches leave as None — and a real wall-clock
+        `duration_ms`. So a model-less row with status None + a large duration
+        is exactly the production 503-exhaustion signature."""
+        import ast
+
+        zai = self._zai_log_call(self._proxy_fn())
+        assert len(zai) == 1, f"expected 1 zai chokepoint, found {len(zai)}"
+        kw = {k.arg: k.value for k in zai[0].keywords}
+
+        # status/error originate from the retry-loop locals (None on the
+        # exhaustion/404 early-return branches) — NOT from a literal.
+        assert isinstance(kw["status_code"], ast.Name), (
+            "status_code must be the loop local, not a literal")
+        assert kw["status_code"].id == "status_code"
+        assert isinstance(kw["error"], ast.Name) and kw["error"].id == "error_text"
+
+        # duration is genuinely measured wall clock, so the fast no-op class
+        # stays <=50ms while real failure rows take far longer.
+        duration = kw["duration_ms"]
+        assert isinstance(duration, ast.Call) and getattr(duration.func, "id", None) == "int", (
+            "duration_ms must be computed with int(...)")
+
+    def test_503_exhaustion_branch_never_sets_status_code(self):
+        """The 503 'all providers exhausted' branch emits via
+        `self.send_response(503)` and returns WITHOUT assigning the
+        `status_code` local — which is why the row reaches the chokepoint with
+        status None. If this ever changes the duration-only discriminator must
+        be re-evaluated, so the contract is pinned here."""
+        import ast
+
+        fn = self._proxy_fn()
+
+        # 1. the exhaustion branch exists
+        emits_503 = False
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Call):
+                continue
+            f = n.func
+            if (isinstance(f, ast.Attribute) and f.attr == "send_response"
+                    and n.args and isinstance(n.args[0], ast.Constant)
+                    and n.args[0].value == 503):
+                emits_503 = True
+        assert emits_503, "no self.send_response(503) in _proxy()"
+
+        # 2. `status_code` is never assigned the literal 503 anywhere in
+        #    _proxy() — assignments come only from real upstream outcomes
+        #    (resp.status / e.code), so an exhausted/never-forwarded request
+        #    keeps the local at its initial None (see `status_code = None`).
+        bad = []
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == "status_code":
+                        if (isinstance(n.value, ast.Constant)
+                                and n.value.value == 503):
+                            bad.append(n.lineno)
+            if isinstance(n, ast.AnnAssign):
+                t = n.target
+                if (isinstance(t, ast.Name) and t.id == "status_code"
+                        and isinstance(n.value, ast.Constant)
+                        and n.value.value == 503):
+                    bad.append(n.lineno)
+        assert not bad, (
+            "status_code is assigned the literal 503 at line(s) "
+            f"{bad} — the 503 path now sets a status, so the no-op drop "
+            "predicate must be re-evaluated")
+
+        # 3. the local is initialised to None before the retry loop (the value
+        #    the exhaustion path therefore carries to the chokepoint)
+        inits = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "status_code"
+                         for t in n.targets)
+                 and isinstance(n.value, ast.Constant)
+                 and n.value.value is None]
+        assert inits, "status_code is not initialised to None in _proxy()"

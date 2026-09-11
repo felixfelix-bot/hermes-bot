@@ -164,3 +164,53 @@ Remaining open items: P4b (NW top-up watch), P4c (key rotations —
 OR/Chutes/ollama#4 live in transcripts), T2b Baidu canary re-run,
 T2c Chutes TEE diagnosis, T3 demand-side QS tasks (D4 cache-hit
 accounting first).
+
+## Resolution log — t_30dde4c7 (/quota vs ollama key state), 2026-09-11
+
+Closed the quota-view vs key-state discrepancy opened above.
+
+**Root cause (probe-verified):** `/quota`'s ollama pools were built from the
+LOCAL token counter (`api_calls.total_tokens` per window). An exhausted key
+stops being dispatched, so its local counts freeze near zero → `/quota`
+reported `included / 0%` while the subscription served 100% of its pool.
+Only `ollama_cloud_3` consulted the authoritative server fraction, so oc/oc2
+(then oc4) desynced completely. Recovery was also gated twice: the in-memory
+exhaustion backoff, AND the persisted 403-paywall flag
+(`.ollama_exhausted_until[_N]`, armed to a next-Monday horizon), which
+`_is_key_healthy()` consults FIRST.
+
+**Shipped (branch `worker-base/t_30dde4c7`, deployed live):**
+- (a)+(c) server-truth override generalised to all four ollama keys:
+  `ollama.com/api/usage` `limits.*.usage` drives the window fractions, the
+  regime (≥100 exhausted / ≥90 extra / else included) and the aggregate
+  `used_pct`/`remaining`; `/quota` exposes `probe_exhausted` /
+  `server_used_pct` / `probe_ts`.
+- (b) `_recover_ollama_stale_backoffs()` (every `_refresh_loop` cycle) heals
+  BOTH bench mechanisms — in-memory exhaustion backoff and the persisted
+  paywall flag — but only on a FRESH probe (`probe_ts` set) showing a clear
+  reset (<99%). Paywall disarms are capped at 3/key/24h
+  (`_ollama_paywall_disarm_allowed`) because a 403 "requires a subscription"
+  is also emitted for a lapsed plan, which never resets.
+- Regression fix: `ExtraUsageStatus` field order made the module unimportable
+  (defaulted field before non-defaulted) — the whole server-truth path was
+  dead code until reordered.
+
+**Live verification:**
+- heal line in the wild: `Sep 10 21:31 [ollama] ollama_cloud server pool no
+  longer exhausted (server_used_pct=67.0) → cleared stale exhaustion backoff`
+  (same for oc2 at 88.1%) — recovery without a restart.
+- post-deploy `/quota`: oc 85.2% included / oc2 94.7% extra / oc3 100%
+  exhausted / oc4 100% exhausted, all with fresh `probe_ts`.
+- 20/20 tests pass against BOTH the branch copy and the DEPLOYED artifact
+  (`cd ~/.hermes/bot && ZAI_PROXY_TARGET=~/.hermes/bot/zai_proxy.py pytest
+  ~/worktrees/t_30dde4c7/test_ollama_probe_sync.py -q`).
+
+**Finding — oc4's plan shape is not what the code comment says.** Code
+comments describe `ollama_cloud_4` (sleepy_easley_477) as a weekly-pool
+subscription "same shape as #1/#2". The server disagrees: its `/api/usage`
+returns `limits.monthly` ONLY (no weekly/session field), exactly like oc3 —
+i.e. it is a monthly-budget plan. Live 2026-09-11 it reports `monthly=1.0`
+(8080 deepseek-v4-flash:0731 requests consumed it) → genuinely exhausted
+~5 days after onboarding, while oc/oc2 (true weekly pools) sit at 85/95%.
+Operator action: confirm the intended plan for that account before budgeting
+on oc4 capacity; the router now benches it on probe truth.

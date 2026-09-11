@@ -309,5 +309,44 @@ class OllamaPaywallDisarmTest(OllamaProbeSyncFixture):
         self.assertFalse(self.zp._ollama_paywall_active("ollama_cloud"))
 
 
+class OllamaProbeTruthAggregateTest(unittest.TestCase):
+    """t_30dde4c7 (c): /quota's AGGREGATE ollama fields (used_pct/remaining) must
+    not advertise headroom the server says is gone.
+
+    Live 2026-09-11: ollama_cloud_4 read used_pct=21.62 / remaining=392M while
+    ollama.com/api/usage reported monthly.usage=1.0 — its only window (that plan
+    has no weekly field), i.e. the pool was fully consumed. The probe marker
+    said exhausted but the aggregate numbers contradicted it, which is exactly
+    the operator-misleading shape this task exists to remove.
+    """
+
+    def setUp(self):
+        self.zp = _zp_mod
+
+    def test_exhausted_probe_forces_full_used_pct(self):
+        self.assertEqual(
+            self.zp._ollama_probe_truth_override(
+                21.62, "extra",
+                {"probe_exhausted": True, "server_used_pct": 100.0}),
+            (100.0, "exhausted"))
+
+    def test_within_pool_probe_is_untouched(self):
+        self.assertEqual(
+            self.zp._ollama_probe_truth_override(
+                85.2, "included",
+                {"probe_exhausted": False, "server_used_pct": 85.2}),
+            (85.2, "included"))
+
+    def test_missing_probe_marker_is_untouched(self):
+        # No fresh server fetch (probe_ts None) → the local view stands.
+        self.assertEqual(
+            self.zp._ollama_probe_truth_override(0.0, "included", {}),
+            (0.0, "included"))
+
+    def test_unusable_status_never_raises(self):
+        for bad in (None, 0, "nope", {"probe_exhausted": "yes"}):
+            self.zp._ollama_probe_truth_override(5.0, "included", bad)
+
+
 if __name__ == "__main__":
     unittest.main()

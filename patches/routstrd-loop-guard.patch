@@ -1,0 +1,127 @@
+--- /tmp/zai_proxy.py.bak-1789239197	2026-09-13 00:23:17.499111042 +0530
++++ /home/c03rad0r/.hermes/bot/zai_proxy.py	2026-09-13 00:23:17.524937792 +0530
+@@ -4333,6 +4333,7 @@
+                 "Authorization": f"Bearer {TELNYX_KEY}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+             },
+         )
+         with urllib.request.urlopen(req, timeout=10) as resp:
+@@ -5413,6 +5414,22 @@
+         return True
+ 
+ # ── proxy handler ───────────────────────────────────────────────────────────
++# ── Routing-loop guard (added 2026-09-12) ───────────────────────────────────
++# routstrd (:8008) is registered here as an upstream provider, AND routstrd's
++# own config.json lists this proxy (http://localhost:9099) in staticProviders
++# with a "localhost passthrough" that forwards straight back to us. Without a
++# depth marker one buyer request ping-pongs forever:
++#     buyer → routstrd → us → routstrd → us → …
++# Every hop was logged as its own api_calls row: 35 identical calls inside
++# 0.7 s, 561 of 1655 calls in one hour (34%) were duplicates, all billed.
++# Marker header round-trips through routstrd because it copies incoming
++# headers, so re-entrant requests are detectable.
++ZAI_HOP_HEADER = "X-Zai-Router-Hop"
++try:
++    ZAI_MAX_HOPS = int(os.environ.get("ZAI_MAX_HOPS", "2"))
++except ValueError:
++    ZAI_MAX_HOPS = 2
++
+ class Handler(BaseHTTPRequestHandler):
+     protocol_version = "HTTP/1.1"
+ 
+@@ -5503,6 +5520,7 @@
+                 "Authorization": f"Bearer {_api_key}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+             }
+ 
+             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+@@ -5823,6 +5841,7 @@
+                 "Authorization": f"Bearer {OPENCODE_GO_KEY}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+             }
+ 
+             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+@@ -6036,6 +6055,7 @@
+                     "Authorization": f"Bearer {TELNYX_KEY}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+                 }
+             else:
+                 url = TELNYX_DEMO_URL
+@@ -6044,6 +6064,7 @@
+                     "Origin": "https://telnyx.com",
+                     "Referer": "https://telnyx.com/products/inference",
+                     "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+                 }
+ 
+             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
+@@ -6129,6 +6150,9 @@
+         prov = EXTERNAL_PROVIDERS.get(provider_name)
+         if not prov or not prov.get("key"):
+             return False
++        if provider_name == "routstrd" and getattr(self, "_zai_hops", 0) >= 1:
++            print("[loop-guard] skipping routstrd upstream for re-entrant request", flush=True)
++            return False
+ 
+         # Determine the model name for this provider
+         ext_model = model or "glm-5.2"
+@@ -6148,6 +6172,7 @@
+                 "Authorization": f"Bearer {prov['key']}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+             }
+             if provider_name == "openrouter":
+                 hdrs["HTTP-Referer"] = "https://hermes.local"
+@@ -6336,6 +6361,9 @@
+             return False
+ 
+         for cost, provider_name, prov in candidates:
++            if provider_name == "routstrd" and getattr(self, "_zai_hops", 0) >= 1:
++                print("[loop-guard] failover: skipping routstrd for re-entrant request", flush=True)
++                continue
+             try:
+                 body_json = json.loads(body) if body else {}
+                 # Per-provider model name translation.
+@@ -6356,6 +6384,7 @@
+                     "Authorization": f"Bearer {prov['key']}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0",
++                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
+                 }
+                 if provider_name == "openrouter":
+                     hdrs["HTTP-Referer"] = "https://hermes.local"
+@@ -6486,6 +6515,25 @@
+         length = int(self.headers.get("Content-Length", 0))
+         body = self.rfile.read(length) if length else b""
+         self._spend_recorded = False  # set True by _try_external_failover on success
++        # Routing-loop depth: bumped on every outbound hop (see ZAI_HOP_HEADER).
++        try:
++            self._zai_hops = int((self.headers.get(ZAI_HOP_HEADER) or "0").strip() or 0)
++        except (TypeError, ValueError):
++            self._zai_hops = 0
++        if self._zai_hops >= ZAI_MAX_HOPS:
++            # Re-entrant beyond the allowed depth — refuse instead of bouncing.
++            _msg = (b'{"error":{"message":"routing loop detected: request already '
++                    b'passed through this proxy ' + str(self._zai_hops).encode() +
++                    b' times","type":"routing_loop"}}')
++            print(f"[loop-guard] refusing re-entrant request (hops={self._zai_hops})", flush=True)
++            self.send_response(429)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Retry-After", "5")
++            self.send_header("X-Zai-Loop-Guard", "refused")
++            self.send_header("Content-Length", str(len(_msg)))
++            self.end_headers()
++            self.wfile.write(_msg)
++            return
+ 
+         # ── Quota-aware model tier routing (auto-downgrade) ────────────────
+         # Step 1: Extract original model + client tier hint

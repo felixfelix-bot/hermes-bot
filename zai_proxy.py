@@ -771,8 +771,12 @@ DEEPSEEK_BASE = "https://api.deepseek.com"
 # Authoritative values from ~/.hermes/profiles/manager/.env (operator-provided):
 # flash $0.14/M input, $0.03/M cached, $0.28/M output. Same tier as NeuralWatt.
 DEEPSEEK_RATES: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"input": 0.14, "cached_input": 0.03, "output": 0.28},
-    "deepseek-v4-pro":   {"input": 1.00, "cached_input": 0.10, "output": 3.00},
+    # V4.1 Flash (2026-09-10). Reduced vs v4-flash; using the v4-flash rate as a
+    # conservative placeholder until the V4.1 price is verified/measured.
+    # `cache_hit` alias kept for the cost-extraction branch (line ~4478).
+    "deepseek-flash":    {"input": 0.14, "cached_input": 0.03, "cache_hit": 0.03, "output": 0.28},
+    "deepseek-v4-flash": {"input": 0.14, "cached_input": 0.03, "cache_hit": 0.03, "output": 0.28},
+    "deepseek-v4-pro":   {"input": 1.00, "cached_input": 0.10, "cache_hit": 0.10, "output": 3.00},
 }
 
 # OpenCode Go — $10/month flat-rate subscription (GLM-5.2/5.3, Kimi, DeepSeek)
@@ -808,6 +812,7 @@ _TELNYX_DIRECT_MODELS = {"kimi-k3"}
 # Any provider not in this dict uses ext_model verbatim.
 _PROVIDER_MODEL_NAMES = {
     "deepinfra": {
+        "deepseek/deepseek-flash":    "deepseek-ai/DeepSeek-V4.1-Flash",
         "deepseek/deepseek-v4-pro":   "deepseek-ai/DeepSeek-V4-Pro",
         "deepseek/deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
         "glm-5.2":                    "zai-org/GLM-5.2",
@@ -829,6 +834,7 @@ _PROVIDER_MODEL_NAMES = {
     "openrouter": {
         "glm-5.2":                    "z-ai/glm-5.2",
         "kimi-k3":                    "moonshotai/kimi-k3",
+        "deepseek/deepseek-flash":    "deepseek/deepseek-v4.1-flash",
         "deepseek/deepseek-v4-flash":  "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek/deepseek-v4-pro",
     },
@@ -840,6 +846,17 @@ _PROVIDER_MODEL_NAMES = {
     # requesting glm-5.2 via chutes must send max_tokens >= 2048 themselves.
     "chutes": {
         "deepseek/deepseek-v4-flash":  "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
+        # 2026-09-13: chutes was only wired for DeepSeek, so it was never a
+        # candidate for glm/kimi/qwen model ids even though it SERVES all three
+        # families. That made cross-family kanban review impossible whenever the
+        # z.ai / ollama / opencode lanes were quota-locked (only deepseek lanes
+        # survived). Verified live 2026-09-13 with a 1-token probe each:
+        #   Qwen/Qwen3.5-397B-A17B-TEE 200, moonshotai/Kimi-K3-TEE 200,
+        #   zai-org/GLM-5.2-TEE 200 (all need max_tokens >= 2048 or the
+        #   completion returns empty content with HTTP 200).
+        "qwen3.5:397b":                "Qwen/Qwen3.5-397B-A17B-TEE",
+        "kimi-k3":                     "moonshotai/Kimi-K3-TEE",
+        "glm-5.2":                     "zai-org/GLM-5.2-TEE",
     },
     "ppq": {
         "glm-5.2":                    "z-ai/glm-5.2",
@@ -860,6 +877,7 @@ _PROVIDER_MODEL_NAMES = {
     # dispatch_fail (734 failures observed 2026-09-08 → provider backoff,
     # zero traffic on a funded $24.55-key). Same fix class as opencode_go.
     "deepseek": {
+        "deepseek/deepseek-flash":    "deepseek-flash",
         "deepseek/deepseek-v4-flash":  "deepseek-v4-flash",
         "deepseek/deepseek-v4-pro":    "deepseek-v4-pro",
     },
@@ -953,7 +971,7 @@ EXTERNAL_PROVIDERS = {
 #   NEVER falls back to flash — returns error instead of low-quality output.
 # Workers (glm-4.5-flash): cheapest available is fine (output gets vetted).
 MANAGER_FALLBACK_MODEL = "glm-5.2"
-WORKER_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+WORKER_FALLBACK_MODEL = "deepseek/deepseek-flash"
 
 # ── Known external model detection (FIX: silent substitution, 2026-08-25) ───
 # Models that are recognized by at least one external provider. If a model
@@ -1220,6 +1238,62 @@ def _ollama_paywall_active(key_name: str = "ollama_cloud") -> bool:
         if not flag.exists():
             return False
         return time.time() < float(flag.read_text().strip())
+    except Exception:
+        return False
+
+
+# ── Probe-driven paywall disarm (t_30dde4c7 prong b) ────────────────────────
+# The persisted 403-paywall flag is armed until a next-Monday-00:00-UTC horizon,
+# which is only an APPROXIMATION of the real pool reset: ollama's weekly window
+# is a rolling 7 days anchored at the subscription start, and ollama_cloud_3's
+# pool is MONTHLY. A key benched by the flag therefore stayed benched for days
+# after the server pool had already reset — the same stale-health livelock this
+# task removes, one level down (the flag is consulted FIRST in _is_key_healthy,
+# so clearing the in-memory backoff alone is not enough).
+# _recover_ollama_stale_backoffs now disarms the flag as soon as a FRESH server
+# probe proves the pool is no longer exhausted.
+#
+# Anti-thrash guard: a 403 "requires a subscription" body is emitted BOTH for
+# quota exhaustion (pool resets) and for a lapsed/cancelled plan (never resets),
+# and /api/usage only reports usage fractions — it cannot tell them apart. A
+# genuine reset heals on the first disarm; a lapsed plan simply re-arms on the
+# next 403 and a genuinely dead pool would flap forever. So cap probe-driven
+# disarms per key per 24h and then leave the flag to expire on its own horizon.
+_OLLAMA_PAYWALL_DISARM_LIMIT = 3
+_OLLAMA_PAYWALL_DISARM_WINDOW_S = 24 * 3600
+_ollama_paywall_disarms: dict[str, list] = {}
+
+
+def _ollama_paywall_disarm_allowed(key_name: str,
+                                   now: float | None = None) -> bool:
+    """True while *key_name* is still under the probe-disarm cap.
+
+    Prunes the per-key disarm history to the trailing 24h window and compares
+    against _OLLAMA_PAYWALL_DISARM_LIMIT. Fail-CLOSED (False) on error: a
+    bookkeeping failure must never authorise unbounded disarms.
+    """
+    try:
+        _now = time.time() if now is None else now
+        _hist = [t for t in _ollama_paywall_disarms.get(key_name, [])
+                 if _now - t < _OLLAMA_PAYWALL_DISARM_WINDOW_S]
+        _ollama_paywall_disarms[key_name] = _hist
+        return len(_hist) < _OLLAMA_PAYWALL_DISARM_LIMIT
+    except Exception:
+        return False
+
+
+def _disarm_ollama_paywall_flag(key_name: str = "ollama_cloud") -> bool:
+    """Remove the persisted paywall flag after a probe proved the pool reset.
+
+    Returns True when a flag was actually removed. Counts against the
+    anti-thrash cap. Never raises.
+    """
+    try:
+        flag = _OLLAMA_PAYWALL_FLAGS.get(key_name, _OLLAMA_PAYWALL_FLAG)
+        existed = flag.exists()
+        flag.unlink(missing_ok=True)
+        _ollama_paywall_disarms.setdefault(key_name, []).append(time.time())
+        return existed
     except Exception:
         return False
 
@@ -2047,6 +2121,26 @@ def _neuralwatt_quota_snapshot() -> dict:
         return {"used_pct": 0.0, "remaining": float("inf")}
 
 
+def _ollama_probe_truth_override(used_pct: float, regime: str,
+                                 oc_status: dict) -> tuple:
+    """Force /quota's aggregate ollama used_pct/regime to match the probe.
+
+    t_30dde4c7 prong (c): the LOCAL token counter cannot see a consumed
+    server-side pool, so without this the aggregate fields contradicted the
+    probe markers and misled operators — live 2026-09-11, ollama_cloud_4 read
+    ``used_pct=21.62 / remaining=392M`` while ollama.com/api/usage reported
+    ``monthly.usage=1.0`` (the plan's only window; it has no weekly field).
+    Exhausted → used_pct 100 so remaining computes to 0 and the entry agrees
+    with ``probe_exhausted``. Never raises; an unusable status is a no-op.
+    """
+    try:
+        if oc_status.get("probe_exhausted", False):
+            return 100.0, "exhausted"
+    except Exception:
+        pass
+    return used_pct, regime
+
+
 def _snapshot_quota() -> dict:
     """Snapshot current quota state for all providers. Thread-safe."""
     snap = {}
@@ -2087,6 +2181,11 @@ def _snapshot_quota() -> dict:
             if _ollama_paywall_active(_oc_key):
                 oc_used_pct = 100.0
                 oc_regime = "paywalled"
+            else:
+                # t_30dde4c7 (c): probe-exhausted pools must not advertise
+                # local-counter headroom (remaining) they do not have.
+                oc_used_pct, oc_regime = _ollama_probe_truth_override(
+                    oc_used_pct, oc_regime, oc_status)
             oc_remaining = max(0.0, oc_total * (1.0 - oc_used_pct / 100.0)) if oc_total else float("inf")
             snap[_oc_key] = {
                 "used_pct": float(oc_used_pct),
@@ -4245,6 +4344,7 @@ def _get_telnyx_balance() -> float | None:
                 "Authorization": f"Bearer {TELNYX_KEY}",
                 "Content-Type": "application/json",
                 "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -4891,15 +4991,27 @@ def _recover_ollama_stale_backoffs():
     livelock. Weekly/monthly pool resets are invisible to both the frozen
     local token counter AND the backoff. Each refresh cycle, check the
     server-derived usage (fetch_ollama_usage → probe-truth override in
-    _get_ollama_quota_status) for keys that are currently benched by an
-    *exhaustion* failure: if the server pool is no longer at 100% (reset),
-    clear the backoff so the key re-enters rotation immediately.
+    _get_ollama_quota_status) for keys that are currently benched: if the
+    server pool is no longer at 100% (reset), clear the bench so the key
+    re-enters rotation immediately.
+
+    TWO bench mechanisms are healed, because each blocks dispatch on its own
+    (and the paywall flag is consulted FIRST in _is_key_healthy, so clearing
+    the in-memory backoff alone leaves the key benched):
+      * in-memory exhaustion backoff (`_mark_key_exhausted` on 429/403)
+      * the persisted 403-paywall flag (`.ollama_exhausted_until[_N]`), whose
+        next-Monday-00:00-UTC horizon is only an approximation of the real
+        reset (rolling 7-day weekly window; MONTHLY pool for ollama_cloud_3).
 
     Safe by design (mirrors the key-health-stale-backoff structural fix):
-    - Only CONSIDER keys whose health flag says exhausted/unhealthy.
+    - Only CONSIDER keys that are actually benched (health OR paywall flag).
     - Only heal when a FRESH server probe actually returned (probe_ts set) —
       a failed fetch will NOT heal, preventing a retry storm vs a genuinely
       exhausted key.
+    - The probe must show a CLEAR reset (server used_pct well under 100), not
+      a boundary value.
+    - Paywall disarms are capped per key per 24h (see
+      _ollama_paywall_disarm_allowed) so a lapsed-plan 403 cannot flap.
     - A genuinely-still-exhausted key simply re-429s on next dispatch and
       re-arms its backoff — self-healing either way (worst case 1 wasted try).
     Never raises.
@@ -4907,19 +5019,40 @@ def _recover_ollama_stale_backoffs():
     for _oc_key in ("ollama_cloud", "ollama_cloud_2", "ollama_cloud_3", "ollama_cloud_4"):
         try:
             h = _zai_key_health.get(_oc_key, {})
-            if h.get("healthy", True):
+            benched_health = (not h.get("healthy", True)
+                              and h.get("last_error_type") == "exhausted")
+            benched_flag = _ollama_paywall_active(_oc_key)
+            if not (benched_health or benched_flag):
                 continue  # not benched — nothing to recover
-            if h.get("last_error_type") not in ("exhausted",):
-                continue  # only decay exhaustion backoffs, never dead/server
             st = _get_ollama_quota_status(_oc_key)  # server-truth (30s cache)
             if st.get("probe_ts") is None:
                 continue  # server fetch unavailable — do NOT risk a retry storm
             if st.get("probe_exhausted", False):
                 continue  # server still says 100% — pool not reset yet
-            _mark_key_healthy(_oc_key)
-            print(f"[ollama] {_oc_key} server pool no longer exhausted "
-                  f"(server_used_pct={st.get('server_used_pct')}) → "
-                  f"cleared stale exhaustion backoff", flush=True)
+            _srv_pct = st.get("server_used_pct")
+            if _srv_pct is None or float(_srv_pct) >= 99.0:
+                continue  # boundary value — not a clear reset
+            if benched_health:
+                _mark_key_healthy(_oc_key)
+                print(f"[ollama] {_oc_key} server pool no longer exhausted "
+                      f"(server_used_pct={_srv_pct}) → "
+                      f"cleared stale exhaustion backoff", flush=True)
+            if benched_flag:
+                if not _ollama_paywall_disarm_allowed(_oc_key):
+                    if len(_ollama_paywall_disarms.get(_oc_key, [])) == _OLLAMA_PAYWALL_DISARM_LIMIT:
+                        print(f"[ollama] {_oc_key} probe-disarm cap reached "
+                              f"({_OLLAMA_PAYWALL_DISARM_LIMIT}/"
+                              f"{_OLLAMA_PAYWALL_DISARM_WINDOW_S // 3600}h) while "
+                              f"the server reports the pool available "
+                              f"(server_used_pct={_srv_pct}) — leaving the "
+                              f"paywall flag to expire on its own horizon",
+                              flush=True)
+                    continue
+                if _disarm_ollama_paywall_flag(_oc_key):
+                    print(f"[ollama] {_oc_key} server pool no longer exhausted "
+                          f"(server_used_pct={_srv_pct}) → disarmed persisted "
+                          f"paywall flag (recovered without a restart)",
+                          flush=True)
         except Exception:
             pass
 
@@ -5292,6 +5425,22 @@ def _attempt_retry(e, attempt, name, t0, key_order):
         return True
 
 # ── proxy handler ───────────────────────────────────────────────────────────
+# ── Routing-loop guard (added 2026-09-12) ───────────────────────────────────
+# routstrd (:8008) is registered here as an upstream provider, AND routstrd's
+# own config.json lists this proxy (http://localhost:9099) in staticProviders
+# with a "localhost passthrough" that forwards straight back to us. Without a
+# depth marker one buyer request ping-pongs forever:
+#     buyer → routstrd → us → routstrd → us → …
+# Every hop was logged as its own api_calls row: 35 identical calls inside
+# 0.7 s, 561 of 1655 calls in one hour (34%) were duplicates, all billed.
+# Marker header round-trips through routstrd because it copies incoming
+# headers, so re-entrant requests are detectable.
+ZAI_HOP_HEADER = "X-Zai-Router-Hop"
+try:
+    ZAI_MAX_HOPS = int(os.environ.get("ZAI_MAX_HOPS", "2"))
+except ValueError:
+    ZAI_MAX_HOPS = 2
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -5382,6 +5531,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Authorization": f"Bearer {_api_key}",
                 "Content-Type": "application/json",
                 "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
             }
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
@@ -5702,6 +5852,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Authorization": f"Bearer {OPENCODE_GO_KEY}",
                 "Content-Type": "application/json",
                 "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
             }
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
@@ -5915,6 +6066,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Authorization": f"Bearer {TELNYX_KEY}",
                     "Content-Type": "application/json",
                     "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
                 }
             else:
                 url = TELNYX_DEMO_URL
@@ -5923,6 +6075,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Origin": "https://telnyx.com",
                     "Referer": "https://telnyx.com/products/inference",
                     "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
                 }
 
             req = urllib.request.Request(url, data=fwd_body, method="POST", headers=hdrs)
@@ -6008,6 +6161,9 @@ class Handler(BaseHTTPRequestHandler):
         prov = EXTERNAL_PROVIDERS.get(provider_name)
         if not prov or not prov.get("key"):
             return False
+        if provider_name == "routstrd" and getattr(self, "_zai_hops", 0) >= 1:
+            print("[loop-guard] skipping routstrd upstream for re-entrant request", flush=True)
+            return False
 
         # Determine the model name for this provider
         ext_model = model or "glm-5.2"
@@ -6027,6 +6183,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Authorization": f"Bearer {prov['key']}",
                 "Content-Type": "application/json",
                 "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
             }
             if provider_name == "openrouter":
                 hdrs["HTTP-Referer"] = "https://hermes.local"
@@ -6215,6 +6372,9 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
         for cost, provider_name, prov in candidates:
+            if provider_name == "routstrd" and getattr(self, "_zai_hops", 0) >= 1:
+                print("[loop-guard] failover: skipping routstrd for re-entrant request", flush=True)
+                continue
             try:
                 body_json = json.loads(body) if body else {}
                 # Per-provider model name translation.
@@ -6235,6 +6395,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Authorization": f"Bearer {prov['key']}",
                     "Content-Type": "application/json",
                     "User-Agent": "Mozilla/5.0",
+                ZAI_HOP_HEADER: str(getattr(self, "_zai_hops", 0) + 1),
                 }
                 if provider_name == "openrouter":
                     hdrs["HTTP-Referer"] = "https://hermes.local"
@@ -6365,6 +6526,25 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         self._spend_recorded = False  # set True by _try_external_failover on success
+        # Routing-loop depth: bumped on every outbound hop (see ZAI_HOP_HEADER).
+        try:
+            self._zai_hops = int((self.headers.get(ZAI_HOP_HEADER) or "0").strip() or 0)
+        except (TypeError, ValueError):
+            self._zai_hops = 0
+        if self._zai_hops >= ZAI_MAX_HOPS:
+            # Re-entrant beyond the allowed depth — refuse instead of bouncing.
+            _msg = (b'{"error":{"message":"routing loop detected: request already '
+                    b'passed through this proxy ' + str(self._zai_hops).encode() +
+                    b' times","type":"routing_loop"}}')
+            print(f"[loop-guard] refusing re-entrant request (hops={self._zai_hops})", flush=True)
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "5")
+            self.send_header("X-Zai-Loop-Guard", "refused")
+            self.send_header("Content-Length", str(len(_msg)))
+            self.end_headers()
+            self.wfile.write(_msg)
+            return
 
         # ── Quota-aware model tier routing (auto-downgrade) ────────────────
         # Step 1: Extract original model + client tier hint
@@ -7864,6 +8044,10 @@ class Handler(BaseHTTPRequestHandler):
                 "minimax-m3:cloud": "ollama_cloud",
                 "deepseek/deepseek-v4-flash": "deepseek",
                 "deepseek/deepseek-v4-pro":   "deepseek",
+                # Alias advertised so catalog-checking consumers (efficiency-monitor)
+                # recognize the short name cron jobs actually pin. Resolves to
+                # DeepSeek-V4.1-Flash via the provider alias map below.
+                "deepseek-flash":              "deepseek",
             }
 
             # Default near-zero pricing (internal use — our own agents pay ~$0)
@@ -7907,6 +8091,7 @@ class Handler(BaseHTTPRequestHandler):
                 _m("minimax-m3:cloud", "ollama", 1048576),
                 _m("deepseek/deepseek-v4-flash", "deepseek"),
                 _m("deepseek/deepseek-v4-pro", "deepseek"),
+                _m("deepseek-flash", "deepseek"),
             ]
             models_data = {
                 "object": "list",

@@ -95,10 +95,16 @@ class ProviderCandidate:
 # Incident 2026-08-25: 2,305 prod requests for short forms got single-candidate
 # lists; when opencode_go hit 429 weekly-cap + 403 RegionError, they 503'd.
 MODEL_ALIASES: dict[str, str] = {
-    "deepseek-v4-flash":      "deepseek/deepseek-v4-flash",
-    "deepseek-v4-pro":        "deepseek/deepseek-v4-pro",
-    "deepseek-v4-flash-0731": "deepseek/deepseek-v4-flash",
-    "deepseek-v4-pro-0813":   "deepseek/deepseek-v4-pro",
+    # V4.1 Flash (2026-09-10) is the canonical deepseek model. Every legacy
+    # v4 name resolves to it (operator 2026-09-11: "use V4.1 in place of v4
+    # everywhere") so nothing can dispatch old V4.
+    "deepseek-flash":             "deepseek/deepseek-flash",
+    "deepseek-v4-flash":          "deepseek/deepseek-flash",
+    "deepseek-v4-flash-0731":     "deepseek/deepseek-flash",
+    "deepseek-v4-pro":            "deepseek/deepseek-flash",
+    "deepseek-v4-pro-0813":       "deepseek/deepseek-flash",
+    "deepseek/deepseek-v4-flash": "deepseek/deepseek-flash",
+    "deepseek/deepseek-v4-pro":   "deepseek/deepseek-flash",
 }
 
 
@@ -215,6 +221,7 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # glm-5.3: LIVE (2026-08-30 catalog probe — zai-org/GLM-5.3 present in
     # their 190-model catalog; translation added to _PROVIDER_MODEL_NAMES).
     "deepinfra": {
+        "deepseek/deepseek-flash",
         "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
         "glm-5.2", "glm-5.3",
     },
@@ -228,7 +235,8 @@ PROVIDER_MODELS: dict[str, set[str]] = {
         # glm-5.2 REMOVED (2026-09-06 incident) — openrouter z-ai/glm-5.2
         # served degenerate repetition output (2.2k-token junk completion,
         # 23:38 evidence, state-db-corruption evening). Reversible.
-        "kimi-k3", "deepseek/deepseek-v4-flash",
+        "kimi-k3", "deepseek/deepseek-flash",
+        "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-pro",
     },
     # Chutes — transient lane (ADR-014, onboarded 2026-09-06). Plus plan:
@@ -238,6 +246,19 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # for glm-5.2 (hidden CoT in completion_tokens) — see zai_proxy comment.
     "chutes": {
         "deepseek/deepseek-v4-flash",
+        # 2026-09-13: chutes was wired for DeepSeek only, so it was never a
+        # candidate for the glm/kimi/qwen model IDs — even though it SERVES
+        # all three families. That is why cross-family kanban review was
+        # impossible whenever z.ai / ollama / opencode were quota-locked
+        # (only deepseek lanes survived) while an idle non-deepseek lane sat
+        # right there. Added for the two REVIEWER pins only (deliberately NOT
+        # glm-5.2 — that is a fleet workhorse and chutes has a 2000 req/day
+        # + $4.17/4h burst cap; we do not want the whole fleet on it).
+        # Live-verified 2026-09-13: Qwen/Qwen3.5-397B-A17B-TEE and
+        # moonshotai/Kimi-K3-TEE both returned 200. Both are reasoning
+        # models — callers must send max_tokens >= 2048 or the completion
+        # comes back EMPTY with HTTP 200 (silent no-op).
+        "qwen3.5:397b", "kimi-k3",
     },
     # Telnyx — Kimi-focused by operator decision.
     # kimi-k3:cloud deduped under canonical kimi-k3 (2026-08-27, FR-2):
@@ -262,7 +283,7 @@ PROVIDER_MODELS: dict[str, set[str]] = {
     # Note: NOT vision-exp (experimental, not in PROVIDER_MODELS deliberately
     # until we have a use case; can be added when needed).
     "deepseek": {
-        "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
     },
 }
 
